@@ -229,7 +229,7 @@ if __name__ == "__main__":
     parser.add_argument("--save_path", type=str, default=None)
     parser.add_argument("--gpu_name", type=str, default="A6000")
     parser.add_argument("--gpu_architecture", type=str, default="Ampere")
-    parser.add_argument("--general_memory_path", type=str, default="results/memory/general_memory_v4_200.txt")
+    parser.add_argument("--general_memory_path", type=str, default="results/memory/general_memory_v1_200.txt")
 
     # for small loop
     parser.add_argument("--refine_steps", type=int, default=25)

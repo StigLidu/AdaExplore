@@ -22,7 +22,7 @@ pool_size: 5
 disable_reviewer: false
 
 save_path: outputs/KB-l2_AdaExplore_50
-general_memory_path: results/memory/general_memory_v4_200.txt
+general_memory_path: results/memory/general_memory_v1_200.txt
 memory_update: false
 knowledge_1_threshold: 3
 

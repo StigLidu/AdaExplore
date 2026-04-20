@@ -65,7 +65,7 @@ When running the agent via `agent/agent_entry.py`, you can enable auto-update:
 ```bash
 python agent/agent_entry.py \
   --config config/<your_config>.yaml \
-  --general_memory_path results/memory/general_memory_v4_200.txt \
+  --general_memory_path results/memory/general_memory_v1_200.txt \
   --memory_update \
   --knowledge_1_threshold 3
 ```
@@ -82,7 +82,7 @@ If you have a specific run folder (e.g. `outputs/example_run`) and want to updat
 ```bash
 python skill_memory/skill_memory.py \
   --log-dir outputs/example_run \
-  --knowledge-store-path results/memory/general_memory_v4_200.txt \
+  --knowledge-store-path results/memory/general_memory_v1_200.txt \
   --server azure \
   --model-name gpt-5-mini \
   --max-logs 3000 \
@@ -98,6 +98,6 @@ Notes:
 
 ## Quick sanity checks
 
-- **Skill memory**: open your memory file (for example `results/memory/general_memory_v4_200.txt`) and confirm each line looks like:
+- **Skill memory**: open your memory file (for example `results/memory/general_memory_v1_200.txt`) and confirm each line looks like:
   - starts with `You cannot ...`
   - ends with `||<number>`

@@ -1,6 +1,6 @@
 ### Synthesis (synthetic KernelBench data)
 
-This folder contains scripts to **generate** synthetic PyTorch kernel modules with an LLM and then **materialize** them into a KernelBench-style dataset folder (e.g. `datasets/KernelBench_syn/syn_v4`) **sequentially**.
+This folder contains scripts to **generate** synthetic PyTorch kernel modules with an LLM and then **materialize** them into a KernelBench-style dataset folder (e.g. `datasets/KernelBench_syn/syn_v1`) **sequentially**.
 
 ### Recommended sequential workflow
 
@@ -36,7 +36,7 @@ After Step 1 finishes, copy the generated directory into your dataset path and r
 ```bash
 python synthesis/rename.py \
   --source_path outputs/data_generation/generated_data_composite_gpt-5-mini_YYYYMMDD_HHMMSS \
-  --data_path datasets/KernelBench_syn/syn_v4 \
+  --data_path datasets/KernelBench_syn/syn_v1 \
   --force
 ```
 

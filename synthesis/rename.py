@@ -98,7 +98,7 @@ def main() -> None:
     parser.add_argument(
         "--data_path",
         type=str,
-        default="datasets/KernelBench_syn/syn_v4",
+        default="datasets/KernelBench_syn/syn_v1",
         help="Destination dataset directory (relative to repo root or absolute).",
     )
     parser.add_argument(
