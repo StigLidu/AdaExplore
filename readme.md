@@ -28,7 +28,7 @@ In practice, this repository is a simplified open-source release of AdaExplore, 
 
 ## TODOs
 
-- [ ] The open-source release is still under construction, and we welcome feedback!
+- [ ] The open-source release is still under refinements, and we welcome feedback!
 
 ## Installation
 
