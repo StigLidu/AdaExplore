@@ -13,9 +13,11 @@ AdaExplore is a research codebase for **LLM-driven GPU kernel engineering**. It 
 - a benchmark and evaluation harness for correctness and performance
 - an optional remote evaluation service for multi-GPU or cluster setups
 
-## What It Does
+<p align="center">
+  <img src="assets/overview.png" alt="AdaExplore overview" />
+</p>
 
-Given a reference PyTorch operator or model component, AdaExplore asks an LLM to generate optimized CUDA/Triton-style implementations, evaluates the generated kernels, and uses search to keep improving them.
+
 
 ## TODOs
 
