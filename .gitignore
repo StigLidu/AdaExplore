@@ -20,7 +20,6 @@ slurm-*
 # Local environment and generated data
 .env
 *.csv
-*.png
 *.pkl
 *.pdf
 *.zip
