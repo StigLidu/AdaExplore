@@ -128,17 +128,26 @@ AdaExplore uses a lightweight evaluation harness built around `online_judge/app_
 
 For result quality, the harness separates correctness from performance measurement. Correctness is checked over one or more randomized trials and uses a small numerical tolerance (`atol=rtol=5e-2`) to avoid rejecting kernels over insignificant floating-point noise, while performance is measured after warmup across multiple runs and summarized into runtime statistics after removing outliers.
 
+For post-processing, `tool_scripts/re_evaluate.py` can re-run the saved best kernels in a log directory, for example `python tool_scripts/re_evaluate.py --log_folder outputs/<run> --num_correct_trials 5 --num_perf_trials 100 --use_remote_eval`.
+To summarize a completed run, use `tool_scripts/stats.py`, e.g. `python tool_scripts/stats.py --log_folder outputs/<run> --step 50`, which reports accuracy and aggregate speedup statistics.
+
 ## Results
 
 <p align="center">
   <img src="assets/results.png" alt="Main Results" />
 </p>
 
+The main takeaway is that AdaExplore benefits from both stages of the pipeline: adaptation improves proposal quality by turning repeated failures into reusable guidance, and exploration converts that guidance into stronger search decisions at test time.
+Across the reported benchmarks, this combination improves robustness and leads to better final kernels than using direct generation or search alone.
+
+We also release the AdaExplore-generated kernels in `results/saved_kernels`; each kernel is the final output of a 50-step exploration run.
+
 ## Citation
 
 Stay tuned!
 
 ## Acknowledgments
+We thank [KernelBench](https://github.com/ScalingIntelligence/KernelBench) and [FlashInfer-Bench](https://github.com/flashinfer-ai/flashinfer-bench) for their open-source code and evaluation harnesses.
 
 ## License
 

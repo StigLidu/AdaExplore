@@ -5,7 +5,6 @@ import math
 import shutil
 import json
 import numpy as np
-import matplotlib.pyplot as plt
 
 source_mapping = {
     "KB": "KernelBench",
@@ -32,7 +31,6 @@ def parse_args():
         help="One or more log folder paths to process",
     )
     parser.add_argument("--range_end", type=int, default=100)
-    parser.add_argument("--draw_curve", action="store_true")
     parser.add_argument("--save_eval_task_ids_path", type=str, default=None)
     parser.add_argument("--load_eval_task_ids_path", type=str, default=None)
     parser.add_argument("--best_metrics_file", type=str, default=None)
@@ -82,14 +80,11 @@ def parse_metrics_file(file_path):
     return compiled, correctness, fast_p, raw
 
 
-def extract_step(filename, log_folder, total_steps):
+def extract_step(filename, log_folder):
     """Extract step number from filename based on agent type."""
     if "proposal" in filename:
         if "PS" in log_folder or "IRL" in log_folder or "IRB" in log_folder:
             return int(filename.split("proposal_")[1].split("_")[0])
-        elif "SQUARE" in log_folder:
-            sqrt_step = int(np.sqrt(total_steps) + 0.1)
-            return (int(filename.split("proposal_")[1].split("_")[0]) - 1) * sqrt_step + 1
         elif "IRS" in log_folder:
             return 1
         else:
@@ -98,9 +93,6 @@ def extract_step(filename, log_folder, total_steps):
         parts = filename.split("tune_")[1].split("_")
         if "IRS" in log_folder:
             return int(parts[1])
-        elif "SQUARE" in log_folder:
-            sqrt_step = int(np.sqrt(total_steps) + 0.1)
-            return (int(parts[0]) - 1) * sqrt_step + int(parts[1]) + 1
         else:
             raise ValueError(f"log folder does not match the file name pattern: {filename}")
     elif "step_" in filename and ("MCTS" in log_folder or "MH" in log_folder or "CHAIN" in log_folder):
@@ -120,9 +112,7 @@ def process_log_folder(
     to_eval_task_ids,
     step_acc_map: dict,
     step_prefix_map: dict,
-    test_idxs: list,
     eval_task_ids: list,
-    total_steps: int,
 ):
     """Process a single log folder and update statistics."""
     correct_count = 0
@@ -185,7 +175,6 @@ def process_log_folder(
         if to_eval_task_ids is not None and (level, problem_id) not in to_eval_task_ids:
             continue
 
-        test_idxs.append((level, problem_id))
         eval_task_ids.append((level, problem_id))
         total_count += 1
         ood_tag = True
@@ -196,7 +185,7 @@ def process_log_folder(
             if not is_metrics:
                 continue
             
-            step = extract_step(file, log_folder, total_steps)
+            step = extract_step(file, log_folder)
             file_path = os.path.join(folder_path, file)
             _, _, fast_p, raw = parse_metrics_file(file_path)
             
@@ -274,51 +263,6 @@ def process_log_folder(
     }
 
 
-def draw_curves(log_folder: str, test_idxs: list, step_acc_map: dict, args):
-    """Draw and save performance curves for a log folder."""
-    total_steps = max(step_acc_map.keys()) + 1 if step_acc_map else 1
-    all_speedup_list = np.zeros((len(test_idxs), total_steps))
-    max_update_count, max_update_idx = 0, None
-
-    for i, (level, problem_id) in enumerate(test_idxs):
-        speedup_list = np.zeros(total_steps)
-        update_count = 0
-        
-        for k in range(1, total_steps):
-            if k in step_acc_map and (level, problem_id) in step_acc_map[k]:
-                speedup_list[k] = step_acc_map[k][(level, problem_id)]
-            else:
-                print(f"[Warning] Step {k} of {level} {problem_id} has no data")
-                speedup_list[k] = speedup_list[k - 1]
-        
-        for k in range(2, total_steps):
-            if speedup_list[k] > speedup_list[k - 1]:
-                update_count += 1
-            speedup_list[k] = max(speedup_list[k], speedup_list[k - 1])
-        
-        all_speedup_list[i] = speedup_list
-        if update_count >= max_update_count:
-            max_update_count, max_update_idx = update_count, (level, problem_id)
-
-    avg_speedup_list = all_speedup_list.mean(axis=0)
-    avg_none_zero_count = (all_speedup_list > 0).mean(axis=0)
-    print(f"Avg none zero count: {avg_none_zero_count}")
-    print(f"Max update count: {max_update_count}")
-    print(f"Max update count idx: {max_update_idx}")
-    os.makedirs(f"results/{log_folder.split('/')[-1]}", exist_ok=True)
-    save_path = f"results/{log_folder.split('/')[-1]}"
-    plt.figure()
-    plt.plot(avg_speedup_list)
-    plt.savefig(f"{save_path}/speedup.png")
-    print(f"Saved speedup curve to {save_path}/speedup.png")
-    plt.figure()
-    plt.plot(avg_none_zero_count)
-    plt.savefig(f"{save_path}/accuracy.png")
-    print(f"Saved accuracy curve to {save_path}/accuracy.png")
-    np.savetxt(f"{save_path}/speedup.csv", avg_speedup_list, delimiter=" ")
-    np.savetxt(f"{save_path}/accuracy.csv", avg_none_zero_count, delimiter=" ")
-
-
 def main():
     args = parse_args()
     to_eval_task_ids = load_eval_task_ids(args.load_eval_task_ids_path)
@@ -366,11 +310,10 @@ def main():
         # Statistics for this folder
         step_acc_map = {}
         step_prefix_map = {}
-        test_idxs = []
         eval_task_ids = []
         
         stats = process_log_folder(
-            log_folder, args, to_eval_task_ids, step_acc_map, step_prefix_map, test_idxs, eval_task_ids, args.step
+            log_folder, args, to_eval_task_ids, step_acc_map, step_prefix_map, eval_task_ids
         )
         
         # Print statistics for this folder
@@ -397,10 +340,6 @@ def main():
 
         if stats['bug_eval_count'] > 0 or stats['total_count'] < args.range_end:
             partial_folders.append(log_folder)
-        
-        # Draw curve for this folder
-        if args.draw_curve and test_idxs:
-            draw_curves(log_folder, test_idxs, step_acc_map, args)
         
         # Save eval task ids for this folder
         if args.save_eval_task_ids_path and eval_task_ids:
