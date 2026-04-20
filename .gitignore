@@ -43,6 +43,7 @@ test_data/*
 test.txt
 *_old
 **/__MACOSX/
+.DS_Store
 
 # Paper artifacts
 outputs_paper/*

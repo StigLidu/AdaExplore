@@ -46,23 +46,6 @@ conda activate AdaExplore
 pip install -r requirements.txt
 ```
 
-## Model Credentials
-
-Set the environment variables for the provider you want to use.
-
-Examples:
-
-```bash
-export OPENAI_API_KEY=...
-```
-
-or
-
-```bash
-export AZURE_API_KEY=...
-export AZURE_OPENAI_ENDPOINT=https://<your-endpoint>.openai.azure.com/
-```
-
 Depending on your setup, you may also need keys such as `ANTHROPIC_API_KEY`, in addition to the backend-specific variables used by `agent/inference_server.py`.
 
 ## Quick Start
