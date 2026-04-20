@@ -26,6 +26,10 @@ In practice, this repository is a simplified open-source release of AdaExplore, 
 - `skill_memory/` builds and updates the reusable memory, 
 - `agent/` runs the search procedure used for benchmark or task-time optimization.
 
+## TODOs
+
+- [ ] The open-source release is still under construction, and we welcome feedback!
+
 ## Installation
 
 ### 1. Create a Python environment and install dependencies
