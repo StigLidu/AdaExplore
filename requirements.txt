@@ -1,0 +1,27 @@
+# Core agent and evaluation
+anthropic==0.75.0
+numpy==2.3.5
+openai==2.9.0
+PyYAML==6.0.3
+requests==2.32.5
+torch==2.5.0
+tqdm==4.67.1
+triton==3.1.0
+
+# Dataset and model support
+einops==0.8.1
+transformers==4.56.0
+
+# Online judge and service tooling
+aiohttp==3.12.15
+fastapi==0.124.0
+pydantic==2.12.5
+uvicorn==0.38.0
+
+# Optional scripts and utilities
+beautifulsoup4
+matplotlib==3.10.7
+sentence-transformers==5.1.2
+
+# Dev
+pytest==8.4.1

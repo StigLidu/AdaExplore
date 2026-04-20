@@ -1,0 +1,174 @@
+You cannot reference the name PADDING_LEFT when it is not defined.||34.0
+You cannot call the compiled Triton kernel without providing the required positional 'meta' argument.||9.0
+You cannot call tl.load(x_ptr + x_addrs, mask=mask_x, other=0.0) inside the Triton kernel.||31.0
+You cannot have an `else:` at line 223 of the module source (SyntaxError: invalid syntax).||79.0
+You cannot use a keyword assignment (e.g., num_warps=8) inside the square-bracket kernel launch configuration when calling a Triton kernel.||1.0
+You cannot access triton.language.math.tanh.||36.0
+You cannot use the expression tl.max(tl.min(tmp, 6.0), 0.0) in the Triton kernel at compile time.||2.0
+You cannot use the 'continue' statement in a Triton kernel.||9.0
+You cannot call tl.float32 as a function inside a Triton kernel.||138.0
+You cannot pass a callable constexpr for the Triton kernel constexpr parameter BLOCK_M.||3.0
+You cannot call TritonPointwise.run with a weight W tensor that has 0 dimensions.||1.0
+You cannot use k_mask & (offs_n[None, :] < N) as the mask argument to tl.load in this Triton kernel when k_mask and (offs_n[None, :] < N) have incompatible dimensions 32 and 128.||6.0
+You cannot access W.shape when W is an int.||6.0
+You cannot compute fan in and fan out for a tensor with fewer than 2 dimensions.||1.0
+You cannot call tl.arange(0, BLOCK) inside the Triton kernel _mean_invstd_kernel.||14.0
+You cannot pass the keyword argument 'num_warps' to triton.jit.||3.0
+You cannot use Triton builder operations that require a `_builder` argument outside of functions compiled with @triton.jit.||20.0
+You cannot index a Triton tensor with an int32[] tensor index inside a Triton kernel during compilation.||36.0
+You cannot establish an HTTP connection to 0.0.0.0:12017 to perform normal evaluation.||1.0
+You cannot pass multiple values for the 'BLOCK' argument when launching the Triton kernel.||8.0
+You cannot access the .dtype attribute of a dict object.||11.0
+You cannot call triton.language.log1p.||7.0
+You cannot index a Triton tensor with a constexpr index inside a Triton kernel at compile time.||61.0
+You cannot access the shape of an uninitialized parameter or buffer.||1.0
+You cannot call the Triton kernel without providing the required constexpr positional arguments 'BLOCK_C' and 'BLOCK_L'.||14.0
+You cannot specify the keyword argument meta when launching this Triton kernel.||5.0
+You cannot access the global variable BLOCK_L from within an @jit'ed Triton kernel.||3.0
+You cannot call the Triton kernel without passing the required constexpr parameter 'BLOCK'.||31.0
+You cannot call torch.cuda.reset().||6.0
+You cannot use triton.language.ones_like.||2.0
+You cannot call .reshape(-1) inside a Triton kernel.||16.0
+You cannot access triton.language.div.||8.0
+You cannot call float() on a tensor (kernel_vol) inside the Triton kernel.||22.0
+You cannot define a nested (inner) function inside a Triton kernel.||2.0
+You cannot pass an integer as the grid parameter when launching the Triton kernel.||19.0
+You cannot call len() on an int.||3.0
+You cannot access the attribute 'dropout3d' on a ModelNew object.||5.0
+You cannot call a function that requires a `_builder` argument from inside a Triton jitted function.||3.0
+You cannot index tl.zeros((1,), dtype=tl.float32) with [0] inside a Triton @jit kernel.||25.0
+You cannot use the '**' operator to raise a Triton tensor (e.g., denom ** beta) inside this Triton kernel.||1.0
+You cannot call tl.store with a 1-element tensor (shape [1]) as the value in this Triton kernel.||1.0
+You cannot pass a dict as an argument when launching a Triton kernel.||3.0
+You cannot use triton.language.pow.||4.0
+You cannot call ModelNew.__init__ with the keyword argument 'mid_channels'.||1.0
+You cannot have an unexpected indent at line 23 (the '@staticmethod' decorator) in the loaded Python module.||3.0
+You cannot call tensor.view with a size argument that contains a torch.nn.Parameter.||6.0
+You cannot access the local variable 'W' in ModelNew.forward before it is assigned.||3.0
+You cannot call out.view(N * C_, S) when the tensor's size and stride make that view incompatible.||4.0
+You cannot add out_mixed and residual when they have different sizes in non-singleton dimension 4 (one has size 64 and the other has size 4).||2.0
+You cannot use triton.language.full_like.||5.0
+You cannot call apply() with keyword arguments.||1.0
+You cannot call tl.dot(x, x) inside the Triton kernel shown.||6.0
+You cannot compile the Triton kernel.||4.0
+You cannot call a function decorated with @triton.jit outside the scope of a kernel.||8.0
+You cannot perform simultaneous multiple assignment.||1.0
+You cannot call the .sum() method on the expression vals.to(tl.float32) inside a Triton @triton.jit kernel.||6.0
+You cannot access triton.language.concat.||1.0
+You cannot load a contiguous vector of length L without masking in this Triton kernel when BLOCK != L.||2.0
+You cannot pass a 'num_channels' keyword argument to torch.nn.functional.group_norm.||1.0
+You cannot pass an int as the 'weight' (third) argument to torch.group_norm.||1.0
+You cannot call torch.add with an out=... argument when one of the arguments requires grad.||1.0
+You cannot use the break statement inside a Triton kernel.||18.0
+You cannot use the variable neg_inf as the other argument to tl.load inside the Triton kernel.||3.0
+You cannot access the attribute 'att_sigmoid' on a ModelNew instance.||2.0
+You cannot set N greater than BLOCK when BLOCK is provided as a constexpr at kernel launch.||2.0
+You cannot reference the name 'EMBED' when instantiating ModelNew.||7.0
+You cannot unpack rms_view.stride() into two variables.||1.0
+You cannot call triton.language.any.||8.0
+You cannot call t() on a 4D tensor.||2.0
+You cannot call torch.matmul with an out=... argument when one of the matmul arguments requires grad.||1.0
+You cannot perform the assignment out_ptr[row * pooled_len + pidx] = acc in the Triton kernel (AssertionError during compilation).||6.0
+You cannot pass a tuple where an object with a .dtype attribute is expected.||1.0
+You cannot access the attribute 'ones' on module triton.language.||4.0
+You cannot call ModelNew.__init__ with 6 positional arguments.||3.0
+You cannot compile the Triton kernel when it contains the statement tl.store(out_ptr + 0, mean_vals, mask=mask_c).||2.0
+You cannot call tl.zeros_like with the keyword argument 'dtype'.||2.0
+You cannot use chained boolean operators (e.g., A or B or C) inside a Triton kernel.||6.0
+You cannot pass a size tuple to torch.nn.functional.interpolate that contains a torch.nn.parameter.Parameter as one of its elements.||3.0
+You cannot convert a tensor with more than one element to a Python scalar using int(...).||1.0
+You cannot index a Triton tensor using a non-constexpr integer variable inside a Triton kernel (e.g., w_vals[:, c_inner]).||8.0
+You cannot access the attribute 'mod' on the triton.language module.||1.0
+You cannot call tl.num_programs() inside a Triton kernel at compile time.||1.0
+You cannot use tl.load(inp_ptr + in_index) in this Triton kernel.||24.0
+You cannot compile a Triton kernel that contains the statement accs = tl.zeros((patch_dim_out,), dtype=tl.float32).||1.0
+You cannot pass a dtype keyword argument to tl.sum inside a Triton kernel.||3.0
+You cannot use tl.cast(tl.float32, 0.0) in the Triton kernel.||1.0
+You cannot call int() on a tensor inside a Triton kernel.||5.0
+You cannot call tl.sum with a mask keyword argument inside a Triton kernel.||2.0
+You cannot pass an indices tensor with float elements to torch.nn.functional.max_unpool3d.||25.0
+You cannot compare a pointer<fp32> (e.g., a kernel pointer argument like weight_ptr) to the integer 0 inside a Triton kernel.||4.0
+You cannot access the attribute 'act' on a ModelNew object.||2.0
+You cannot call torch.nn.functional.conv_transpose1d with an input tensor of type torch.cuda.FloatTensor and a weight tensor of type torch.FloatTensor.||1.0
+You cannot use the assignment expression 'math_sqrt_5 := (5 ** 0.5)' as an argument in the call to nn.init.kaiming_uniform_.||1.0
+You cannot access triton.language.set.||1.0
+You cannot use triton.language.bool.||2.0
+You cannot require more shared memory than the device's hardware limit when launching the Triton kernel.||5.0
+You cannot access the attribute 'dropout2d' on a ModelNew object.||1.0
+You cannot access triton.language.constant (i.e., call tl.constant).||12.0
+You cannot call triton.language.flatten.||2.0
+You cannot set the constexpr parameter BLOCK to a value different from C in this Triton kernel.||1.0
+You cannot access triton.language.make_constant.||1.0
+You cannot call torch.silu.||1.0
+You cannot use chained/simultaneous multiple comparisons like "0 <= dd < D" inside a Triton kernel.||3.0
+You cannot define class ModelNew that inherits from the name 'Model' when 'Model' is not defined.||31.0
+You cannot access the attribute 'hardshrink_triton' on a ModelNew object.||2.0
+You cannot reassign a loop-carried variable that is initially a scalar fp32 to a vector of shape [256] fp32 inside a Triton kernel loop.||4.0
+You cannot omit the @triton.jit decorator on a Triton kernel function.||5.0
+You cannot call the .unsqueeze method on a Triton 'tensor' object (e.g., the result of tl.arange) inside a Triton kernel.||2.0
+You cannot call torch.maximum with an out=... argument when one of the arguments requires grad.||1.0
+You cannot call torch.bernoulli_.||1.0
+You cannot call tl.max with arguments max_val and m in this Triton kernel.||5.0
+You cannot call triton.language.stack (tl.stack).||2.0
+You cannot call triton_tanhshrink(inp).||1.0
+You cannot call torch.tanh with an out=... argument when one of its arguments requires grad.||1.0
+You cannot call tl.arange(0, BLOCK_C) inside the Triton kernel _softmax_channelwise_kernel.||3.0
+You cannot pass a torch.cuda.FloatTensor as the indices (argument #1) to torch.embedding_bag.||72.0
+You cannot reference the variable mask_c outside the scope where it is defined in the Triton kernel.||1.0
+You cannot add the Python loop variable l_start to the result of tl.arange(0, BLOCK_L) inside the Triton jitted kernel.||3.0
+You cannot use triton.language.select.||2.0
+You cannot call tl.arange(0, D) where D is provided as a Triton kernel argument inside the kernel.||3.0
+You cannot call the method new_empty_like on a Tensor object (e.g., x.new_empty_like(x_flat)).||4.0
+You cannot call torch.mul with an out=... argument when one of the arguments requires grad.||4.0
+You cannot access the .ptr attribute of a Tensor when launching a Triton kernel.||1.0
+You cannot pass a tuple where an integer is expected when launching the Triton kernel.||2.0
+You cannot reference the name 'Model' inside ModelNew.__init__.||27.0
+You cannot access the attribute 'sign' on triton.language (i.e., you cannot use tl.sign).||1.0
+You cannot create an attribute named 'encoder_weight' when an attribute with that name already exists.||4.0
+You cannot add a pointer<fp32> and a triton.language.float32 value when forming an address in a Triton kernel.||2.0
+You cannot perform tl.load(...) inside a Python while loop that iterates up to a runtime integer D in a Triton kernel.||1.0
+You cannot call torch.sigmoid with an out=... argument when one of the arguments requires grad.||2.0
+You cannot call torch.addcmul with an out=... argument when one of the function's arguments requires grad.||1.0
+You cannot access the attribute 'tanh' on module 'triton.language'.||5.0
+You cannot call the transpose method (e.g., tensor.transpose(0, 1)) on a Triton 'tensor' object inside the Triton kernel.||1.0
+You cannot access the bias attribute of the RMSNorm object.||1.0
+You cannot compile this Triton kernel when it contains the call tl.load(x_ptrs, mask=mask, other=0.0).||3.0
+You cannot call tl.load(ptrs) in the Triton kernel.||1.0
+You cannot assign to elements of a Python list (e.g., vals[i] = v) inside this Triton kernel.||1.0
+You cannot call tl.load(..., mask=mask) without supplying an 'other' argument inside this Triton kernel during compilation.||3.0
+You cannot call unsqueeze on an uninitialized parameter (torch.nn.parameter.UninitializedParameter).||1.0
+You cannot call conv_transpose1d with an input tensor that has 3 channels when the layer's weight expects 1 channel.||1.0
+You cannot call tl.sum with the keyword argument 'axes' when compiling a Triton kernel.||2.0
+You cannot call tl.arange(0, C, BLOCK_C) inside a Triton kernel.||1.0
+You cannot pass a float as an element of the 'size' argument to torch.empty.||1.0
+You cannot call F.conv1d with an input tensor on CUDA (torch.cuda.FloatTensor) and a weight tensor on CPU (torch.FloatTensor).||2.0
+You cannot access the memory_format attribute on a Tensor object.||1.0
+You cannot use the expression tl.program_id(3) < 1024 inside a Triton kernel.||3.0
+You cannot call tl.arange(0, BLOCK, dtype=tl.int32) inside a Triton kernel where BLOCK is a tl.constexpr parameter.||1.0
+You cannot call _triton_gemm_kernel[grid](...).||1.0
+You cannot assign an fp64 (Python float) value to the Triton kernel variable sum_exp in the if-then block when sum_exp was initialized as fp32.||1.0
+You cannot pass the keyword argument 'd_model' to ModelNew.__init__.||1.0
+You cannot unpack out.stride() into exactly three variables.||1.0
+You cannot reference the name 'math' in _init_params.||4.0
+You cannot access the attribute 'neg' on the triton.language module.||1.0
+You cannot provide a 5D input to linear mode.||1.0
+You cannot use mask_out[i] in a Python if-statement inside the triton.jit kernel.||1.0
+You cannot use a Python list comprehension (ListComp) inside a @triton.jit kernel.||1.0
+You cannot access triton.language.shift.||2.0
+You cannot call F.avg_pool1d when F is an int.||3.0
+You cannot call replication_pad2d_triton(x_4d, PAD2D).||2.0
+You cannot access the attribute 'drop1d' on a ModelNew object.||1.0
+You cannot assign to an expression like "Hc * Wp" in an assignment statement (e.g., "S = Hc * Wp = None").||1.0
+You cannot access triton.is_available.||1.0
+You cannot access triton.language.reduce_max.||1.0
+You cannot pass a non-variable argument to ctx.mark_dirty.||1.0
+You cannot access the attribute 'weight' on a ModelNew object.||1.0
+You cannot compute k_block = tl.min(BLOCK_K, K - k) in this Triton kernel.||1.0
+You cannot call ModelNew.__init__ with 10 positional arguments.||1.0
+You cannot pass None to float().||2.0
+You cannot call instancenorm1d_triton with a 'BLOCK' keyword argument.||1.0
+You cannot access the attribute 'pad' on a ModelNew object.||1.0
+You cannot call F.linear with an input matrix of shape (256, 1) and a weight matrix of shape (32, 32).||1.0
+You cannot multiply a pointer<fp32> by a triton.language.int32 inside a Triton kernel.||1.0
+You cannot call torch.int32(...) as if it were a function.||1.0
+You cannot use the walrus assignment expression 'math_safe_gain:=1.0' in the module source at import/compile time.||1.0

@@ -1,0 +1,23 @@
+test_source: SYN
+agent_type: MCTS
+test_list_path: config/test_list/test_list_syn.txt
+dtype_str: fp32
+num_processes: 15
+gpu_name: A6000
+gpu_architecture: Ampere
+gpu_ids:
+- 0
+server_type: openai
+model_name: gpt-5-mini
+max_completion_tokens: 16384
+general_memory_path: results/memory/general_memory_v4_200.txt
+memory_update: true
+total_steps: 25
+max_memory_round: 5
+pool_size: 5
+disable_reviewer: true
+save_path: outputs/SYN-v4_example_run
+resume_from: outputs/SYN-v4_example_run
+debug: false
+use_remote_eval: true
+remote_eval_url: http://127.0.0.1:12017

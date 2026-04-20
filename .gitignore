@@ -1,0 +1,48 @@
+# Python and packaging artifacts
+**__pycache__/
+*.egg-info/
+**build/
+**dist/
+
+# Run outputs and caches
+runs/*
+cache/*
+outputs/
+models
+rag/*
+*cache*
+temp*
+tmp*
+slurm_logs/*
+slurm-*
+*.lock
+
+# Local environment and generated data
+.env
+*.csv
+*.png
+*.pkl
+*.pdf
+*.zip
+*.tar.gz
+*.err
+*.out
+ncu_profile.txt
+
+# Dataset and experiment scratch space
+KernelBench_syn/syn_v3/*
+KernelBench_syn/*_old/*
+datasets/TritonBench_T
+datasets/flashinfer-trace
+datasets/flashinfer-trace/*
+datasets/mlsys26-contest
+datasets/mlsys26-contest/*
+TritonBench/
+flashinfer-bench/
+test_data/*
+test.txt
+*_old
+**/__MACOSX/
+
+# Paper artifacts
+outputs_paper/*

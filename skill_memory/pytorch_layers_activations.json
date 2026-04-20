@@ -1,0 +1,690 @@
+{
+  "layers": [
+    {
+      "name": "nn.Conv2d",
+      "description": "Applies a 2D convolution over an input signal composed of several input planes.",
+      "link": "generated/torch.nn.Conv2d.html#torch.nn.Conv2d",
+      "section": "Convolution Layers#"
+    },
+    {
+      "name": "nn.Conv3d",
+      "description": "Applies a 3D convolution over an input signal composed of several input planes.",
+      "link": "generated/torch.nn.Conv3d.html#torch.nn.Conv3d",
+      "section": "Convolution Layers#"
+    },
+    {
+      "name": "nn.ConvTranspose1d",
+      "description": "Applies a 1D transposed convolution operator over an input image composed of several input planes.",
+      "link": "generated/torch.nn.ConvTranspose1d.html#torch.nn.ConvTranspose1d",
+      "section": "Convolution Layers#"
+    },
+    {
+      "name": "nn.ConvTranspose2d",
+      "description": "Applies a 2D transposed convolution operator over an input image composed of several input planes.",
+      "link": "generated/torch.nn.ConvTranspose2d.html#torch.nn.ConvTranspose2d",
+      "section": "Convolution Layers#"
+    },
+    {
+      "name": "nn.ConvTranspose3d",
+      "description": "Applies a 3D transposed convolution operator over an input image composed of several input planes.",
+      "link": "generated/torch.nn.ConvTranspose3d.html#torch.nn.ConvTranspose3d",
+      "section": "Convolution Layers#"
+    },
+    {
+      "name": "nn.LazyConv1d",
+      "description": "A torch.nn.Conv1d module with lazy initialization of the in_channels argument.",
+      "link": "generated/torch.nn.LazyConv1d.html#torch.nn.LazyConv1d",
+      "section": "Convolution Layers#"
+    },
+    {
+      "name": "nn.LazyConv2d",
+      "description": "A torch.nn.Conv2d module with lazy initialization of the in_channels argument.",
+      "link": "generated/torch.nn.LazyConv2d.html#torch.nn.LazyConv2d",
+      "section": "Convolution Layers#"
+    },
+    {
+      "name": "nn.LazyConv3d",
+      "description": "A torch.nn.Conv3d module with lazy initialization of the in_channels argument.",
+      "link": "generated/torch.nn.LazyConv3d.html#torch.nn.LazyConv3d",
+      "section": "Convolution Layers#"
+    },
+    {
+      "name": "nn.LazyConvTranspose1d",
+      "description": "A torch.nn.ConvTranspose1d module with lazy initialization of the in_channels argument.",
+      "link": "generated/torch.nn.LazyConvTranspose1d.html#torch.nn.LazyConvTranspose1d",
+      "section": "Convolution Layers#"
+    },
+    {
+      "name": "nn.LazyConvTranspose2d",
+      "description": "A torch.nn.ConvTranspose2d module with lazy initialization of the in_channels argument.",
+      "link": "generated/torch.nn.LazyConvTranspose2d.html#torch.nn.LazyConvTranspose2d",
+      "section": "Convolution Layers#"
+    },
+    {
+      "name": "nn.LazyConvTranspose3d",
+      "description": "A torch.nn.ConvTranspose3d module with lazy initialization of the in_channels argument.",
+      "link": "generated/torch.nn.LazyConvTranspose3d.html#torch.nn.LazyConvTranspose3d",
+      "section": "Convolution Layers#"
+    },
+    {
+      "name": "nn.Unfold",
+      "description": "Extracts sliding local blocks from a batched input tensor.",
+      "link": "generated/torch.nn.Unfold.html#torch.nn.Unfold",
+      "section": "Convolution Layers#"
+    },
+    {
+      "name": "nn.Fold",
+      "description": "Combines an array of sliding local blocks into a large containing tensor.",
+      "link": "generated/torch.nn.Fold.html#torch.nn.Fold",
+      "section": "Convolution Layers#"
+    },
+    {
+      "name": "nn.MaxPool2d",
+      "description": "Applies a 2D max pooling over an input signal composed of several input planes.",
+      "link": "generated/torch.nn.MaxPool2d.html#torch.nn.MaxPool2d",
+      "section": "Pooling layers#"
+    },
+    {
+      "name": "nn.MaxPool3d",
+      "description": "Applies a 3D max pooling over an input signal composed of several input planes.",
+      "link": "generated/torch.nn.MaxPool3d.html#torch.nn.MaxPool3d",
+      "section": "Pooling layers#"
+    },
+    {
+      "name": "nn.MaxUnpool1d",
+      "description": "Computes a partial inverse of MaxPool1d.",
+      "link": "generated/torch.nn.MaxUnpool1d.html#torch.nn.MaxUnpool1d",
+      "section": "Pooling layers#"
+    },
+    {
+      "name": "nn.MaxUnpool2d",
+      "description": "Computes a partial inverse of MaxPool2d.",
+      "link": "generated/torch.nn.MaxUnpool2d.html#torch.nn.MaxUnpool2d",
+      "section": "Pooling layers#"
+    },
+    {
+      "name": "nn.MaxUnpool3d",
+      "description": "Computes a partial inverse of MaxPool3d.",
+      "link": "generated/torch.nn.MaxUnpool3d.html#torch.nn.MaxUnpool3d",
+      "section": "Pooling layers#"
+    },
+    {
+      "name": "nn.AvgPool1d",
+      "description": "Applies a 1D average pooling over an input signal composed of several input planes.",
+      "link": "generated/torch.nn.AvgPool1d.html#torch.nn.AvgPool1d",
+      "section": "Pooling layers#"
+    },
+    {
+      "name": "nn.AvgPool2d",
+      "description": "Applies a 2D average pooling over an input signal composed of several input planes.",
+      "link": "generated/torch.nn.AvgPool2d.html#torch.nn.AvgPool2d",
+      "section": "Pooling layers#"
+    },
+    {
+      "name": "nn.AvgPool3d",
+      "description": "Applies a 3D average pooling over an input signal composed of several input planes.",
+      "link": "generated/torch.nn.AvgPool3d.html#torch.nn.AvgPool3d",
+      "section": "Pooling layers#"
+    },
+    {
+      "name": "nn.FractionalMaxPool2d",
+      "description": "Applies a 2D fractional max pooling over an input signal composed of several input planes.",
+      "link": "generated/torch.nn.FractionalMaxPool2d.html#torch.nn.FractionalMaxPool2d",
+      "section": "Pooling layers#"
+    },
+    {
+      "name": "nn.FractionalMaxPool3d",
+      "description": "Applies a 3D fractional max pooling over an input signal composed of several input planes.",
+      "link": "generated/torch.nn.FractionalMaxPool3d.html#torch.nn.FractionalMaxPool3d",
+      "section": "Pooling layers#"
+    },
+    {
+      "name": "nn.LPPool1d",
+      "description": "Applies a 1D power-average pooling over an input signal composed of several input planes.",
+      "link": "generated/torch.nn.LPPool1d.html#torch.nn.LPPool1d",
+      "section": "Pooling layers#"
+    },
+    {
+      "name": "nn.LPPool2d",
+      "description": "Applies a 2D power-average pooling over an input signal composed of several input planes.",
+      "link": "generated/torch.nn.LPPool2d.html#torch.nn.LPPool2d",
+      "section": "Pooling layers#"
+    },
+    {
+      "name": "nn.LPPool3d",
+      "description": "Applies a 3D power-average pooling over an input signal composed of several input planes.",
+      "link": "generated/torch.nn.LPPool3d.html#torch.nn.LPPool3d",
+      "section": "Pooling layers#"
+    },
+    {
+      "name": "nn.AdaptiveMaxPool1d",
+      "description": "Applies a 1D adaptive max pooling over an input signal composed of several input planes.",
+      "link": "generated/torch.nn.AdaptiveMaxPool1d.html#torch.nn.AdaptiveMaxPool1d",
+      "section": "Pooling layers#"
+    },
+    {
+      "name": "nn.AdaptiveMaxPool2d",
+      "description": "Applies a 2D adaptive max pooling over an input signal composed of several input planes.",
+      "link": "generated/torch.nn.AdaptiveMaxPool2d.html#torch.nn.AdaptiveMaxPool2d",
+      "section": "Pooling layers#"
+    },
+    {
+      "name": "nn.AdaptiveMaxPool3d",
+      "description": "Applies a 3D adaptive max pooling over an input signal composed of several input planes.",
+      "link": "generated/torch.nn.AdaptiveMaxPool3d.html#torch.nn.AdaptiveMaxPool3d",
+      "section": "Pooling layers#"
+    },
+    {
+      "name": "nn.AdaptiveAvgPool1d",
+      "description": "Applies a 1D adaptive average pooling over an input signal composed of several input planes.",
+      "link": "generated/torch.nn.AdaptiveAvgPool1d.html#torch.nn.AdaptiveAvgPool1d",
+      "section": "Pooling layers#"
+    },
+    {
+      "name": "nn.AdaptiveAvgPool2d",
+      "description": "Applies a 2D adaptive average pooling over an input signal composed of several input planes.",
+      "link": "generated/torch.nn.AdaptiveAvgPool2d.html#torch.nn.AdaptiveAvgPool2d",
+      "section": "Pooling layers#"
+    },
+    {
+      "name": "nn.AdaptiveAvgPool3d",
+      "description": "Applies a 3D adaptive average pooling over an input signal composed of several input planes.",
+      "link": "generated/torch.nn.AdaptiveAvgPool3d.html#torch.nn.AdaptiveAvgPool3d",
+      "section": "Pooling layers#"
+    },
+    {
+      "name": "nn.ReflectionPad2d",
+      "description": "Pads the input tensor using the reflection of the input boundary.",
+      "link": "generated/torch.nn.ReflectionPad2d.html#torch.nn.ReflectionPad2d",
+      "section": "Padding Layers#"
+    },
+    {
+      "name": "nn.ReflectionPad3d",
+      "description": "Pads the input tensor using the reflection of the input boundary.",
+      "link": "generated/torch.nn.ReflectionPad3d.html#torch.nn.ReflectionPad3d",
+      "section": "Padding Layers#"
+    },
+    {
+      "name": "nn.ReplicationPad1d",
+      "description": "Pads the input tensor using replication of the input boundary.",
+      "link": "generated/torch.nn.ReplicationPad1d.html#torch.nn.ReplicationPad1d",
+      "section": "Padding Layers#"
+    },
+    {
+      "name": "nn.ReplicationPad2d",
+      "description": "Pads the input tensor using replication of the input boundary.",
+      "link": "generated/torch.nn.ReplicationPad2d.html#torch.nn.ReplicationPad2d",
+      "section": "Padding Layers#"
+    },
+    {
+      "name": "nn.ReplicationPad3d",
+      "description": "Pads the input tensor using replication of the input boundary.",
+      "link": "generated/torch.nn.ReplicationPad3d.html#torch.nn.ReplicationPad3d",
+      "section": "Padding Layers#"
+    },
+    {
+      "name": "nn.ZeroPad1d",
+      "description": "Pads the input tensor boundaries with zero.",
+      "link": "generated/torch.nn.ZeroPad1d.html#torch.nn.ZeroPad1d",
+      "section": "Padding Layers#"
+    },
+    {
+      "name": "nn.ZeroPad2d",
+      "description": "Pads the input tensor boundaries with zero.",
+      "link": "generated/torch.nn.ZeroPad2d.html#torch.nn.ZeroPad2d",
+      "section": "Padding Layers#"
+    },
+    {
+      "name": "nn.ZeroPad3d",
+      "description": "Pads the input tensor boundaries with zero.",
+      "link": "generated/torch.nn.ZeroPad3d.html#torch.nn.ZeroPad3d",
+      "section": "Padding Layers#"
+    },
+    {
+      "name": "nn.ConstantPad1d",
+      "description": "Pads the input tensor boundaries with a constant value.",
+      "link": "generated/torch.nn.ConstantPad1d.html#torch.nn.ConstantPad1d",
+      "section": "Padding Layers#"
+    },
+    {
+      "name": "nn.ConstantPad2d",
+      "description": "Pads the input tensor boundaries with a constant value.",
+      "link": "generated/torch.nn.ConstantPad2d.html#torch.nn.ConstantPad2d",
+      "section": "Padding Layers#"
+    },
+    {
+      "name": "nn.ConstantPad3d",
+      "description": "Pads the input tensor boundaries with a constant value.",
+      "link": "generated/torch.nn.ConstantPad3d.html#torch.nn.ConstantPad3d",
+      "section": "Padding Layers#"
+    },
+    {
+      "name": "nn.CircularPad1d",
+      "description": "Pads the input tensor using circular padding of the input boundary.",
+      "link": "generated/torch.nn.CircularPad1d.html#torch.nn.CircularPad1d",
+      "section": "Padding Layers#"
+    },
+    {
+      "name": "nn.CircularPad2d",
+      "description": "Pads the input tensor using circular padding of the input boundary.",
+      "link": "generated/torch.nn.CircularPad2d.html#torch.nn.CircularPad2d",
+      "section": "Padding Layers#"
+    },
+    {
+      "name": "nn.CircularPad3d",
+      "description": "Pads the input tensor using circular padding of the input boundary.",
+      "link": "generated/torch.nn.CircularPad3d.html#torch.nn.CircularPad3d",
+      "section": "Padding Layers#"
+    },
+    {
+      "name": "nn.BatchNorm2d",
+      "description": "Applies Batch Normalization over a 4D input.",
+      "link": "generated/torch.nn.BatchNorm2d.html#torch.nn.BatchNorm2d",
+      "section": "Normalization Layers#"
+    },
+    {
+      "name": "nn.BatchNorm3d",
+      "description": "Applies Batch Normalization over a 5D input.",
+      "link": "generated/torch.nn.BatchNorm3d.html#torch.nn.BatchNorm3d",
+      "section": "Normalization Layers#"
+    },
+    {
+      "name": "nn.LazyBatchNorm1d",
+      "description": "A torch.nn.BatchNorm1d module with lazy initialization.",
+      "link": "generated/torch.nn.LazyBatchNorm1d.html#torch.nn.LazyBatchNorm1d",
+      "section": "Normalization Layers#"
+    },
+    {
+      "name": "nn.LazyBatchNorm2d",
+      "description": "A torch.nn.BatchNorm2d module with lazy initialization.",
+      "link": "generated/torch.nn.LazyBatchNorm2d.html#torch.nn.LazyBatchNorm2d",
+      "section": "Normalization Layers#"
+    },
+    {
+      "name": "nn.LazyBatchNorm3d",
+      "description": "A torch.nn.BatchNorm3d module with lazy initialization.",
+      "link": "generated/torch.nn.LazyBatchNorm3d.html#torch.nn.LazyBatchNorm3d",
+      "section": "Normalization Layers#"
+    },
+    {
+      "name": "nn.GroupNorm",
+      "description": "Applies Group Normalization over a mini-batch of inputs.",
+      "link": "generated/torch.nn.GroupNorm.html#torch.nn.GroupNorm",
+      "section": "Normalization Layers#"
+    },
+    {
+      "name": "nn.SyncBatchNorm",
+      "description": "Applies Batch Normalization over a N-Dimensional input.",
+      "link": "generated/torch.nn.SyncBatchNorm.html#torch.nn.SyncBatchNorm",
+      "section": "Normalization Layers#"
+    },
+    {
+      "name": "nn.InstanceNorm1d",
+      "description": "Applies Instance Normalization.",
+      "link": "generated/torch.nn.InstanceNorm1d.html#torch.nn.InstanceNorm1d",
+      "section": "Normalization Layers#"
+    },
+    {
+      "name": "nn.InstanceNorm2d",
+      "description": "Applies Instance Normalization.",
+      "link": "generated/torch.nn.InstanceNorm2d.html#torch.nn.InstanceNorm2d",
+      "section": "Normalization Layers#"
+    },
+    {
+      "name": "nn.InstanceNorm3d",
+      "description": "Applies Instance Normalization.",
+      "link": "generated/torch.nn.InstanceNorm3d.html#torch.nn.InstanceNorm3d",
+      "section": "Normalization Layers#"
+    },
+    {
+      "name": "nn.LazyInstanceNorm1d",
+      "description": "A torch.nn.InstanceNorm1d module with lazy initialization of the num_features argument.",
+      "link": "generated/torch.nn.LazyInstanceNorm1d.html#torch.nn.LazyInstanceNorm1d",
+      "section": "Normalization Layers#"
+    },
+    {
+      "name": "nn.LazyInstanceNorm2d",
+      "description": "A torch.nn.InstanceNorm2d module with lazy initialization of the num_features argument.",
+      "link": "generated/torch.nn.LazyInstanceNorm2d.html#torch.nn.LazyInstanceNorm2d",
+      "section": "Normalization Layers#"
+    },
+    {
+      "name": "nn.LazyInstanceNorm3d",
+      "description": "A torch.nn.InstanceNorm3d module with lazy initialization of the num_features argument.",
+      "link": "generated/torch.nn.LazyInstanceNorm3d.html#torch.nn.LazyInstanceNorm3d",
+      "section": "Normalization Layers#"
+    },
+    {
+      "name": "nn.LayerNorm",
+      "description": "Applies Layer Normalization over a mini-batch of inputs.",
+      "link": "generated/torch.nn.LayerNorm.html#torch.nn.LayerNorm",
+      "section": "Normalization Layers#"
+    },
+    {
+      "name": "nn.LocalResponseNorm",
+      "description": "Applies local response normalization over an input signal.",
+      "link": "generated/torch.nn.LocalResponseNorm.html#torch.nn.LocalResponseNorm",
+      "section": "Normalization Layers#"
+    },
+    {
+      "name": "nn.RMSNorm",
+      "description": "Applies Root Mean Square Layer Normalization over a mini-batch of inputs.",
+      "link": "generated/torch.nn.RMSNorm.html#torch.nn.RMSNorm",
+      "section": "Normalization Layers#"
+    },
+    {
+      "name": "nn.RNN",
+      "description": "Apply a multi-layer Elman RNN with tanh⁡\\tanhtanh or ReLU\\text{ReLU}ReLU non-linearity to an input sequence.",
+      "link": "generated/torch.nn.RNN.html#torch.nn.RNN",
+      "section": "Recurrent Layers#"
+    },
+    {
+      "name": "nn.LSTM",
+      "description": "Apply a multi-layer long short-term memory (LSTM) RNN to an input sequence.",
+      "link": "generated/torch.nn.LSTM.html#torch.nn.LSTM",
+      "section": "Recurrent Layers#"
+    },
+    {
+      "name": "nn.GRU",
+      "description": "Apply a multi-layer gated recurrent unit (GRU) RNN to an input sequence.",
+      "link": "generated/torch.nn.GRU.html#torch.nn.GRU",
+      "section": "Recurrent Layers#"
+    },
+    {
+      "name": "nn.RNNCell",
+      "description": "An Elman RNN cell with tanh or ReLU non-linearity.",
+      "link": "generated/torch.nn.RNNCell.html#torch.nn.RNNCell",
+      "section": "Recurrent Layers#"
+    },
+    {
+      "name": "nn.LSTMCell",
+      "description": "A long short-term memory (LSTM) cell.",
+      "link": "generated/torch.nn.LSTMCell.html#torch.nn.LSTMCell",
+      "section": "Recurrent Layers#"
+    },
+    {
+      "name": "nn.GRUCell",
+      "description": "A gated recurrent unit (GRU) cell.",
+      "link": "generated/torch.nn.GRUCell.html#torch.nn.GRUCell",
+      "section": "Recurrent Layers#"
+    },
+    {
+      "name": "nn.TransformerEncoder",
+      "description": "TransformerEncoder is a stack of N encoder layers.",
+      "link": "generated/torch.nn.TransformerEncoder.html#torch.nn.TransformerEncoder",
+      "section": "Transformer Layers#"
+    },
+    {
+      "name": "nn.TransformerDecoder",
+      "description": "TransformerDecoder is a stack of N decoder layers.",
+      "link": "generated/torch.nn.TransformerDecoder.html#torch.nn.TransformerDecoder",
+      "section": "Transformer Layers#"
+    },
+    {
+      "name": "nn.TransformerEncoderLayer",
+      "description": "TransformerEncoderLayer is made up of self-attn and feedforward network.",
+      "link": "generated/torch.nn.TransformerEncoderLayer.html#torch.nn.TransformerEncoderLayer",
+      "section": "Transformer Layers#"
+    },
+    {
+      "name": "nn.TransformerDecoderLayer",
+      "description": "TransformerDecoderLayer is made up of self-attn, multi-head-attn and feedforward network.",
+      "link": "generated/torch.nn.TransformerDecoderLayer.html#torch.nn.TransformerDecoderLayer",
+      "section": "Transformer Layers#"
+    },
+    {
+      "name": "nn.Linear",
+      "description": "Applies an affine linear transformation to the incoming data: y=xAT+by = xA^T + by=xAT+b.",
+      "link": "generated/torch.nn.Linear.html#torch.nn.Linear",
+      "section": "Linear Layers#"
+    },
+    {
+      "name": "nn.Bilinear",
+      "description": "Applies a bilinear transformation to the incoming data: y=x1TAx2+by = x_1^T A x_2 + by=x1T​Ax2​+b.",
+      "link": "generated/torch.nn.Bilinear.html#torch.nn.Bilinear",
+      "section": "Linear Layers#"
+    },
+    {
+      "name": "nn.LazyLinear",
+      "description": "A torch.nn.Linear module where in_features is inferred.",
+      "link": "generated/torch.nn.LazyLinear.html#torch.nn.LazyLinear",
+      "section": "Linear Layers#"
+    },
+    {
+      "name": "nn.Dropout1d",
+      "description": "Randomly zero out entire channels.",
+      "link": "generated/torch.nn.Dropout1d.html#torch.nn.Dropout1d",
+      "section": "Dropout Layers#"
+    },
+    {
+      "name": "nn.Dropout2d",
+      "description": "Randomly zero out entire channels.",
+      "link": "generated/torch.nn.Dropout2d.html#torch.nn.Dropout2d",
+      "section": "Dropout Layers#"
+    },
+    {
+      "name": "nn.Dropout3d",
+      "description": "Randomly zero out entire channels.",
+      "link": "generated/torch.nn.Dropout3d.html#torch.nn.Dropout3d",
+      "section": "Dropout Layers#"
+    },
+    {
+      "name": "nn.AlphaDropout",
+      "description": "Applies Alpha Dropout over the input.",
+      "link": "generated/torch.nn.AlphaDropout.html#torch.nn.AlphaDropout",
+      "section": "Dropout Layers#"
+    },
+    {
+      "name": "nn.FeatureAlphaDropout",
+      "description": "Randomly masks out entire channels.",
+      "link": "generated/torch.nn.FeatureAlphaDropout.html#torch.nn.FeatureAlphaDropout",
+      "section": "Dropout Layers#"
+    },
+    {
+      "name": "nn.EmbeddingBag",
+      "description": "Compute sums or means of 'bags' of embeddings, without instantiating the intermediate embeddings.",
+      "link": "generated/torch.nn.EmbeddingBag.html#torch.nn.EmbeddingBag",
+      "section": "Sparse Layers#"
+    },
+    {
+      "name": "nn.PixelUnshuffle",
+      "description": "Reverse the PixelShuffle operation.",
+      "link": "generated/torch.nn.PixelUnshuffle.html#torch.nn.PixelUnshuffle",
+      "section": "Vision Layers#"
+    },
+    {
+      "name": "nn.Upsample",
+      "description": "Upsamples a given multi-channel 1D (temporal), 2D (spatial) or 3D (volumetric) data.",
+      "link": "generated/torch.nn.Upsample.html#torch.nn.Upsample",
+      "section": "Vision Layers#"
+    },
+    {
+      "name": "nn.UpsamplingNearest2d",
+      "description": "Applies a 2D nearest neighbor upsampling to an input signal composed of several input channels.",
+      "link": "generated/torch.nn.UpsamplingNearest2d.html#torch.nn.UpsamplingNearest2d",
+      "section": "Vision Layers#"
+    },
+    {
+      "name": "nn.UpsamplingBilinear2d",
+      "description": "Applies a 2D bilinear upsampling to an input signal composed of several input channels.",
+      "link": "generated/torch.nn.UpsamplingBilinear2d.html#torch.nn.UpsamplingBilinear2d",
+      "section": "Vision Layers#"
+    },
+    {
+      "name": "nn.parallel.DistributedDataParallel",
+      "description": "Implement distributed data parallelism based on torch.distributed at module level.",
+      "link": "generated/torch.nn.parallel.DistributedDataParallel.html#torch.nn.parallel.DistributedDataParallel",
+      "section": "DataParallel Layers (multi-GPU, distributed)#"
+    }
+  ],
+  "activations": [
+    {
+      "name": "nn.Hardshrink",
+      "description": "Applies the Hard Shrinkage (Hardshrink) function element-wise.",
+      "link": "generated/torch.nn.Hardshrink.html#torch.nn.Hardshrink",
+      "section": "Non-linear Activations (weighted sum, nonlinearity)#"
+    },
+    {
+      "name": "nn.Hardsigmoid",
+      "description": "Applies the Hardsigmoid function element-wise.",
+      "link": "generated/torch.nn.Hardsigmoid.html#torch.nn.Hardsigmoid",
+      "section": "Non-linear Activations (weighted sum, nonlinearity)#"
+    },
+    {
+      "name": "nn.Hardtanh",
+      "description": "Applies the HardTanh function element-wise.",
+      "link": "generated/torch.nn.Hardtanh.html#torch.nn.Hardtanh",
+      "section": "Non-linear Activations (weighted sum, nonlinearity)#"
+    },
+    {
+      "name": "nn.Hardswish",
+      "description": "Applies the Hardswish function, element-wise.",
+      "link": "generated/torch.nn.Hardswish.html#torch.nn.Hardswish",
+      "section": "Non-linear Activations (weighted sum, nonlinearity)#"
+    },
+    {
+      "name": "nn.LeakyReLU",
+      "description": "Applies the LeakyReLU function element-wise.",
+      "link": "generated/torch.nn.LeakyReLU.html#torch.nn.LeakyReLU",
+      "section": "Non-linear Activations (weighted sum, nonlinearity)#"
+    },
+    {
+      "name": "nn.LogSigmoid",
+      "description": "Applies the Logsigmoid function element-wise.",
+      "link": "generated/torch.nn.LogSigmoid.html#torch.nn.LogSigmoid",
+      "section": "Non-linear Activations (weighted sum, nonlinearity)#"
+    },
+    {
+      "name": "nn.MultiheadAttention",
+      "description": "Allows the model to jointly attend to information from different representation subspaces.",
+      "link": "generated/torch.nn.MultiheadAttention.html#torch.nn.MultiheadAttention",
+      "section": "Non-linear Activations (weighted sum, nonlinearity)#"
+    },
+    {
+      "name": "nn.PReLU",
+      "description": "Applies the element-wise PReLU function.",
+      "link": "generated/torch.nn.PReLU.html#torch.nn.PReLU",
+      "section": "Non-linear Activations (weighted sum, nonlinearity)#"
+    },
+    {
+      "name": "nn.ReLU",
+      "description": "Applies the rectified linear unit function element-wise.",
+      "link": "generated/torch.nn.ReLU.html#torch.nn.ReLU",
+      "section": "Non-linear Activations (weighted sum, nonlinearity)#"
+    },
+    {
+      "name": "nn.ReLU6",
+      "description": "Applies the ReLU6 function element-wise.",
+      "link": "generated/torch.nn.ReLU6.html#torch.nn.ReLU6",
+      "section": "Non-linear Activations (weighted sum, nonlinearity)#"
+    },
+    {
+      "name": "nn.RReLU",
+      "description": "Applies the randomized leaky rectified linear unit function, element-wise.",
+      "link": "generated/torch.nn.RReLU.html#torch.nn.RReLU",
+      "section": "Non-linear Activations (weighted sum, nonlinearity)#"
+    },
+    {
+      "name": "nn.SELU",
+      "description": "Applies the SELU function element-wise.",
+      "link": "generated/torch.nn.SELU.html#torch.nn.SELU",
+      "section": "Non-linear Activations (weighted sum, nonlinearity)#"
+    },
+    {
+      "name": "nn.CELU",
+      "description": "Applies the CELU function element-wise.",
+      "link": "generated/torch.nn.CELU.html#torch.nn.CELU",
+      "section": "Non-linear Activations (weighted sum, nonlinearity)#"
+    },
+    {
+      "name": "nn.GELU",
+      "description": "Applies the Gaussian Error Linear Units function.",
+      "link": "generated/torch.nn.GELU.html#torch.nn.GELU",
+      "section": "Non-linear Activations (weighted sum, nonlinearity)#"
+    },
+    {
+      "name": "nn.Sigmoid",
+      "description": "Applies the Sigmoid function element-wise.",
+      "link": "generated/torch.nn.Sigmoid.html#torch.nn.Sigmoid",
+      "section": "Non-linear Activations (weighted sum, nonlinearity)#"
+    },
+    {
+      "name": "nn.SiLU",
+      "description": "Applies the Sigmoid Linear Unit (SiLU) function, element-wise.",
+      "link": "generated/torch.nn.SiLU.html#torch.nn.SiLU",
+      "section": "Non-linear Activations (weighted sum, nonlinearity)#"
+    },
+    {
+      "name": "nn.Mish",
+      "description": "Applies the Mish function, element-wise.",
+      "link": "generated/torch.nn.Mish.html#torch.nn.Mish",
+      "section": "Non-linear Activations (weighted sum, nonlinearity)#"
+    },
+    {
+      "name": "nn.Softplus",
+      "description": "Applies the Softplus function element-wise.",
+      "link": "generated/torch.nn.Softplus.html#torch.nn.Softplus",
+      "section": "Non-linear Activations (weighted sum, nonlinearity)#"
+    },
+    {
+      "name": "nn.Softshrink",
+      "description": "Applies the soft shrinkage function element-wise.",
+      "link": "generated/torch.nn.Softshrink.html#torch.nn.Softshrink",
+      "section": "Non-linear Activations (weighted sum, nonlinearity)#"
+    },
+    {
+      "name": "nn.Softsign",
+      "description": "Applies the element-wise Softsign function.",
+      "link": "generated/torch.nn.Softsign.html#torch.nn.Softsign",
+      "section": "Non-linear Activations (weighted sum, nonlinearity)#"
+    },
+    {
+      "name": "nn.Tanh",
+      "description": "Applies the Hyperbolic Tangent (Tanh) function element-wise.",
+      "link": "generated/torch.nn.Tanh.html#torch.nn.Tanh",
+      "section": "Non-linear Activations (weighted sum, nonlinearity)#"
+    },
+    {
+      "name": "nn.Tanhshrink",
+      "description": "Applies the element-wise Tanhshrink function.",
+      "link": "generated/torch.nn.Tanhshrink.html#torch.nn.Tanhshrink",
+      "section": "Non-linear Activations (weighted sum, nonlinearity)#"
+    },
+    {
+      "name": "nn.Threshold",
+      "description": "Thresholds each element of the input Tensor.",
+      "link": "generated/torch.nn.Threshold.html#torch.nn.Threshold",
+      "section": "Non-linear Activations (weighted sum, nonlinearity)#"
+    },
+    {
+      "name": "nn.GLU",
+      "description": "Applies the gated linear unit function.",
+      "link": "generated/torch.nn.GLU.html#torch.nn.GLU",
+      "section": "Non-linear Activations (weighted sum, nonlinearity)#"
+    },
+    {
+      "name": "nn.Softmax",
+      "description": "Applies the Softmax function to an n-dimensional input Tensor.",
+      "link": "generated/torch.nn.Softmax.html#torch.nn.Softmax",
+      "section": "Non-linear Activations (other)#"
+    },
+    {
+      "name": "nn.Softmax2d",
+      "description": "Applies SoftMax over features to each spatial location.",
+      "link": "generated/torch.nn.Softmax2d.html#torch.nn.Softmax2d",
+      "section": "Non-linear Activations (other)#"
+    },
+    {
+      "name": "nn.LogSoftmax",
+      "description": "Applies the log⁡(Softmax(x))\\log(\\text{Softmax}(x))log(Softmax(x)) function to an n-dimensional input Tensor.",
+      "link": "generated/torch.nn.LogSoftmax.html#torch.nn.LogSoftmax",
+      "section": "Non-linear Activations (other)#"
+    },
+    {
+      "name": "nn.AdaptiveLogSoftmaxWithLoss",
+      "description": "Efficient softmax approximation.",
+      "link": "generated/torch.nn.AdaptiveLogSoftmaxWithLoss.html#torch.nn.AdaptiveLogSoftmaxWithLoss",
+      "section": "Non-linear Activations (other)#"
+    }
+  ]
+}
