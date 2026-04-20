@@ -1,17 +1,21 @@
 # AdaExplore
 
-HardAgent is a research codebase for **LLM-driven GPU kernel engineering**. It combines:
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![arXiv](https://img.shields.io/badge/arXiv-xxxx.xxxxx-b31b1b.svg)](https://arxiv.org/abs/xxxx.xxxxx)
 
+> **Weihua Du, Jingming Zhuo, Yixin Dong, Andre Wang He, Weiwei Sun, Zeyu Zheng, Manupa Karunaratne, Ivan Fox, Tim Dettmers, Tianqi Chen, Yiming Yang, Sean Welleck**  
+> ["AdaExplore: Failure-Driven Adaptation and Diversity-Preserving Search for Efficient Kernel Generation " (2026)](https://arxiv.org/abs/xxxx.xxxxx)
+
+AdaExplore is a research codebase for **LLM-driven GPU kernel engineering**. It combines:
+
+- agent self-explored skill memory for mastering kernel languages
 - a multi-strategy search agent for proposing and revising kernels
 - a benchmark and evaluation harness for correctness and performance
-- optional memory components for iterative improvement
 - an optional remote evaluation service for multi-GPU or cluster setups
-
-The repository is built around KernelBench-style tasks, but also includes support for synthesized tasks, FlashInfer-style traces, MLSYS-style tasks, and TritonBench-G style inputs.
 
 ## What It Does
 
-Given a reference PyTorch operator or model component, HardAgent asks an LLM to generate optimized CUDA/Triton-style implementations, evaluates the generated kernels, and uses search to keep improving them.
+Given a reference PyTorch operator or model component, AdaExplore asks an LLM to generate optimized CUDA/Triton-style implementations, evaluates the generated kernels, and uses search to keep improving them.
 
 The main supported agent families are:
 
