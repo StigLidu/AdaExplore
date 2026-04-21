@@ -148,12 +148,16 @@ We also release the AdaExplore-generated kernels in `results/saved_kernels`; eac
 
 ## Citation
 
+If you find our work useful, please consider citing:
+
+```bibtex
 @article{du2026adaexplore,
   title={AdaExplore: Failure-Driven Adaptation and Diversity-Preserving Search for Efficient Kernel Generation},
   author={Weihua Du and Jingming Zhuo and Yixin Dong and Andre Wang He and Weiwei Sun and Zeyu Zheng and Manupa Karunaratne and Ivan Fox and Tim Dettmers and Tianqi Chen and Yiming Yang and Sean Welleck},
   journal={arXiv preprint arXiv:2604.16625},
   year={2026}
 }
+```
 
 ## Acknowledgments
 We thank [KernelBench](https://github.com/ScalingIntelligence/KernelBench) and [FlashInfer-Bench](https://github.com/flashinfer-ai/flashinfer-bench) for their open-source code and evaluation harnesses.
