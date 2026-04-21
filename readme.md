@@ -1,10 +1,10 @@
 # AdaExplore
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![arXiv](https://img.shields.io/badge/arXiv-xxxx.xxxxx-b31b1b.svg)](https://arxiv.org/abs/xxxx.xxxxx)
+[![arXiv](https://img.shields.io/badge/arXiv-2604.16625-b31b1b.svg)](https://arxiv.org/abs/2604.16625)
 
 > **Weihua Du, Jingming Zhuo, Yixin Dong, Andre Wang He, Weiwei Sun, Zeyu Zheng, Manupa Karunaratne, Ivan Fox, Tim Dettmers, Tianqi Chen, Yiming Yang, Sean Welleck**  
-> ["AdaExplore: Failure-Driven Adaptation and Diversity-Preserving Search for Efficient Kernel Generation " (2026)](https://arxiv.org/abs/xxxx.xxxxx)
+> ["AdaExplore: Failure-Driven Adaptation and Diversity-Preserving Search for Efficient Kernel Generation " (2026)](https://arxiv.org/abs/2604.16625)
 
 AdaExplore is a research codebase for **LLM-driven GPU kernel engineering**. The framework is built around two complementary stages:
 
@@ -28,7 +28,7 @@ In practice, this repository is a simplified open-source release of AdaExplore, 
 
 ## TODOs
 
-- [ ] The open-source release is still under refinements, and we welcome feedback!
+- [ ] The open-source release is still under refinement, and we welcome feedback!
 
 ## Installation
 
@@ -148,7 +148,12 @@ We also release the AdaExplore-generated kernels in `results/saved_kernels`; eac
 
 ## Citation
 
-Stay tuned!
+@article{du2026adaexplore,
+  title={AdaExplore: Failure-Driven Adaptation and Diversity-Preserving Search for Efficient Kernel Generation},
+  author={Weihua Du and Jingming Zhuo and Yixin Dong and Andre Wang He and Weiwei Sun and Zeyu Zheng and Manupa Karunaratne and Ivan Fox and Tim Dettmers and Tianqi Chen and Yiming Yang and Sean Welleck},
+  journal={arXiv preprint arXiv:2604.16625},
+  year={2026}
+}
 
 ## Acknowledgments
 We thank [KernelBench](https://github.com/ScalingIntelligence/KernelBench) and [FlashInfer-Bench](https://github.com/flashinfer-ai/flashinfer-bench) for their open-source code and evaluation harnesses.
