@@ -90,7 +90,7 @@ python synthesis/generate_data.py \
   --temperature 1.0
 
 python synthesis/rename.py \
-  --source_path outputs/data_generation/generated_data_composite_gpt-5-mini_YYYYMMDD_HHMMSS \
+  --source_path outputs/data_generation/<generated_data_dir_from_previous_step> \
   --data_path datasets/KernelBench_syn/<your_dataset_name> \
   --force
 ```
