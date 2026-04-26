@@ -11,12 +11,12 @@ server_type: openai
 model_name: gpt-5-mini
 max_completion_tokens: 16384
 general_memory_path: outputs/SYN-v1_example_run/general_memory.txt
+memory_update: true
 total_steps: 25
 max_memory_round: 5
 pool_size: 5
 disable_reviewer: true
 save_path: outputs/SYN-v1_example_run
-resume_from: outputs/SYN-v1_example_run
 debug: false
 use_remote_eval: true
 remote_eval_url: http://127.0.0.1:12017

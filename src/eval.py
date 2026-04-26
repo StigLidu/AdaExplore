@@ -314,46 +314,6 @@ def build_compile_cache(
     return True, stdout_buffer.getvalue(), None
 
 
-def build_compile_cache_with_capturing(
-    custom_model_src: str, verbose: bool = False, build_dir: os.PathLike = None
-) -> tuple[int, str, str]:
-    """
-    Write a temporary python file to compile the custom model on CPU
-    Captures the return code, stdout, and stderr
-    This works for capturing, build_compile_cache does not
-    """
-    if build_dir:
-        # Add import at the start of the source code
-        custom_model_src = (
-            "import os\n" f"os.environ['TORCH_EXTENSIONS_DIR'] = '{build_dir}'\n"
-        ) + custom_model_src
-
-    kernel_hash = hash(custom_model_src)
-    # tmp is a temp python file we write to for compilation
-    tmp = os.path.join(build_dir, f"tmp_{kernel_hash}.py")
-    os.makedirs(os.path.dirname(tmp), exist_ok=True)
-
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(custom_model_src)
-
-    # Execute the temporary Python file and capture output
-    process = subprocess.Popen(
-        ["python", tmp], stdout=subprocess.PIPE, stderr=subprocess.PIPE
-    )
-    stdout, stderr = process.communicate()
-    returncode = process.returncode
-
-    # Clean up temporary file
-    os.remove(tmp)
-
-    if verbose:
-        print("[CPU Precompile] return code: ", returncode)
-        print("[CPU Precompile] stdout: \n", stdout.decode("utf-8"))
-        print("[CPU Precompile] stderr: \n", stderr.decode("utf-8"))
-
-    return returncode, stdout.decode("utf-8"), stderr.decode("utf-8")
-
-
 def eval_kernel_against_ref(
     original_model_src: str,
     custom_model_src: str,
@@ -852,64 +812,6 @@ def run_and_check_correctness(
         return KernelExecResult(compiled=True, correctness=False, metadata=metadata)
 
 
-def check_metadata_serializable(metadata: dict):
-    """
-    Ensure metadata is JSON serializable,
-    if not, convert non-serializable values to strings
-    """
-    try:
-        json.dumps(metadata)
-    except (TypeError, OverflowError) as e:
-        print(f"[WARNING] Metadata is not JSON serializable, error: {str(e)}")
-        # Convert non-serializable values to strings
-        metadata = {
-            "eval_0": {
-                k: (
-                    str(v)
-                    if not isinstance(
-                        v, (dict, list, str, int, float, bool, type(None))
-                    )
-                    else v
-                )
-                for k, v in metadata["eval_0"].items()
-            }
-        }
-        print(
-            f"[WARNING] Metadata now converted to string: {metadata} to be JSON serializable"
-        )
-
-    return metadata
-
-
-def check_metadata_serializable_all_types(metadata: dict):
-    """
-    Ensure metadata is JSON serializable,
-    if not, convert non-serializable values to strings recursively
-    """
-
-    def convert_to_serializable(obj):
-        if isinstance(obj, dict):
-            return {k: convert_to_serializable(v) for k, v in obj.items()}
-        elif isinstance(obj, (list, tuple)):
-            return [convert_to_serializable(v) for v in obj]
-        elif isinstance(obj, (str, int, float, bool, type(None))):
-            return obj
-        else:
-            return str(obj)
-
-    try:
-        json.dumps(metadata)
-        return metadata
-    except (TypeError, OverflowError) as e:
-        print(f"[WARNING] Metadata is not JSON serializable, error: {str(e)}")
-        # Convert non-serializable values to strings recursively
-        converted_metadata = convert_to_serializable(metadata)
-        print(
-            f"[WARNING] Metadata now converted to be JSON serializable: {converted_metadata}"
-        )
-        return converted_metadata
-
-
 ################################################################################
 # Performance Eval
 ################################################################################
@@ -1324,166 +1226,10 @@ def wrapped_eval_kernel_against_ref(
     )
 
 
-def ncu_profile_solution(
-    original_model_src: str,
-    custom_model_src: str,
-    *,
-    device: Union[torch.device, int] = (
-        torch.cuda.current_device() if torch.cuda.is_available() else None
-    ),
-    backend: str = "cuda",
-    dtype_str: str = "fp32",
-    seed_num: int = 42,
-    build_dir: os.PathLike = None,
-    # NCU configuration
-    ncu_path: str = "ncu",
-    set: str = None,
-    sections: list[str] = ["SpeedOfLight"],
-    kernel_name: str | None = None,
-    page: str = "details",
-    nvtx_range: str = "kernelbench_ncu_profile",
-    # Execution control
-    timeout: int = 120,
-    tmpdir: str | None = None,
-    max_lines: int | None = 4000,
-) -> KernelExecResult:
-    """
-    Profile a KernelBench solution using NVIDIA Nsight Compute.
-
-    This runs `ncu` against a standalone runner (`src.ncu_subprocess_runner`) that
-    compiles + executes the custom model once inside an NVTX range, so NCU can filter.
-    """
-    device_val = str(device)
-    if shutil.which(ncu_path) is None:
-        return KernelExecResult(
-            compiled=False,
-            correctness=False,
-            metadata={
-                "error": f"NCU executable not found at '{ncu_path}'. Please install NVIDIA Nsight Compute."
-            },
-        )
-
-    with tempfile.TemporaryDirectory(prefix="kb_ncu_", dir=tmpdir) as build_dir_tmp:
-        payload_dir = Path(build_dir_tmp)
-        # The NCU runner expects file paths in args.json; write sources into the payload dir.
-        original_model_src_path = payload_dir / "original_model_src.py"
-        custom_model_src_path = payload_dir / "custom_model_src.py"
-        original_model_src_path.write_text(original_model_src)
-        custom_model_src_path.write_text(custom_model_src)
-
-        payload = {
-            "original_model_src_path": str(original_model_src_path),
-            "custom_model_src_path": str(custom_model_src_path),
-            "seed_num": seed_num,
-            "backend": backend,
-            "dtype_str": dtype_str,
-            "build_dir": str(build_dir) if build_dir is not None else None,
-            "num_warmup": 1,
-            "nvtx_range": nvtx_range,
-        }
-        (payload_dir / "args.json").write_text(json.dumps(payload))
-
-        cmd: list[str] = [
-            ncu_path,
-            "--page",
-            page,
-            "--nvtx",
-            "--nvtx-include",
-            f"{nvtx_range}]",
-            "--target-processes",
-            "all",
-        ]
-        if set is not None:
-            cmd.extend(["--set", set])
-        if sections:
-            for section in sections:
-                cmd.extend(["--section", section])
-        if kernel_name:
-            cmd.extend(["--kernel-name", kernel_name])
-        cmd.append("-f")
-        cmd.extend(
-            [
-                sys.executable,
-                "-u",
-                "-m",
-                "src.ncu_subprocess_runner",
-                "--data-dir",
-                str(payload_dir),
-                "--device",
-                f"cuda:{device_val}",
-                "--backend",
-                backend,
-                "--dtype-str",
-                dtype_str,
-                "--seed",
-                str(seed_num),
-                "--nvtx-range",
-                nvtx_range,
-            ]
-        )
-        if build_dir is not None:
-            cmd.extend(["--build-dir", str(build_dir)])
-
-        env = os.environ.copy()
-        if tmpdir:
-            env["TMPDIR"] = tmpdir
-
-        try:
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, env=env, timeout=timeout
-            )
-        except subprocess.TimeoutExpired:
-            return KernelExecResult(
-                compiled=False,
-                correctness=False,
-                metadata={
-                    "error": f"NCU profiling timed out after {timeout} seconds.",
-                    "ncu_cmd": " ".join(cmd),
-                },
-            )
-
-        output = (result.stdout or "") + (result.stderr or "")
-        if max_lines is not None:
-            lines = output.splitlines()
-            if len(lines) > max_lines:
-                output = "\n".join(
-                    lines[:max_lines]
-                    + [f"[Output truncated: {len(lines) - max_lines} more lines]"]
-                )
-
-        if result.returncode != 0:
-            return KernelExecResult(
-                compiled=False,
-                correctness=False,
-                metadata={
-                    "error": f"NCU exited with non-zero return code {result.returncode}.",
-                    "ncu_cmd": " ".join(cmd),
-                    "ncu_output": output,
-                },
-            )
-
-        return KernelExecResult(
-            compiled=True,
-            correctness=True,
-            metadata={
-                "ncu_cmd": " ".join(cmd),
-                "ncu_output": output,
-            },
-        )
-
 if __name__ == "__main__":
     import argparse
-    import json as _json
 
-    parser = argparse.ArgumentParser(description="KernelBench eval / NCU test entrypoint")
-    parser.add_argument(
-        "--test-ncu",
-        action="store_true",
-        help="Run a minimal NCU profile test on the example solution.",
-    )
-
-# fetch_baseline_time("level1", 0, ["1_Square_matrix_multiplication_.py"], "tests/baseline_time_matx3.json")
-    # Shared / example sources
+    parser = argparse.ArgumentParser(description="KernelBench remote-eval demo entrypoint")
     parser.add_argument(
         "--original-model-src-path",
         default="test_data/kernelbench/reference_src.py",
@@ -1497,63 +1243,22 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--backend", default="triton", help="cuda|triton")
     parser.add_argument("--dtype-str", default="fp32", help="fp16|fp32|bf16")
-
-    # Remote-eval demo args (kept as the default behavior)
     parser.add_argument("--remote-eval-url", default="http://localhost:12017")
-
-    # NCU args (only used when --test-ncu is set)
-    parser.add_argument("--device", default="cuda:0", help="CUDA device, e.g. cuda:0")
-    parser.add_argument("--ncu-path", default="ncu", help="Path to Nsight Compute executable")
-    parser.add_argument("--ncu-set", default="basic", help="NCU --set preset")
-    parser.add_argument(
-        "--ncu-section",
-        action="append",
-        default=["SpeedOfLight"],
-        help="Repeatable: NCU --section <name> (e.g. SpeedOfLight).",
-    )
-    parser.add_argument("--ncu-page", default="details", help="NCU --page (e.g. details)")
-    parser.add_argument("--kernel-name", default=None, help="Optional NCU --kernel-name filter")
-    parser.add_argument("--nvtx-range", default="kernelbench_ncu_profile")
-    parser.add_argument("--timeout", type=int, default=120)
-    parser.add_argument("--tmpdir", default=None, help="Optional TMPDIR for compilation/profiling")
-    parser.add_argument("--max-lines", type=int, default=4000, help="Max NCU output lines to keep")
     args = parser.parse_args()
 
     original_model_src = open(args.original_model_src_path, "r").read()
     custom_model_src = open(args.custom_model_src_path, "r").read()
 
-    if args.test_ncu:
-        result = ncu_profile_solution(
-            original_model_src=original_model_src,
-            custom_model_src=custom_model_src,
-            device=args.device,
-            backend=args.backend,
-            dtype_str=args.dtype_str,
-            seed_num=args.seed,
-            ncu_path=args.ncu_path,
-            set=args.ncu_set,
-            sections=args.ncu_section,
-            kernel_name=args.kernel_name,
-            page=args.ncu_page,
-            nvtx_range=args.nvtx_range,
-            timeout=args.timeout,
-            tmpdir=args.tmpdir,
-            max_lines=args.max_lines,
-        )
-        print(result.metadata["ncu_output"])
-    else:
-        # Backwards-compatible demo behavior: remote eval.
-        result = wrapped_eval_kernel_against_ref(
-            original_model_src=original_model_src,
-            custom_model_src=custom_model_src,
-            seed_num=args.seed,
-            num_correct_trials=1,
-            num_perf_trials=10,
-            verbose=False,
-            backend=args.backend,
-            measure_performance=True,
-            use_remote_eval=True,
-            remote_eval_url=args.remote_eval_url,
-        )
-        print(result)
-        print(type(result))
+    result = wrapped_eval_kernel_against_ref(
+        original_model_src=original_model_src,
+        custom_model_src=custom_model_src,
+        seed_num=args.seed,
+        num_correct_trials=1,
+        num_perf_trials=10,
+        verbose=False,
+        backend=args.backend,
+        measure_performance=True,
+        use_remote_eval=True,
+        remote_eval_url=args.remote_eval_url,
+    )
+    print(result)

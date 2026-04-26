@@ -8,7 +8,7 @@ gpu_name: NVIDIA GPU
 gpu_architecture: Ampere
 gpu_ids:
 - 0
-num_processes: 25
+num_processes: 10
 use_remote_eval: true
 remote_eval_url: http://127.0.0.1:12017
 server_type: openai

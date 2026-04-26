@@ -96,6 +96,20 @@ Notes:
 
 ---
 
+## Refreshing the PyTorch layer/activation list
+
+`synthesis/generate_data.py` (composite prompt style) reads `skill_memory/pytorch_layers_activations.json`, a snapshot of all `torch.nn` layers and activations scraped from the official PyTorch docs. The snapshot is committed in this repo, so you do **not** need to run the scraper to reproduce the paper results.
+
+Re-run it only if you want to refresh against a newer PyTorch version:
+
+```bash
+python skill_memory/scrape_pytorch_layers.py
+```
+
+This fetches `https://docs.pytorch.org/docs/stable/nn.html` and overwrites both `pytorch_layers_activations.json` (machine-readable) and `pytorch_layers_activations.txt` (human-readable) in this directory.
+
+---
+
 ## Quick sanity checks
 
 - **Skill memory**: open your memory file (for example `results/memory/general_memory_v1_200.txt`) and confirm each line looks like:

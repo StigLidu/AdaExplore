@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![arXiv](https://img.shields.io/badge/arXiv-2604.16625-b31b1b.svg)](https://arxiv.org/abs/2604.16625)
 
-> **Weihua Du, Jingming Zhuo, Yixin Dong, Andre Wang He, Weiwei Sun, Zeyu Zheng, Manupa Karunaratne, Ivan Fox, Tim Dettmers, Tianqi Chen, Yiming Yang, Sean Welleck**  
+> **Weihua Du, Jingming Zhuo, Yixin Dong, Andre He, Weiwei Sun, Zeyu Zheng, Manupa Karunaratne, Ivan Fox, Tim Dettmers, Tianqi Chen, Yiming Yang, Sean Welleck**  
 > ["AdaExplore: Failure-Driven Adaptation and Diversity-Preserving Search for Efficient Kernel Generation " (2026)](https://arxiv.org/abs/2604.16625)
 
 AdaExplore is a research codebase for **LLM-driven GPU kernel engineering**. The framework is built around two complementary stages:
@@ -26,20 +26,16 @@ In practice, this repository is a simplified open-source release of AdaExplore, 
 - `skill_memory/` builds and updates the reusable memory, 
 - `agent/` runs the search procedure used for benchmark or task-time optimization.
 
-## TODOs
-
-- [ ] The open-source release is still under refinement, and we welcome feedback!
-
 ## Installation
 
 ### 1. Create a Python environment and install dependencies
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -U pip
-pip install -r requirements.txt
+conda env create -f environment.yml
+conda activate adaexplore
 ```
+
+This creates a Python 3.12 environment named `adaexplore` and installs the pinned dependencies from `requirements.txt`. Verified on Linux x86_64 with Ampere-class GPUs and a CUDA 12.4 user-space driver; the bundled `torch==2.5.0` wheel ships its own CUDA 12.4 runtime, so only the NVIDIA host driver needs to support CUDA 12.4.
 
 ### 2. Configure model access
 
@@ -117,14 +113,31 @@ python skill_memory/skill_memory.py \
 
 The exploration stage corresponds to the second half of the paper: AdaExplore uses the skill memory collected during adaptation to guide search, while a tree-based optimizer preserves multiple candidate branches and alternates between local edits and structural reconstruction. In this repo, that behavior is implemented through the `MCTS` agent in `agent/agent_entry.py` and the benchmark configs under `config/`.
 
-To reproduce the main benchmark runs, first make sure `general_memory_path` points to the collected memory file, then launch the provided configs:
+## Reproducing Results
+
+The two configs above correspond directly to the **AdaExplore, 50-step, gpt-5-mini** rows of Table 1 in the paper:
+
+| Config | Benchmark | Problems | Steps / problem | Model |
+|---|---|---|---|---|
+| `config/KB-l2/config_KB-l2_AdaExplore_50.yaml` | KernelBench Level 2 | 100 (`test_list_2.txt`) | 50 | `gpt-5-mini` (OpenAI) |
+| `config/KB-l3/config_KB-l3_AdaExplore_50.yaml` | KernelBench Level 3 | 50 (`test_list_3.txt`) | 50 | `gpt-5-mini` (OpenAI) |
+
+Both configs already point to the bundled cross-task skill memory at `results/memory/general_memory_v1_200.txt`, so you can launch the reproduction directly without rerunning the Adapt stage.
+
+**Hardware.** The paper experiments use A6000 with a fixed frequency (1500MHz) at fp32.
+
+**Concurrency.** Each config runs `num_processes` agent workers in parallel, all submitting evaluations to the same online judge.
+
+**Summarizing a finished run.** After a config completes, use `tool_scripts/stats.py` to recover the Table 1 numbers:
 
 ```bash
-python agent/agent_entry.py --config config/KB-l2/config_KB-l2_AdaExplore_50.yaml
-python agent/agent_entry.py --config config/KB-l3/config_KB-l3_AdaExplore_50.yaml
+python tool_scripts/stats.py --log_folder outputs/KB-l2_AdaExplore_50 --step 50
+python tool_scripts/stats.py --log_folder outputs/KB-l3_AdaExplore_50 --step 50
 ```
 
-These runs use `agent_type: MCTS`, inject the cross-task skill memory during proposal, and save search traces plus the best discovered kernels under `outputs/KB-l2_AdaExplore_50` and `outputs/KB-l3_AdaExplore_50`. If you want to evaluate a single task instead of a full test list, you can override the fields `--level` and `--problem_id` directly on the command line.
+This reports correctness rate and aggregate speedup statistics (mean / median / fast_p threshold accuracies). If you want to re-measure performance with more trials before reporting, run `tool_scripts/re_evaluate.py` first (see the Evaluation section below).
+
+**Cost / runtime expectations.** A full 50-step Level 2 run hits the OpenAI API on the order of $10^4$ requests; budget several hours of wall-clock time on a single Ampere GPU and a non-trivial token bill. Both can be reduced for smoke testing by editing the test list (e.g. `2 1` to evaluate only level-2 problem 1) or by lowering `total_steps`.
 
 ## Evaluation
 

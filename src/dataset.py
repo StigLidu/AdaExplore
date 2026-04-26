@@ -3,7 +3,6 @@
 ################################################################################
 
 import os
-import random
 import re
 import hashlib
 import json
@@ -22,15 +21,6 @@ MLSYS26_CONTEST_PATH = os.path.join(REPO_TOP_PATH, "datasets", "mlsys26-contest"
 TRITONBENCH_PATH = os.path.join(REPO_TOP_PATH, "datasets", "TritonBench")
 TRITONBENCH_G_PATH = os.path.join(TRITONBENCH_PATH, "data", "TritonBench_G_v1")
 TRITONBENCH_G_FLAT_PATH = os.path.join(REPO_TOP_PATH, "datasets", "TritonBench_G_v1")
-
-
-def assign_problem_hash(problem_path: str) -> list[int]:
-    """
-    Assign a unique hash to a problem in the dataset
-    """
-    with open(problem_path, "r") as f:
-        problem_src = f.read()
-    return get_code_hash(problem_src)
 
 
 def get_code_hash(problem_src: str) -> str:
@@ -149,23 +139,6 @@ KERNELBENCH_LEVEL_3_DATASET = construct_kernelbench_dataset(level=3)
 ################################################################################
 # Eval on Subsets of KernelBench
 ################################################################################
-
-
-def get_kernelbench_subset(
-    level: int, num_subset_problems: int = 10, random_seed: int = 42
-) -> tuple[list[str], list[int]]:
-    """
-    Get a random subset of problems from the KernelBench dataset
-    """
-
-    full_dataset = construct_kernelbench_dataset(level)
-
-    random.seed(random_seed)
-    num_subset_problems = min(num_subset_problems, len(full_dataset))
-    subset_indices = random.sample(range(len(full_dataset)), num_subset_problems)
-
-    subset = sorted([full_dataset[i] for i in subset_indices])
-    return subset, subset_indices
 
 
 ################################################################################
@@ -289,6 +262,3 @@ def load_flashinfer_trace_definition(
         return json.load(f)
 
 
-def flashinfer_trace_definition_to_ref_arch_src(definition: dict) -> str:
-    """Return the reference implementation from definition."""
-    return definition.get("reference", "")

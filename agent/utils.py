@@ -154,19 +154,6 @@ def load_test_source(test_source: str, level, problem_id, suffix: str = ""):
     else:
         raise ValueError(f"Invalid test source: {test_source}")
 
-def compare_score(score1: tuple, score2: tuple|None=None):
-    # < 1: score1 is worse than score2, >= 1: score1 is better than score2
-    # < 0: much worse
-    if score2 is None:
-        return float('inf')
-    if score2[2] == 0:
-        if score1[2] == 0:
-            return 1
-        else:
-            return float('inf')
-    else:
-        return score1[2] / score2[2]
-
 def copy_step_files(src_path: str, dst_path: str):
     """
     Copy all non-best log files from source to destination directory.

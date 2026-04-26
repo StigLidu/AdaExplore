@@ -1,0 +1,20 @@
+# Conda environment for AdaExplore.
+#
+# Mirrors the venv-based install in the README (Python 3.12 + pip wheels from
+# requirements.txt). Verified end-to-end on Linux x86_64 with NVIDIA Ampere
+# GPUs (A6000) and CUDA 12.4 user-space; the bundled `torch==2.5.0` wheel pulls
+# in its own CUDA 12.4 runtime, so only an NVIDIA driver new enough for CUDA
+# 12.4 is required on the host.
+#
+# Usage:
+#     conda env create -f environment.yml
+#     conda activate adaexplore
+
+name: adaexplore
+channels:
+  - defaults
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+      - -r requirements.txt

@@ -37,15 +37,3 @@ def extract_first_code(output_string: str, code_language_types: list[str]) -> st
         return code
 
     return output_string
-
-
-def set_gpu_arch(arch_list: list[str]):
-    """
-    Set env variable for torch cuda arch list to build kernels for specified architectures.
-    """
-    valid_archs = ["Maxwell", "Pascal", "Volta", "Turing", "Ampere", "Hopper", "Ada"]
-    for arch in arch_list:
-        if arch not in valid_archs:
-            raise ValueError(f"Invalid architecture: {arch}. Must be one of {valid_archs}")
-
-    os.environ["TORCH_CUDA_ARCH_LIST"] = ";".join(arch_list)
