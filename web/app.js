@@ -65,7 +65,7 @@ const state = {
   curStep: 0,            // index into data.steps shown so far (inclusive)
   selected: 0,           // which node_id is open in the detail panel
   playing: false,
-  speed: 850,            // ms per step (lower = faster)
+  speed: 1200,           // ms per step (lower = faster)
   timer: null,
   saturationShown: false, // true once we've auto-paused at the 10× milestone
   viewBoxScale: 1,        // SVG units per CSS pixel; set each redraw from viewBox
@@ -114,12 +114,12 @@ function initPage(data) {
   state.saturationShown = false;
   document.getElementById("saturation-banner").hidden = true;
 
-  // Auto-pace: target roughly the same total wall-clock playback (~80s) for
+  // Auto-pace: target roughly the same total wall-clock playback (~120s) for
   // both 50-step and 200-step runs. Clamp so the speed never feels jerky or
   // glacial. The slider sits at the matching position so the user can still
   // override.
   const totalSteps = data.total_steps;
-  state.speed = Math.min(850, Math.max(350, Math.round(80000 / totalSteps)));
+  state.speed = Math.min(1200, Math.max(350, Math.round(120000 / totalSteps)));
   const slider = document.getElementById("speed");
   if (slider) slider.value = +slider.max + +slider.min - state.speed;
 
@@ -513,13 +513,12 @@ function renderDetail() {
     <h3>Step ${s.step} ${pillType}</h3>
     <p style="margin:0 0 0.6rem">${verdict}</p>
     <dl>
-      <dt>parent</dt><dd>node ${s.parent_node_id ?? "—"}</dd>
+      <dt>parent</dt><dd>step ${s.parent_node_id ?? "—"}</dd>
       <dt>depth</dt><dd>${s.depth}</dd>
-      <dt>visits</dt><dd>${s.visits}</dd>
       <dt>reward</dt><dd>${s.avg_reward.toFixed(3)}</dd>
       <dt title="Earlier nodes whose kernels were given to the LLM as working-memory / pool context for this proposal.">context</dt>
       <dd>${s.context_node_ids.length
-            ? s.context_node_ids.map(id => `node ${id}`).join(", ")
+            ? s.context_node_ids.map(id => `step ${id}`).join(", ")
             : "—"}</dd>
       ${s.runtime_us ? `<dt>runtime</dt><dd>${s.runtime_us.toFixed(2)} ms</dd>` : ""}
     </dl>
