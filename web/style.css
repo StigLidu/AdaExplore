@@ -1,0 +1,555 @@
+/* AdaExplore demo page — minimal, documentation-style. */
+:root {
+  --bg: #fafaf7;
+  --panel: #ffffff;
+  --ink: #1f1f1f;
+  --muted: #6b6b6b;
+  --border: #e5e2da;
+  --accent: #2a6df4;
+  --accent-soft: #2a6df41a;
+
+  --c-pending: #cbd5da;   /* dummy-root color; matches nodeColor() in app.js */
+  --c-fail: #d04746;
+  --c-incorrect: #ef9c1f;
+  --c-slow: #e8d352;
+  --c-fast-1: #9bd07a;
+  --c-fast-2: #4ca85a;
+  --c-fast-3: #1f6e36;
+  --c-best: #2a6df4;
+
+  --edge-small: #b6b1a4;
+  --edge-large: #2a6df4;
+  --ctx: #d97a16;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: ui-sans-serif, -apple-system, "Segoe UI", system-ui, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+}
+
+.container {
+  max-width: 980px;
+  margin: 0 auto;
+  padding: 1rem 1.25rem;
+}
+
+/* ---- Hero ---- */
+.hero {
+  background: #fff;
+  border-bottom: 1px solid var(--border);
+  padding: 3.5rem 0 2.5rem;
+}
+.eyebrow {
+  font-size: 0.78rem;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin: 0 0 0.5rem;
+}
+.hero h1 {
+  font-family: "Iowan Old Style", "Charter", Georgia, serif;
+  font-weight: 700;
+  font-size: 3rem;
+  margin: 0 0 0.4rem;
+  letter-spacing: -0.01em;
+}
+.subtitle {
+  font-size: 1.4rem;
+  color: #2c2c2c;
+  margin: 0 0 1.2rem;
+  font-weight: 500;
+}
+.authors {
+  font-size: 0.92rem;
+  color: var(--muted);
+  margin: 0 0 1.5rem;
+}
+.cta { margin: 0; }
+.btn {
+  display: inline-block;
+  padding: 0.5rem 1rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: #fff;
+  color: var(--ink);
+  text-decoration: none;
+  font-size: 0.92rem;
+  margin-right: 0.5rem;
+  cursor: pointer;
+  transition: transform 0.08s ease, background 0.15s ease, border-color 0.15s ease;
+}
+.btn-icon {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+.btn-icon svg {
+  width: 1rem;
+  height: 1rem;
+  flex: 0 0 auto;
+}
+.btn:hover  { background: #f0eee6; }
+.btn:active { transform: translateY(1px); }
+.btn.primary {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+.btn.primary:hover { background: #1f56c8; }
+
+/* ---- Intro ---- */
+.intro h2 {
+  font-family: "Iowan Old Style", Georgia, serif;
+  font-size: 1.6rem;
+  margin: 1.5rem 0 0.5rem;
+}
+.intro h3 {
+  font-family: "Iowan Old Style", Georgia, serif;
+  font-size: 1.25rem;
+  margin: 1.6rem 0 0.4rem;
+}
+.intro pre {
+  background: #1f2227;
+  color: #e8e8e8;
+  padding: 0.7rem 0.9rem;
+  border-radius: 6px;
+  font-size: 0.84rem;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  overflow: auto;
+  margin: 0.6rem 0;
+}
+.intro code {
+  background: #f0eee6;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 0.86em;
+}
+.intro pre code {
+  background: transparent;
+  padding: 0;
+}
+
+/* paper figures (insight + pipeline) at the top of the intro */
+.paper-figure {
+  margin: 1.2rem 0;
+}
+.paper-figure img {
+  width: 100%;
+  height: auto;
+  display: block;
+  border-radius: 8px;
+}
+.paper-figure--75 img {
+  max-width: 75%;
+  margin: 0 auto;
+}
+.paper-figure--90 img {
+  max-width: 90%;
+  margin: 0 auto;
+}
+.paper-figure figcaption {
+  font-size: 0.88rem;
+  color: var(--muted);
+  text-align: center;
+  margin-top: 0.4rem;
+  font-style: italic;
+}
+.figure-placeholder {
+  border: 2px dashed var(--border);
+  background: rgba(0, 0, 0, 0.025);
+  padding: 4rem 2rem;
+  text-align: center;
+  color: var(--muted);
+  font-style: italic;
+  border-radius: 8px;
+  font-size: 0.95rem;
+}
+.figure-placeholder-large {
+  min-height: 360px;
+  display: grid;
+  place-items: center;
+}
+.results-section {
+  margin: 2rem auto 1rem;
+}
+.results-figure {
+  margin: 1rem 0 0.75rem;
+}
+.results-figure img {
+  width: 100%;
+  height: auto;
+  display: block;
+  border-radius: 8px;
+}
+.results-figure figcaption {
+  font-size: 0.88rem;
+  color: var(--muted);
+  text-align: center;
+  margin-top: 0.5rem;
+  font-style: italic;
+}
+.results-note {
+  color: var(--muted);
+  margin-top: 0.75rem;
+}
+
+/* ---- Demo ---- */
+.demo {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 1.25rem 1.25rem 0.5rem;
+  margin: 2rem auto;
+}
+.demo-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin-bottom: 0.5rem;
+}
+.run-picker {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.run-picker label {
+  font-size: 0.78rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.run-picker select {
+  font-size: 0.95rem;
+  padding: 0.4rem 0.7rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #fff;
+  color: var(--ink);
+  max-width: min(60vw, 520px);
+  cursor: pointer;
+}
+.run-picker select:disabled {
+  background: #f3f1ea;
+  cursor: progress;
+}
+.run-blurb {
+  margin: 0.2rem 0 0.7rem;
+  font-size: 0.92rem;
+  color: var(--muted);
+  font-style: italic;
+}
+
+.saturation-banner {
+  display: flex;
+  align-items: center;
+  gap: 0.8rem;
+  padding: 0.7rem 0.9rem;
+  margin: 0.4rem 0 0.7rem;
+  background: #fff8e6;
+  border: 1px solid #f3d77a;
+  border-left: 4px solid #d97a16;
+  border-radius: 6px;
+  font-size: 0.9rem;
+  color: #4a3712;
+}
+.saturation-banner code {
+  background: #fff;
+  padding: 0 4px;
+  border-radius: 3px;
+  border: 1px solid #f0e2b8;
+  font-size: 0.85em;
+}
+.saturation-banner .btn {
+  margin-left: auto;
+  flex-shrink: 0;
+}
+.metrics-strip {
+  display: flex;
+  gap: 1.25rem;
+  font-size: 0.92rem;
+  color: var(--muted);
+}
+.metrics-strip strong { color: var(--ink); }
+
+/* ---- Controls ---- */
+.controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  padding: 0.6rem 0 0.8rem;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 0.8rem;
+}
+.controls .speed {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.9rem;
+  color: var(--muted);
+  margin-left: 0.5rem;
+}
+.controls .speed input { width: 100px; }
+.step-counter {
+  margin-left: auto;
+  font-size: 0.95rem;
+  color: var(--muted);
+}
+.step-counter strong { color: var(--ink); }
+
+/* ---- Tree + detail ---- */
+.viz-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 320px;
+  gap: 1.25rem;
+}
+@media (max-width: 880px) {
+  .viz-row { grid-template-columns: 1fr; }
+}
+
+.tree-wrap {
+  position: relative;
+  background: #fcfaf2;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;        /* viewBox handles fit-to-viewport; no scroll needed */
+}
+#tree {
+  width: 100%;
+  height: 560px;
+  display: block;
+  /* JS sets viewBox to the bbox of currently visible nodes + padding so the
+     visible subtree always fits the viewport, growing smoothly as new nodes
+     appear. SVG element size stays constant. */
+}
+
+/* ---- Tree nodes ---- */
+.node circle {
+  stroke-width: 1.5px;
+  stroke: rgba(0, 0, 0, 0.25);
+  transition: r 220ms ease, fill 220ms ease, stroke 180ms ease;
+  vector-effect: non-scaling-stroke;
+}
+.node.best circle { stroke: var(--c-best); stroke-width: 3px; }
+.node.selected circle { stroke: #1f1f1f; stroke-width: 2.5px; }
+.node.context circle {
+  stroke: var(--ctx);
+  stroke-width: 3px;
+  stroke-dasharray: 3 2;
+}
+.node.context.best circle {
+  stroke: var(--ctx);          /* context wins visually over best when both apply */
+}
+
+/* dashed amber arc from each context node to the node it informed */
+.context-link {
+  fill: none;
+  stroke: var(--ctx);
+  stroke-width: 1.5px;
+  stroke-dasharray: 4 3;
+  opacity: 0.7;
+  pointer-events: none;
+  vector-effect: non-scaling-stroke;
+}
+.node text {
+  font-weight: 600;
+  fill: #1f1f1f;
+  pointer-events: none;
+  paint-order: stroke;          /* white halo so labels stay legible over edges */
+  stroke: rgba(255, 255, 255, 0.85);
+  stroke-width: 3px;
+  stroke-linejoin: round;
+  vector-effect: non-scaling-stroke;
+}
+.node.milestone text {
+  fill: #1f1f1f;
+}
+.node.selected text {
+  fill: var(--accent);
+}
+.link {
+  fill: none;
+  stroke-width: 1.5px;
+  transition: stroke 200ms ease;
+  vector-effect: non-scaling-stroke;
+}
+.link.small { stroke: var(--edge-small); }
+.link.large { stroke: var(--edge-large); stroke-dasharray: 4 4; stroke-width: 2px; }
+
+/* The tree-pane groups the scrolling tree-wrap with the (always visible) legend
+   so the legend sits below the tree rather than scrolling away with it. */
+.tree-pane {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  min-width: 0;
+}
+
+/* ---- Legend ---- */
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem 1rem;
+  background: rgba(255, 255, 255, 0.92);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+.legend span { display: inline-flex; align-items: center; gap: 0.35rem; }
+.dot {
+  width: 10px; height: 10px;
+  border-radius: 50%;
+  display: inline-block;
+}
+.dot-pending   { background: var(--c-pending); }
+.dot-fail      { background: var(--c-fail); }
+.dot-incorrect { background: var(--c-incorrect); }
+.dot-slow      { background: var(--c-slow); }
+.dot-fast      { background: var(--c-fast-2); }
+.dot-best      { background: #fff; border: 2px solid var(--c-best); }
+.dot-ctx       { background: #fff; border: 2px dashed var(--ctx); }
+.edge-small {
+  width: 22px; height: 0; display: inline-block;
+  border-top: 2px solid var(--edge-small);
+  margin-bottom: 1px;
+}
+.edge-large {
+  width: 22px; height: 0; display: inline-block;
+  border-top: 2px dashed var(--edge-large);
+  margin-bottom: 1px;
+}
+
+/* ---- Detail panel ---- */
+.detail-panel {
+  background: #fcfaf2;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1rem;
+  font-size: 0.92rem;
+  height: 560px;
+  overflow: auto;
+}
+.detail-panel .hint {
+  color: var(--muted);
+  font-style: italic;
+  margin: 0;
+}
+.detail-panel h3 {
+  margin: 0 0 0.5rem;
+  font-size: 1rem;
+}
+.detail-panel dl {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 4px 10px;
+  margin: 0 0 0.8rem;
+}
+.detail-panel dt { color: var(--muted); }
+.detail-panel dd { margin: 0; word-break: break-word; }
+.detail-panel pre {
+  background: #1f2227;
+  color: #e8e8e8;
+  border-radius: 6px;
+  padding: 10px 12px;
+  font-size: 0.78rem;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  overflow: auto;
+  max-height: 260px;
+  margin: 0.4rem 0 0.8rem;
+}
+.detail-panel .pill {
+  display: inline-block;
+  font-size: 0.74rem;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  margin-right: 0.3rem;
+}
+.detail-panel .pill.large { background: #2a6df41a; color: var(--accent); }
+.detail-panel .pill.small { background: #99999933; color: #555; }
+.detail-panel .err {
+  color: var(--c-fail);
+  font-family: ui-monospace, monospace;
+  font-size: 0.78rem;
+  white-space: pre-wrap;
+}
+
+/* ---- Timeline ---- */
+.timeline-wrap {
+  margin-top: 1rem;
+  padding-bottom: 0.5rem;
+}
+.timeline-wrap h3 {
+  font-size: 0.92rem;
+  margin: 0 0 0.4rem;
+  color: var(--muted);
+  font-weight: 500;
+}
+#timeline { width: 100%; height: 120px; display: block; }
+.tl-line { fill: none; stroke: var(--accent); stroke-width: 2px; }
+.tl-area { fill: var(--accent-soft); }
+.tl-axis text { fill: var(--muted); font-size: 11px; }
+.tl-axis path, .tl-axis line { stroke: var(--border); }
+.tl-cursor { stroke: var(--c-fail); stroke-width: 1.5px; stroke-dasharray: 3 3; }
+
+.caveat {
+  font-size: 0.85rem;
+  color: var(--muted);
+  margin: 1.5rem auto;
+  padding: 0.7rem 0.9rem;
+  border-left: 3px solid var(--border);
+  background: rgba(0, 0, 0, 0.02);
+  border-radius: 0 4px 4px 0;
+}
+.caveat em {
+  color: var(--ink);
+  font-style: normal;
+  font-weight: 600;
+}
+.caveat code {
+  background: #f0eee6;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 0.86em;
+}
+
+/* ---- Footer ---- */
+footer {
+  border-top: 1px solid var(--border);
+  margin-top: 3rem;
+  padding-top: 1rem;
+  padding-bottom: 3rem;
+}
+footer h2 {
+  font-family: "Iowan Old Style", Georgia, serif;
+  font-size: 1.4rem;
+  margin: 0.5rem 0;
+}
+footer pre {
+  background: #fcfaf2;
+  color: var(--ink);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.8rem 1rem;
+  font-size: 0.85rem;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  white-space: pre-wrap;          /* keep indentation, but wrap long lines */
+  overflow-wrap: anywhere;        /* let very long unbroken tokens break too */
+}
+footer .muted {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+footer a { color: var(--accent); }

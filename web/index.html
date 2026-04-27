@@ -1,0 +1,264 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>AdaExplore</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<header class="hero">
+  <div class="container">
+    <h1>AdaExplore</h1>
+    <p class="subtitle">
+      Failure-Driven Adaptation and Diversity-Preserving Search
+      for Efficient Kernel Generation
+    </p>
+    <p class="authors">
+      Weihua Du · Jingming Zhuo · Yixin Dong · Andre He · Weiwei Sun ·
+      Zeyu Zheng · Manupa Karunaratne · Ivan Fox · Tim Dettmers · Tianqi Chen ·
+      Yiming Yang · Sean Welleck
+    </p>
+    <p class="cta">
+      <a class="btn btn-icon" href="https://arxiv.org/abs/2604.16625">
+        <svg viewBox="0 0 16 16" aria-hidden="true">
+          <path
+            fill="currentColor"
+            d="M3 1.5A1.5 1.5 0 0 1 4.5 0h4.38c.4 0 .78.16 1.06.44l2.62 2.62c.28.28.44.66.44 1.06v10.38A1.5 1.5 0 0 1 11.5 16h-7A1.5 1.5 0 0 1 3 14.5v-13ZM9 1.06V4.5c0 .28.22.5.5.5h3.44L9 1.06ZM5.25 7.25c0-.41.34-.75.75-.75h4c.41 0 .75.34.75.75s-.34.75-.75.75H6a.75.75 0 0 1-.75-.75Zm0 2.75c0-.41.34-.75.75-.75h4c.41 0 .75.34.75.75s-.34.75-.75.75H6a.75.75 0 0 1-.75-.75Zm0 2.75c0-.41.34-.75.75-.75h2.5c.41 0 .75.34.75.75s-.34.75-.75.75H6a.75.75 0 0 1-.75-.75Z"
+          ></path>
+        </svg>
+        <span>arXiv</span>
+      </a>
+      <a class="btn btn-icon" href="https://github.com/StigLidu/AdaExplore">
+        <svg viewBox="0 0 16 16" aria-hidden="true">
+          <path
+            fill="currentColor"
+            d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38
+               0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13
+               -.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07
+               -1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12
+               0 0 .67-.21 2.2.82a7.65 7.65 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82
+               .44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48
+               0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"
+          ></path>
+        </svg>
+        <span>Code</span>
+      </a>
+    </p>
+  </div>
+</header>
+
+<section class="container intro">
+  <figure class="paper-figure">
+    <img
+      src="src/adaevolve_framework_v4.png"
+      alt="AdaExplore pipeline figure"
+    />
+    <figcaption>AdaExplore: two-stage Adapt → Explore pipeline.</figcaption>
+  </figure>
+  <h2>Overview</h2>
+  <p>
+    AdaExplore is an LLM agent for GPU kernel generation with a two-stage pipeline:
+    <strong>failure-driven adaptation</strong> that distills past failures
+    into reusable rules, and <strong>diversity-preserving search</strong> that
+    maintains multiple kernel candidates in parallel. Together they improve
+    both correctness and speedup without any fine-tuning or external
+    knowledge.
+  </p>
+  <h2>Why AdaExplore?</h2>
+  <p>
+    Kernel generation is hard for LLMs for two reasons. First,
+    <strong>correctness has a sharp feasibility boundary</strong>: even
+    small mistakes in syntax, memory access, or parallelization often cause
+    compilation failures or runtime errors. Kernel generation is also
+    underrepresented in LLM pretraining data, so models tend to repeat the
+    same mistakes across tasks instead of learning from them. Second,
+    <strong>performance lives on a rugged optimization landscape</strong>:
+    meaningful speedups usually require coordinated structural changes, such
+    as different tiling, parallelization, or fusion strategies, rather than
+    small local edits. A search that only patches the current best often gets
+    trapped in a weak strategy, while a search that only regenerates from
+    scratch never fully refines promising candidates.
+  </p>
+  <figure class="paper-figure">
+    <img
+      src="src/insight_figure_v3.png"
+      alt="AdaExplore insight figure"
+    />
+    <figcaption>The difficulty of kernel optimization.</figcaption>
+  </figure>
+  <p>
+    AdaExplore addresses both challenges directly. The Adapt stage builds a
+    cross-task memory of recurring failures, helping the agent avoid mistakes
+    it has already seen. The Explore stage runs a tree search that
+    alternates between <em>small steps</em> for local refinement and
+    <em>large steps</em> for structural regeneration, while keeping multiple
+    promising branches alive in parallel. Together, these two stages handle
+    both the sharp feasibility boundary and the highly non-linear performance
+    landscape.
+  </p>
+
+  <h3>Adapt: failure-driven skill acquisition</h3>
+  <p>
+    The agent is first run on a few hundred synthesized kernel-style tasks.
+    Each compilation or runtime failure is summarized by an LLM into a minimal
+    <em>"you cannot..."</em> rule, near-duplicates are merged by an LLM judge,
+    and only rules that recur across multiple independent failures are kept.
+    The result is a compact <em>skill memory</em> that is injected into every
+    proposal prompt during search, so the agent stops repeating mistakes it
+    has already encountered.
+  </p>
+  <p>
+    For example, a synthesized <code>hardswish</code> kernel produced the
+    following error:
+  </p>
+  <pre><code>x = tl.load(X_ptr + offs, mask=mask, other=tl.float32(0.0))
+                                           ^
+TypeError: 'dtype' object is not callable</code></pre>
+  <p>
+    The Adapt pipeline distilled this failure into a single rule that was
+    added to the cross-task skill memory:
+  </p>
+  <pre><code>You cannot call tl.float32 as a function inside a Triton kernel.</code></pre>
+  <p>
+    Once distilled, the rule stays in memory as a single line and helps
+    prevent the same mistake in future kernels.
+  </p>
+
+  <h3>Explore: diversity-preserving search</h3>
+  <p>
+    The Explore stage organizes candidate kernels into an MCTS search tree.
+    <strong>Small steps</strong> refine the current best locally while
+    keeping the recent refinement chain in working memory. Occasionally,
+    <strong>large steps</strong> regenerate the kernel from scratch, seeded
+    by a representative kernel from the pool, to escape local minima.
+  </p>
+  <p>
+    The figure below shows several concrete Explore trajectories augmented
+    with the learned skill memory.
+  </p>
+</section>
+
+<section class="container demo">
+  <div class="demo-header">
+    <div class="run-picker">
+      <label for="run-select">Run</label>
+      <select id="run-select" disabled><option>Loading…</option></select>
+    </div>
+    <div class="metrics-strip" id="metrics-strip"></div>
+  </div>
+  <p class="run-blurb" id="run-blurb"></p>
+
+  <div id="saturation-banner" class="saturation-banner" hidden>
+    <span><strong>Stopped at 10×.</strong> Evaluation caps <code>fast_p</code> at 10×
+    to remove outlier measurements, so MCTS also limits its internal reward signal at
+    10× to stay consistent with the evaluator. Any further gains shown above this line
+    come from continued exploration on promising regions of the tree. Press
+    <em>Play</em> to keep watching the rest of the trajectory.</span>
+    <button id="banner-dismiss" class="btn">Continue ▶</button>
+  </div>
+
+  <div class="controls">
+    <button id="play-pause" class="btn primary">▶ Play</button>
+    <button id="step-back" class="btn">◀ Step</button>
+    <button id="step-fwd" class="btn">Step ▶</button>
+    <button id="reset" class="btn">↻ Reset</button>
+    <label class="speed">
+      Speed
+      <input id="speed" type="range" min="100" max="1500" value="750" />
+    </label>
+    <span class="step-counter">step <strong id="cur-step">0</strong> / <span id="max-step">50</span></span>
+  </div>
+
+  <div class="viz-row">
+    <div class="tree-pane">
+      <div class="tree-wrap">
+        <svg id="tree"></svg>
+      </div>
+      <div class="legend">
+        <span><span class="dot dot-pending"></span>dummy root</span>
+        <span><span class="dot dot-fail"></span>compile / runtime error</span>
+        <span><span class="dot dot-incorrect"></span>compiled, incorrect</span>
+        <span><span class="dot dot-slow"></span>correct, &lt;1× speedup</span>
+        <span><span class="dot dot-fast"></span>correct, ≥1× speedup</span>
+        <span><span class="edge-small"></span>small step</span>
+        <span><span class="edge-large"></span>large step</span>
+        <span><span class="dot dot-best"></span>current best</span>
+        <span><span class="dot dot-ctx"></span>context for selected</span>
+      </div>
+    </div>
+
+    <aside class="detail-panel" id="detail">
+      <p class="hint">Click any node in the tree, or let the animation play.</p>
+    </aside>
+  </div>
+
+  <div class="timeline-wrap">
+    <h3>Best speedup over time</h3>
+    <svg id="timeline" width="900" height="120"></svg>
+  </div>
+</section>
+
+<p class="container caveat">
+  <em>Caveat:</em> "correctness" here means passing KernelBench's randomized
+  numerical-tolerance check (<code>atol=rtol=5e-2</code> over five
+  trials). The kernels shown are not formally verified and may not be safe
+  to drop into production without further testing.
+</p>
+
+<section class="container results-section">
+  <h2>Results</h2>
+  <p>
+    Both stages of AdaExplore deliver measurable gains on KernelBench:
+    Adapt raises pass@1 correctness for every base model we tested, and
+    Explore produces faster final kernels than the search baselines we
+    compared against.
+  </p>
+
+  <h3>Adapt Stage Improves Generation Correctness</h3>
+  <p>
+    The Adapt stage turns repeated failures into reusable rules and feeds
+    them back into every future proposal. The figure below compares each
+    base model's pass@1 correctness with its own skill memory enabled
+    (<code>w. SM</code>) against direct generation (<code>Direct</code>).
+    Every model we tested sees a substantial correctness gain after building
+    a skill memory.
+  </p>
+  <figure class="paper-figure paper-figure--75">
+    <img
+      src="src/adapt.png"
+      alt="Adapt stage correctness figure"
+    />
+    <figcaption>Adapt stage correctness rate across KernelBench settings.</figcaption>
+  </figure>
+  <h3>Explore Stage Improves Kernel Efficiency</h3>
+  <p>
+    Given a fixed per-problem search budget, Explore finds substantially
+    faster kernels than prior search baselines by maintaining multiple
+    candidate branches and alternating between local refinement (small
+    steps) and structural rewrites (large steps).
+  </p>
+  <figure class="paper-figure paper-figure--90">
+    <img
+      src="src/explore.png"
+      alt="Explore stage efficiency figure"
+    />
+    <figcaption>Explore stage speedup across KernelBench settings.</figcaption>
+  </figure>
+</section>
+
+<footer class="container">
+  <h2>Cite</h2>
+  <pre><code>@article{du2026adaexplore,
+  title={AdaExplore: Failure-Driven Adaptation and Diversity-Preserving Search for Efficient Kernel Generation},
+  author={Du, Weihua and Zhuo, Jingming and Dong, Yixin and He, Andre Wang and Sun, Weiwei and Zheng, Zeyu and Karunaratne, Manupa and Fox, Ivan and Dettmers, Tim and Chen, Tianqi and Yang, Yiming and Welleck, Sean},
+  journal={arXiv preprint arXiv:2604.16625},
+  year={2026}
+}</code></pre>
+</footer>
+
+<script src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,65 @@
+{
+  "showcases": [
+    {
+      "id": "kb-l2-p40-200",
+      "file": "showcase/kb-l2-p40-200.json",
+      "label": "L2 / 40 (6.18x speedup)",
+      "blurb": "Seventeen separate best-score updates across 200 search steps. Never reaches MCTS's 10× reward ceiling, so the full trajectory plays without an auto-pause.",
+      "default": true
+    },
+    {
+      "id": "kb-l2-p83-200",
+      "file": "showcase/kb-l2-p83-200.json",
+      "label": "L2 / 83 (10+ speedup)",
+      "blurb": "Sixteen distinct best-score updates. Climbs through the MCTS reward ceiling at step 25, then exploration keeps stumbling onto faster strategies all the way to a 912× speedup."
+    },
+    {
+      "id": "kb-l2-p84-200",
+      "file": "showcase/kb-l2-p84-200.json",
+      "label": "L2 / 84 (10+ speedup)",
+      "blurb": "Plateaus around 5× through the first 140 steps; then a structural large step finally breaks out and reaches 22.4×. A clear example of diversity-preserving search paying off late."
+    },
+    {
+      "id": "kb-l2-p42-200",
+      "file": "showcase/kb-l2-p42-200.json",
+      "label": "L2 / 42 (10+ speedup)",
+      "blurb": "Step 2 already hits 28× — well past MCTS's 10× reward ceiling. After that, MCTS no longer differentiates, yet exploration keeps stumbling onto faster strategies (87× → 125× → 249×)."
+    },
+    {
+      "id": "kb-l2-p44-200",
+      "file": "showcase/kb-l2-p44-200.json",
+      "label": "L2 / 44 (10+ speedup)",
+      "blurb": "Saturates at 10× around step 54, then continues climbing to 92×."
+    },
+    {
+      "id": "kb-l2-p18-200",
+      "file": "showcase/kb-l2-p18-200.json",
+      "label": "L2 / 18 (10+ speedup)",
+      "blurb": "First correct kernel is already 15.65× — past the MCTS reward ceiling immediately. The rest of the run is exploration on top of a flat reward landscape, eventually finding 98×."
+    },
+    {
+      "id": "kb-l2-p63-200",
+      "file": "showcase/kb-l2-p63-200.json",
+      "label": "L2 / 63 (5.53x speedup)",
+      "blurb": "Fourteen progress events spread across the full 200 steps without ever crossing 10× — the search stays inside MCTS's sensitive reward range the whole time."
+    },
+    {
+      "id": "kb-l2-p29-200",
+      "file": "showcase/kb-l2-p29-200.json",
+      "label": "L2 / 29 (5.05x speedup)",
+      "blurb": "Eleven incremental improvements to a final speedup of 5.05×. Small-step refinement chains stitched together by occasional large-step branching."
+    },
+    {
+      "id": "kb-l2-p70-200",
+      "file": "showcase/kb-l2-p70-200.json",
+      "label": "L2 / 70 (5.98x speedup)",
+      "blurb": "Ten progress events over 200 steps; ends just under the saturation point at 5.98×. The full trajectory plays without entering the saturation regime."
+    },
+    {
+      "id": "kb-l2-p92-200",
+      "file": "showcase/kb-l2-p92-200.json",
+      "label": "L2 / 92 (3.88x speedup)",
+      "blurb": "First correct kernel already beats baseline (1.41×). Eleven jumps of incremental refinement to 3.88×, well below the saturation point — pure reward-driven optimization."
+    }
+  ]
+}

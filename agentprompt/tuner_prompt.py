@@ -234,7 +234,7 @@ if __name__ == "__main__":
     inference_server = create_inference_server(
         server_type="azure",
     )
-    output = query_inference_server(inference_server, model_name="gpt-5", prompt=prompt, max_completion_tokens=1000)
+    output = query_inference_server(inference_server, model_name="gpt-5-mini", prompt=prompt, max_completion_tokens=1000)
     print(output)
     print("-" * 100)
     edits = extract_edits(output)

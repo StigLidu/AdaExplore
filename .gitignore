@@ -21,7 +21,6 @@ slurm-*
 .env
 *.csv
 *.pkl
-*.pdf
 *.zip
 *.tar.gz
 *.err
@@ -46,3 +45,4 @@ test.txt
 
 # Paper artifacts
 outputs_paper/*
+experiments
