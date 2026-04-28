@@ -65,7 +65,7 @@ const state = {
   curStep: 0,            // index into data.steps shown so far (inclusive)
   selected: 0,           // which node_id is open in the detail panel
   playing: false,
-  speed: 1200,           // ms per step (lower = faster)
+  speed: 1350,           // ms per step (lower = faster)
   timer: null,
   saturationShown: false, // true once we've auto-paused at the 10× milestone
   viewBoxScale: 1,        // SVG units per CSS pixel; set each redraw from viewBox
@@ -114,12 +114,12 @@ function initPage(data) {
   state.saturationShown = false;
   document.getElementById("saturation-banner").hidden = true;
 
-  // Auto-pace: target roughly the same total wall-clock playback (~120s) for
+  // Auto-pace: target roughly the same total wall-clock playback (~135s) for
   // both 50-step and 200-step runs. Clamp so the speed never feels jerky or
   // glacial. The slider sits at the matching position so the user can still
   // override.
   const totalSteps = data.total_steps;
-  state.speed = Math.min(1200, Math.max(350, Math.round(120000 / totalSteps)));
+  state.speed = Math.min(1350, Math.max(350, Math.round(135000 / totalSteps)));
   const slider = document.getElementById("speed");
   if (slider) slider.value = +slider.max + +slider.min - state.speed;
 
