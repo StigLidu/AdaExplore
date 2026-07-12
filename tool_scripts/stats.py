@@ -1,3 +1,38 @@
+"""Summarize the statistics of one (or more) run log folder(s).
+
+A log folder is the output directory of a single run and contains one
+sub-directory per task (e.g. ``2_1``, ``2_2``, ... = ``<level>_<problem_id>``),
+each holding that task's per-step kernels, prompts, and metrics files. This
+script walks a log folder, picks each task's best kernel (from its
+``global_best_metrics_*`` file, or by re-scanning the steps with
+``--force_refind``), and reports aggregate quality numbers:
+
+  * correctness rate (how many tasks produced a correct kernel), and
+  * speedup statistics: arithmetic mean and clamped geometric mean GM(10)
+    over all tasks and over correct-only tasks, plus the fraction of tasks
+    beating the 1.2x / 2.0x speedup thresholds.
+
+Typical usage::
+
+    # summarize one run at step 50
+    python tool_scripts/stats.py --log_folder outputs/KB-l2_AdaExplore_50 --step 50
+
+    # summarize several runs at once
+    python tool_scripts/stats.py --log_folder outputs/run_a outputs/run_b --step 50
+
+    # per-task breakdown
+    python tool_scripts/stats.py --log_folder outputs/<run> --step 50 --verbose
+
+Notes:
+  * ``--step N`` selects which ``global_best_metrics_*_N`` snapshot to score;
+    without it the step is inferred from the folder name and may fail if the
+    name does not end in a step number.
+  * ``--rename_bug_folders`` (off by default) is destructive: it appends a
+    ``_BUG`` suffix to task folders whose evaluation hit an infrastructure
+    error (OOM / disk full / remote-eval failure), overwriting any existing
+    ``_BUG`` folder. Leave it off when analyzing data you intend to keep.
+"""
+
 import argparse
 import os
 import ast
@@ -20,7 +55,9 @@ level_mapping = {
 SPEEDUP_CLAMP = (0.0, 10.0)
 
 def parse_args():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Summarize correctness and speedup statistics of a run log folder.",
+    )
     # The log folder to process
     # Folder structure: agent-type_knowledge-base_task-level_step_date-time
     parser.add_argument(
@@ -39,6 +76,7 @@ def parse_args():
     parser.add_argument("--filter_meaningless", action="store_true", default=False, help="Filter out meaningless kernels")
     parser.add_argument("--meaningless_list_path", type=str, default="datasets/meaningless.txt", help="Path to the meaningless list")
     parser.add_argument("--verbose", action="store_true", default=False, help="Verbose each task's metrics")
+    parser.add_argument("--rename_bug_folders", action="store_true", default=False, help="Rename folders with eval errors by appending a _BUG suffix (destructive: overwrites existing _BUG folders). Off by default.")
     args = parser.parse_args()
     return args
 
@@ -243,7 +281,7 @@ def process_log_folder(
             print(f"Task ID: {level} {problem_id}, Fast P: {best_fast_p}")
 
         # Handle bug folder
-        if not ood_tag and not no_place_tag:
+        if args.rename_bug_folders and not ood_tag and not no_place_tag:
             bug_folder = os.path.join(log_folder, f"{level}_{problem_id}_BUG")
             if os.path.exists(bug_folder):
                 shutil.rmtree(bug_folder)
@@ -319,16 +357,21 @@ def main():
         # Print statistics for this folder
         tc, cc = stats["total_count"], stats["correct_count"]
         if tc > 0:
-            print(f"\nStatistics for {log_folder}:")
-            print(f"  Total: {tc}, Correct: {cc}, Accuracy: {cc/tc:.4f}")
-            print(f"  Avg speedup: {stats['sum_speedup']/tc:.4f}, "
-                  f"GM(10): {math.exp(stats['log_sum_speedup_with_incorrect']/tc):.4f}")
+            rule = "─" * 60
+            gm_all = math.exp(stats['log_sum_speedup_with_incorrect'] / tc)
+            print(f"\n{rule}")
+            print(f"  Summary · {log_folder}")
+            print(rule)
+            print(f"  {'Tasks':<18}{cc}/{tc} correct  ({cc/tc*100:.2f}% accuracy)")
+            print(f"  {'Speedup (all)':<18}avg {stats['sum_speedup']/tc:.4f}×    GM(10) {gm_all:.4f}×")
             if cc > 0:
-                print(f"  Avg speedup (correct only): {stats['sum_speedup']/cc:.4f}, "
-                      f"GM(10) (correct only): {math.exp(stats['log_sum_speedup']/cc):.4f}")
-            print(f"  Bug eval count: {stats['bug_eval_count']}")
-            print(f"  Count 1.2: {stats['count_1_2']}")
-            print(f"  Count 2: {stats['count_2']}")
+                gm_corr = math.exp(stats['log_sum_speedup'] / cc)
+                print(f"  {'Speedup (correct)':<18}avg {stats['sum_speedup']/cc:.4f}×    GM(10) {gm_corr:.4f}×")
+            print(f"  {'> 1.2× speedup':<18}{stats['count_1_2']}/{tc}  ({stats['count_1_2']/tc*100:.1f}%)")
+            print(f"  {'> 2.0× speedup':<18}{stats['count_2']}/{tc}  ({stats['count_2']/tc*100:.1f}%)")
+            if args.rename_bug_folders:
+                print(f"  {'Bug eval count':<18}{stats['bug_eval_count']}")
+            print(rule)
         else:
             print(f"No valid results found in {log_folder}")
 
@@ -338,7 +381,8 @@ def main():
                 json.dump(stats['prefix_best_data'], f)
             print(f"  Saved prefix best data to {prefix_path}")
 
-        if stats['bug_eval_count'] > 0 or stats['total_count'] < args.range_end:
+        bug_incomplete = args.rename_bug_folders and stats['bug_eval_count'] > 0
+        if bug_incomplete or stats['total_count'] < args.range_end:
             partial_folders.append(log_folder)
         
         # Save eval task ids for this folder
@@ -351,7 +395,8 @@ def main():
             with open(save_path, "w") as f:
                 f.writelines(f"{level} {problem_id}\n" for level, problem_id in eval_task_ids)
     
-    print("incomplete folders: ", partial_folders)
+    if partial_folders:
+        print("incomplete folders: ", partial_folders)
 
 
 if __name__ == "__main__":

@@ -138,6 +138,8 @@ python tool_scripts/stats.py --log_folder outputs/KB-l3_AdaExplore_50 --step 50
 
 This reports correctness rate and aggregate speedup statistics (mean / median / fast_p threshold accuracies). If you want to re-measure performance with more trials before reporting, run `tool_scripts/re_evaluate.py` first (see the Evaluation section below).
 
+We release the raw run traces (per-task step kernels, prompts, and metrics) used for the paper at [VanishD/AdaExplore_Traces](https://huggingface.co/datasets/VanishD/AdaExplore_Traces). Download and extract an archive, then verify the reported numbers directly from them with the same script, e.g. `python tool_scripts/stats.py --log_folder MCTS_0120_KB-l2_200 --step 200` (and `--log_folder MCTS_0120_KB-l3_100 --step 100` for Level 3).
+
 **Cost / runtime expectations.** A full 50-step Level 2 run hits the OpenAI API on the order of $10^4$ requests; budget several hours of wall-clock time on a single Ampere GPU and a non-trivial token bill. Both can be reduced for smoke testing by editing the test list (e.g. `2 1` to evaluate only level-2 problem 1) or by lowering `total_steps`.
 
 ## Evaluation
