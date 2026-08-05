@@ -3,131 +3,114 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
-# Autotune configurations tuned for NVIDIA A6000 (Ampere).
-# Explore a range of BLOCK sizes and ROWS_PER_PROG to find the best throughput.
+# Autotune some reasonable block sizes for elementwise operations
 AUTOTUNE_CONFIGS = [
-    triton.Config({"BLOCK": 128,  "ROWS_PER_PROG": 1}, num_warps=4, num_stages=2),
-    triton.Config({"BLOCK": 128,  "ROWS_PER_PROG": 2}, num_warps=4, num_stages=2),
-    triton.Config({"BLOCK": 128,  "ROWS_PER_PROG": 4}, num_warps=8, num_stages=2),
-
-    triton.Config({"BLOCK": 256,  "ROWS_PER_PROG": 1}, num_warps=4, num_stages=2),
-    triton.Config({"BLOCK": 256,  "ROWS_PER_PROG": 2}, num_warps=8, num_stages=3),
-    triton.Config({"BLOCK": 256,  "ROWS_PER_PROG": 4}, num_warps=8, num_stages=3),
-    triton.Config({"BLOCK": 256,  "ROWS_PER_PROG": 8}, num_warps=8, num_stages=3),
-
-    triton.Config({"BLOCK": 512,  "ROWS_PER_PROG": 1}, num_warps=8, num_stages=3),
-    triton.Config({"BLOCK": 512,  "ROWS_PER_PROG": 2}, num_warps=8, num_stages=3),
-    triton.Config({"BLOCK": 512,  "ROWS_PER_PROG": 4}, num_warps=8, num_stages=3),
-
-    # try a larger BLOCK to increase memory throughput on Ampere
-    triton.Config({"BLOCK": 1024, "ROWS_PER_PROG": 1}, num_warps=8, num_stages=3),
-    triton.Config({"BLOCK": 1024, "ROWS_PER_PROG": 2}, num_warps=8, num_stages=3),
+    triton.Config({"BLOCK": 256},  num_warps=2, num_stages=2),
+    triton.Config({"BLOCK": 512},  num_warps=4, num_stages=2),
+    triton.Config({"BLOCK": 1024}, num_warps=8, num_stages=2),
 ]
 
-@triton.autotune(configs=AUTOTUNE_CONFIGS, key=['n_rows', 'W', 'H', 'C'])
+
+@triton.autotune(
+    configs=AUTOTUNE_CONFIGS,
+    key=["n_elements"],
+)
 @triton.jit
-def _fused_relu_add_bias_rowwise(
-    x_ptr,         # pointer to input tensor (N*C*H*W), contiguous
-    bias_ptr,      # pointer to bias (C,)
-    out_ptr,       # pointer to output tensor
-    n_rows,        # N * C * H (number of rows)
-    W,             # width (elements per row)
-    H,             # height (used to recover channel index)
-    C,             # channels
-    BLOCK: tl.constexpr,         # number of elements processed per program along W
-    ROWS_PER_PROG: tl.constexpr, # number of rows handled per program
+def _relu_add_bias_kernel(
+    x_ptr,          # pointer to input (flattened)
+    bias_ptr,       # pointer to bias (C,)
+    out_ptr,        # pointer to output (flattened)
+    N,              # batch
+    C,              # channels
+    H,              # height
+    W,              # width
+    hw,             # H*W
+    n_elements,     # total number of elements
+    BLOCK: tl.constexpr,
 ):
     """
-    Each program processes ROWS_PER_PROG consecutive rows and a contiguous block
-    of BLOCK elements along the width dimension. This layout favors memory
-    coalescing and reuses the scalar bias per-channel for all vector lanes.
+    For each linear index idx in [0, n_elements):
+      c = (idx // hw) % C
+      out[idx] = relu(x[idx]) + bias[c]
     """
-    group = tl.program_id(0)   # which group of rows (each group contains ROWS_PER_PROG rows)
-    block_id = tl.program_id(1)
-    col_start = block_id * BLOCK
-    offs = col_start + tl.arange(0, BLOCK)  # offsets within a row
-    mask_cols = offs < W                      # mask for valid columns
+    pid = tl.program_id(0)
+    block_start = pid * BLOCK
+    offsets = block_start + tl.arange(0, BLOCK)
+    mask = offsets < n_elements
 
-    base_row = group * ROWS_PER_PROG
+    # Load input values (masked)
+    x_vals = tl.load(x_ptr + offsets, mask=mask, other=0.0)
 
-    # Unroll across the small constexpr ROWS_PER_PROG
-    for i in range(ROWS_PER_PROG):
-        row = base_row + i
-        within_rows = row < n_rows  # boolean scalar representing validity of the row
+    # Compute channel indices for each flattened offset:
+    # idx // hw gives (n * C + c) for flattened by (N, C, H, W),
+    # then % C yields channel c.
+    # Note: hw and C are Python integers passed in as kernel args.
+    c_idx = (offsets // hw) % C
 
-        # compute flattened offsets for this row: row * W + offs
-        row_start = row * W
-        flat_offs = row_start + offs
+    # Load bias per-channel (broadcast)
+    bias_vals = tl.load(bias_ptr + c_idx, mask=mask, other=0.0)
 
-        # combine masks: both column valid and row valid
-        mask = mask_cols & within_rows
+    # ReLU implemented with where to avoid relying on tl.max
+    relu_vals = tl.where(x_vals > 0.0, x_vals, 0.0)
 
-        # Load inputs for this segment (masked)
-        x_vals = tl.load(x_ptr + flat_offs, mask=mask, other=0.0)
+    out_vals = relu_vals + bias_vals
 
-        # recover channel index:
-        # row = ((n * C) + c) * H + h  => tmp = row // H = n*C + c  => c = tmp % C
-        tmp = row // H
-        c = tmp % C
-
-        # Load bias scalar for this channel and broadcast-add
-        bias_val = tl.load(bias_ptr + c)
-
-        # fused op: relu then add bias
-        relu = tl.where(x_vals > 0.0, x_vals, 0.0)
-        out_vals = relu + bias_val
-
-        # Store results back (masked)
-        tl.store(out_ptr + flat_offs, out_vals, mask=mask)
+    # Store result
+    tl.store(out_ptr + offsets, out_vals, mask=mask)
 
 
-def triton_fused_relu_add_bias(x: torch.Tensor, bias: torch.Tensor):
+def triton_relu_add_bias(x: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
     """
-    Wrapper around the Triton kernel.
-    x: (N, C, H, W) contiguous CUDA tensor (fp32)
-    bias: (C,) or (C,1,1) tensor; will be flattened
-    Returns a new tensor with relu applied and per-channel bias added.
+    x: tensor of shape (N, C, H, W), dtype float32, CUDA
+    bias: tensor of shape (C, 1, 1) or (C,), dtype float32, CUDA
+    Returns output tensor same shape and dtype as x.
     """
-    assert x.is_cuda and bias.is_cuda, "Tensors must be on CUDA to run Triton kernel."
+    assert x.is_cuda and bias.is_cuda, "Inputs must be CUDA tensors."
+    assert x.dtype == torch.float32 and bias.dtype == torch.float32, "Only float32 supported."
 
-    # Ensure contiguous layout for pointer arithmetic in Triton kernel
+    # Ensure contiguous
     x = x.contiguous()
+    # Flatten bias to shape (C,)
     bias_flat = bias.view(-1).contiguous()
 
     N, C, H, W = x.shape
-    n_rows = N * C * H
+    hw = H * W
+    n_elements = x.numel()
+
     out = torch.empty_like(x)
 
-    # Grid is 2D: number of groups (over rows) x number of blocks per row
-    grid = lambda meta: (
-        (n_rows + meta['ROWS_PER_PROG'] - 1) // meta['ROWS_PER_PROG'],
-        (W + meta['BLOCK'] - 1) // meta['BLOCK'],
+    # Flatten tensors for pointer arithmetic in the Triton kernel
+    x_flat = x.view(-1)
+    out_flat = out.view(-1)
+
+    grid = lambda meta: ((n_elements + meta["BLOCK"] - 1) // meta["BLOCK"],)
+
+    _relu_add_bias_kernel[grid](
+        x_flat, bias_flat, out_flat,
+        N, C, H, W, hw, n_elements
     )
 
-    # Launch kernel
-    _fused_relu_add_bias_rowwise[grid](x, bias_flat, out, n_rows, W, H, C)
     return out
 
 
 class ModelNew(nn.Module):
     """
-    Optimized Model:
-      - Uses PyTorch's highly-optimized Conv2d for convolution.
-      - Fuses ReLU + per-channel bias add into a Triton kernel that operates
-        row-wise (along width) and is autotuned for Ampere GPUs.
+    Optimized variant of the original Model:
+      - Uses PyTorch's performant Conv2d for the convolution.
+      - Fuses ReLU + per-channel bias addition using a custom Triton kernel.
+    This keeps the convolution implementation (weights, bias) identical while
+    accelerating the elementwise post-processing.
     """
     def __init__(self, in_channels, out_channels, kernel_size, bias_shape):
         super(ModelNew, self).__init__()
+        # Keep the same Conv2d initialization as original model
         self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
-        # Keep the additional bias (as in the original model)
+        # Per-channel bias that will be added after ReLU; shape expected (C,1,1)
         self.bias = nn.Parameter(torch.randn(bias_shape))
 
     def forward(self, x):
+        # Convolution (uses PyTorch implementation)
         x = self.conv(x)
-        # If input is on CUDA, use the fused Triton kernel for ReLU + bias add
-        if x.is_cuda:
-            return triton_fused_relu_add_bias(x, self.bias)
-        else:
-            # CPU fallback: do the operations in PyTorch
-            x = torch.relu(x)
-            return x + self.bias
+        # Fused ReLU + bias add via Triton kernel
+        x = triton_relu_add_bias(x, self.bias)
+        return x

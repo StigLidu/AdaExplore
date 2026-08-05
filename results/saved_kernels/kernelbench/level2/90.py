@@ -3,120 +3,155 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
-# Autotune configurations for the fused kernel. BLOCK is the number of spatial elements processed per program.
+# Autotune configurations chosen for A6000 (Ampere)
 AUTOTUNE_CONFIGS = [
-    triton.Config({"BLOCK": 128}, num_warps=2, num_stages=2),
-    triton.Config({"BLOCK": 256}, num_warps=4, num_stages=2),
-    triton.Config({"BLOCK": 512}, num_warps=8, num_stages=3),
-    triton.Config({"BLOCK": 1024}, num_warps=8, num_stages=3),
+    triton.Config({"BLOCK_SIZE": 128}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_SIZE": 256}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_SIZE": 512}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_SIZE": 1024}, num_warps=8, num_stages=3),
 ]
 
-@triton.autotune(configs=AUTOTUNE_CONFIGS, key=['B', 'C', 'S'])
+@triton.autotune(configs=AUTOTUNE_CONFIGS, key=['N', 'C', 'spatial_size'])
 @triton.jit
-def fused_pointwise_kernel(
-    x_ptr,         # pointer to conv output (flattened)
-    sum_ptr,       # pointer to sum tensor (length C)
-    out_ptr,       # pointer to output (flattened)
-    B,             # batch size
-    C,             # channels
-    S,             # spatial size per channel: D*H*W
-    neg_slope,     # leaky relu negative slope (float)
-    BLOCK: tl.constexpr
+def fused_postprocess_kernel(
+    x_ptr,        # pointer to input tensor (flattened)
+    sum_ptr,      # pointer to per-channel sum (length C)
+    out_ptr,      # pointer to output tensor (flattened)
+    N,            # batch size
+    C,            # number of channels
+    spatial_size, # D*H*W
+    BLOCK_SIZE: tl.constexpr,
 ):
     """
-    Grid layout:
-      program_id(0) -> batch index (0..B-1)
-      program_id(1) -> channel index (0..C-1)
-      program_id(2) -> spatial block index (0..ceil(S/BLOCK)-1)
-    Each program processes up to BLOCK spatial elements for a given (batch,channel).
+    Each program processes a contiguous block of size BLOCK_SIZE from a single (n, c) channel slice.
+    Mapping:
+      pid = program id in [0 .. N*C*blocks_per_channel-1]
+      n = pid // (C * blocks_per_channel)
+      rem = pid % (C * blocks_per_channel)
+      c = rem // blocks_per_channel
+      s_block = rem % blocks_per_channel
+    start_offset = ((n * C + c) * spatial_size) + s_block * BLOCK_SIZE
     """
-    b = tl.program_id(0)
-    c = tl.program_id(1)
-    block_idx = tl.program_id(2)
+    pid = tl.program_id(0)
 
-    offs = block_idx * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < S
+    # Compute blocks_per_channel from constexpr BLOCK_SIZE and runtime spatial_size
+    blocks_per_channel = (spatial_size + BLOCK_SIZE - 1) // BLOCK_SIZE
 
-    # base offset for this (b,c)
-    # linear index = ((b * C) + c) * S + offs
-    base = ((b * C) + c) * S
-    idx = base + offs
+    # Compute n, c, and spatial block index
+    channel_block_span = C * blocks_per_channel
+    n = pid // channel_block_span
+    rem = pid - n * channel_block_span
+    c = rem // blocks_per_channel
+    s_block = rem - c * blocks_per_channel
 
-    # load input (masked)
-    x = tl.load(x_ptr + idx, mask=mask, other=0.0)
+    # Compute the starting flattened offset for this (n, c, s_block)
+    start = (n * C + c) * spatial_size + s_block * BLOCK_SIZE
+    offs = start + tl.arange(0, BLOCK_SIZE)
+    # mask for spatial bounds within this channel
+    max_off = (n * C + c) * spatial_size + spatial_size
+    mask = offs < max_off
 
-    # load per-channel bias/addition
-    sum_v = tl.load(sum_ptr + c)
+    # Load input values
+    x_vals = tl.load(x_ptr + offs, mask=mask, other=0.0)
 
-    # leaky relu: if x >= 0 -> x else x * neg_slope
-    x = tl.where(x >= 0.0, x, x * neg_slope)
+    # Load the per-channel addend (scalar) and broadcast via arithmetic
+    sum_val = tl.load(sum_ptr + c)  # scalar load
 
-    # add the per-channel tensor (broadcast)
-    x = x + sum_v
+    # LeakyReLU (negative_slope=0.2)
+    neg_slope = 0.2
+    x_relu = tl.where(x_vals > 0.0, x_vals, x_vals * neg_slope)
 
-    # clamp between -1 and 1
-    x = tl.where(x < -1.0, -1.0, x)
-    x = tl.where(x >  1.0,  1.0, x)
+    # Add per-channel value
+    x_added = x_relu + sum_val
 
-    # GELU approximation using sigmoid: x * sigmoid(1.702 * x)
-    y = 1.702 * x
-    sig = 1.0 / (1.0 + tl.exp(-y))
-    x = x * sig
+    # Clamp to [-1.0, 1.0]
+    x_clamped = tl.where(x_added < -1.0, -1.0, tl.where(x_added > 1.0, 1.0, x_added))
 
-    # store results
-    tl.store(out_ptr + idx, x, mask=mask)
+    # GELU approx: x * sigmoid(1.702 * x)
+    k = 1.702
+    sig = 1.0 / (1.0 + tl.exp(-k * x_clamped))
+    y = x_clamped * sig
+
+    # Store result
+    tl.store(out_ptr + offs, y, mask=mask)
 
 
-def triton_fused_pointwise(x: torch.Tensor, sum_tensor: torch.Tensor, neg_slope: float = 0.2):
+def triton_fused_postprocess(x: torch.Tensor, sum_tensor: torch.Tensor) -> torch.Tensor:
     """
-    Wrapper to launch the Triton fused kernel.
-    Expects:
-      x: conv output tensor of shape [B, C, D, H, W], contiguous on CUDA
-      sum_tensor: tensor of shape [C, 1, 1, 1] or [C], contiguous on CUDA
-    Returns:
-      out tensor with same shape as x
+    Wrapper that launches the Triton fused kernel.
+    Assumes x is contiguous CUDA float32 tensor with shape [N, C, D, H, W].
+    sum_tensor is of shape [C] or [C,1,1,1] (will be flattened).
     """
-    assert x.is_cuda and sum_tensor.is_cuda, "Tensors must be on CUDA."
-    assert x.dtype == torch.float32 and sum_tensor.dtype == torch.float32, "Only fp32 supported."
+    assert x.is_cuda and sum_tensor.is_cuda, "Tensors must be on CUDA"
+    assert x.dtype == torch.float32 and sum_tensor.dtype == torch.float32
 
-    # ensure contiguous
     x = x.contiguous()
-    # make sum_tensor a 1D contiguous tensor of length C
-    sum_1d = sum_tensor.view(sum_tensor.shape[0]).contiguous()
-
-    B, C, D, H, W = x.shape
-    S = D * H * W
-
+    sum_flat = sum_tensor.reshape(-1).contiguous()
     out = torch.empty_like(x)
 
-    # flatten tensors for pointer arithmetic in the kernel
-    x_flat = x.view(-1)
-    out_flat = out.view(-1)
-    sum_flat = sum_1d
+    N, C, D, H, W = x.shape
+    spatial_size = D * H * W
 
-    # grid: (B, C, number of spatial blocks)
+    # grid function uses the autotuned BLOCK_SIZE from meta to compute the number of programs
     def grid(meta):
-        return (B, C, (S + meta['BLOCK'] - 1) // meta['BLOCK'])
+        BLOCK = meta["BLOCK_SIZE"]
+        bpc = (spatial_size + BLOCK - 1) // BLOCK
+        total_blocks = N * C * bpc
+        return (total_blocks,)
 
-    fused_pointwise_kernel[grid](x_flat, sum_flat, out_flat, B, C, S, float(neg_slope))
+    # Launch the autotuned kernel. The kernel computes blocks_per_channel internally from BLOCK_SIZE.
+    fused_postprocess_kernel[grid](
+        x,
+        sum_flat,
+        out,
+        N,
+        C,
+        spatial_size
+    )
+
     return out
 
 
 class ModelNew(nn.Module):
     """
-    Optimized model that uses PyTorch's Conv3d but fuses the subsequent
-    elementwise operations (LeakyReLU, add with sum_tensor, clamp, GELU)
-    into a single Triton kernel for improved performance.
+    Optimized model: keep PyTorch Conv3d for correctness and use a Triton-fused kernel
+    to perform the post-convolution elementwise chain:
+      - LeakyReLU(negative_slope=0.2)
+      - Add per-channel sum_tensor (broadcast)
+      - Clamp to [-1, 1]
+      - GELU (approx: x * sigmoid(1.702*x))
+    The Triton kernel processes blocks of spatial elements per (N, C) slice to minimize repeated loads of the per-channel addend.
     """
     def __init__(self, in_channels, out_channels, kernel_size, sum_tensor_shape):
         super(ModelNew, self).__init__()
         self.conv = nn.Conv3d(in_channels, out_channels, kernel_size)
-        # sum_tensor expected shape: (out_channels, 1, 1, 1)
-        self.sum_tensor = nn.Parameter(torch.randn(sum_tensor_shape, dtype=torch.float32))
+        self.sum_tensor = nn.Parameter(torch.randn(sum_tensor_shape))
 
     def forward(self, x):
-        # conv uses PyTorch implementation (GPU)
         x = self.conv(x)
-        # fused pointwise operations implemented in Triton
-        x = triton_fused_pointwise(x, self.sum_tensor, neg_slope=0.2)
+        # Ensure tensors are on CUDA when calling the Triton wrapper
+        if x.is_cuda and self.sum_tensor.is_cuda:
+            x = triton_fused_postprocess(x, self.sum_tensor)
+        else:
+            # CPU or mismatched device: fall back to pure PyTorch implementation
+            x = torch.nn.functional.leaky_relu(x, negative_slope=0.2)
+            x = x + self.sum_tensor
+            x = torch.clamp(x, min=-1.0, max=1.0)
+            x = torch.nn.functional.gelu(x)
         return x
+
+
+# Compatibility helper functions (same signatures as original)
+def get_inputs():
+    batch_size = 128
+    in_channels = 8
+    depth, height, width = 16, 64, 64
+    # Return CUDA tensor for best performance with the Triton kernel
+    return [torch.rand(batch_size, in_channels, depth, height, width).cuda()]
+
+def get_init_inputs():
+    in_channels = 8
+    out_channels = 64
+    kernel_size = 3
+    sum_tensor_shape = (out_channels, 1, 1, 1)
+    return [in_channels, out_channels, kernel_size, sum_tensor_shape]

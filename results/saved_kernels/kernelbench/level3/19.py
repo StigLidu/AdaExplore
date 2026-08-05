@@ -1,200 +1,209 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-# Autotune configs chosen for NVIDIA A6000 (Ampere). We tune both the class-block (BLOCK_K)
-# and channel-reduction block (BLOCK_C). The kernel fuses spatial average pooling and
-# the final fully-connected layer into a single Triton kernel.
-AUTOTUNE_CONFIGS = [
-    triton.Config({"BLOCK_K": 64,   "BLOCK_C": 128}, num_warps=4, num_stages=2),
-    triton.Config({"BLOCK_K": 128,  "BLOCK_C": 128}, num_warps=4, num_stages=3),
-    triton.Config({"BLOCK_K": 128,  "BLOCK_C": 256}, num_warps=8, num_stages=3),
-    triton.Config({"BLOCK_K": 256,  "BLOCK_C": 256}, num_warps=8, num_stages=4),
-    triton.Config({"BLOCK_K": 512,  "BLOCK_C": 256}, num_warps=8, num_stages=4),
+# Autotune configs for elementwise ReLU kernel
+RELU_AUTOTUNE_CONFIGS = [
+    triton.Config({"BLOCK": 1024}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK": 2048}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK": 4096}, num_warps=8, num_stages=3),
 ]
 
-@triton.autotune(
-    configs=AUTOTUNE_CONFIGS,
-    key=['N', 'C', 'S', 'K'],
-)
+@triton.autotune(configs=RELU_AUTOTUNE_CONFIGS, key=['n_elements'])
 @triton.jit
-def _fused_avgpool_fc_kernel(
-    x_ptr,      # pointer to input tensor (N, C, H, W) flattened
-    w_ptr,      # pointer to fc weights tensor (C, K) flattened (note: weight is transposed on host and pre-scaled by 1/S)
-    b_ptr,      # pointer to fc bias tensor (K,) or pointer-sized placeholder (pre-scaled by 1/S if present)
-    out_ptr,    # pointer to output tensor (N, K) flattened
-    N,          # batch size
-    C,          # channels
-    S,          # spatial size H*W
-    K,          # number of classes (output dim)
-    has_bias,   # int flag: 1 if b_ptr is a valid bias pointer, 0 otherwise
-    BLOCK_K: tl.constexpr,  # number of output classes handled per program
-    BLOCK_C: tl.constexpr,  # number of channels reduced per inner loop
-):
+def _triton_relu_kernel(x_ptr, n_elements, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    start = pid * BLOCK
+    offs = start + tl.arange(0, BLOCK)
+    mask = offs < n_elements
+    vals = tl.load(x_ptr + offs, mask=mask, other=0.0)
+    res = tl.where(vals > 0.0, vals, 0.0)
+    tl.store(x_ptr + offs, res, mask=mask)
+
+
+def triton_relu_inplace(x: torch.Tensor):
     """
-    Vectorized blocked spatial reduction + weight reduction.
-    The host pre-scales weights and bias by 1/S, so the kernel does not divide by S here.
+    In-place ReLU implemented in Triton. Works only for CUDA float32 tensors.
+    Falls back to torch.nn.functional.relu for other cases.
     """
-    n = tl.program_id(0)
-    k_block = tl.program_id(1)
-
-    # Offsets for classes this program will compute
-    k_offsets = k_block * BLOCK_K + tl.arange(0, BLOCK_K)
-    mask_k = k_offsets < K
-
-    # accumulator for BLOCK_K outputs
-    acc = tl.zeros((BLOCK_K,), dtype=tl.float32)
-
-    # base pointer offset for this sample in the flattened input: n * (C * S)
-    base_x = n * (C * S)
-
-    # c_inner: channel offsets within a BLOCK_C
-    c_inner = tl.arange(0, BLOCK_C)
-
-    # Spatial tile size (constexpr literal to allow tl.arange usage inside kernel)
-    BLOCK_S = 16
-
-    # For each channel block, compute sum over spatial positions once, then multiply by weight block
-    for c_block_start in range(0, C, BLOCK_C):
-        c_offsets = c_block_start + c_inner  # shape (BLOCK_C,)
-        mask_c = c_offsets < C  # shape (BLOCK_C,)
-
-        # Compute sum_x = sum over s of X[n, c_offsets, s]  -> shape (BLOCK_C,)
-        sum_x = tl.zeros((BLOCK_C,), dtype=tl.float32)
-
-        # Blocked spatial reduction: iterate over spatial tiles of size BLOCK_S and load a (BLOCK_C x BLOCK_S) tile at once.
-        s_start = 0
-        # Use Python-level range to iterate tiles (S is runtime), but internal aranges are constexpr BLOCK_S vectors.
-        for s_start in range(0, S, BLOCK_S):
-            s_offs = s_start + tl.arange(0, BLOCK_S)                     # shape (BLOCK_S,)
-            mask_s = s_offs < S                                           # shape (BLOCK_S,)
-
-            # Build indices for the (BLOCK_C x BLOCK_S) tile:
-            # x_index = base_x + c_offsets[:, None] * S + s_offs[None, :]
-            x_index = base_x + c_offsets[:, None] * S + s_offs[None, :]
-
-            # Combined mask for the tile: valid channels x valid spatial positions
-            tile_mask = mask_c[:, None] & mask_s[None, :]
-
-            # Load tile and sum across spatial axis -> shape (BLOCK_C,)
-            tile = tl.load(x_ptr + x_index, mask=tile_mask, other=0.0)
-            sum_x += tl.sum(tile, axis=1)
-
-        # Load the weight block for the current BLOCK_C channels and BLOCK_K classes:
-        # Weight layout is (C, K) flattened on host: index = c * K + k
-        w_index = c_offsets[:, None] * K + k_offsets[None, :]
-        mask_w = mask_c[:, None] & mask_k[None, :]
-        w_block = tl.load(w_ptr + w_index, mask=mask_w, other=0.0)  # shape (BLOCK_C, BLOCK_K)
-
-        # Multiply weights by sum_x and accumulate into acc:
-        acc += tl.sum(w_block * sum_x[:, None], axis=0)
-
-    # finalize: weights/bias were pre-scaled by 1/S on host, so no division here
-    out_vals = acc
-    if has_bias != 0:
-        bias = tl.load(b_ptr + k_offsets, mask=mask_k, other=0.0)
-        out_vals = out_vals + bias
-
-    # store results into out_ptr at positions n * K + k_offsets
-    out_idx = n * K + k_offsets
-    tl.store(out_ptr + out_idx, out_vals, mask=mask_k)
-
-
-def triton_fused_avgpool_fc(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor):
-    """
-    Fallback pure-PyTorch implementation that computes spatial average on the host and
-    performs the final matrix multiplication. This avoids dynamic Python loops inside the
-    Triton kernel and uses PyTorch's highly optimized pooling and GEMM on Ampere GPUs.
-    Inputs:
-      - x: (N, C, H, W) CUDA float32 tensor
-      - weight: (K, C) CUDA float32 tensor
-      - bias: (K,) CUDA float32 tensor or None
-    Output:
-      - out: (N, K) CUDA float32 tensor
-    """
-    assert x.is_cuda and weight.is_cuda, "Inputs must be CUDA tensors"
-
-    # Compute spatial average (N, C)
-    pooled = x.mean(dim=(2, 3))
-
-    # pooled @ weight.T -> (N, K) since weight has shape (K, C)
-    out = pooled.matmul(weight.t())
-
-    if bias is not None:
-        out = out + bias
-
-    return out
+    if not x.is_cuda or x.dtype != torch.float32:
+        return F.relu(x, inplace=True)
+    x = x.contiguous()
+    n = x.numel()
+    if n == 0:
+        return x
+    grid = lambda meta: ((n + meta["BLOCK"] - 1) // meta["BLOCK"],)
+    _triton_relu_kernel[grid](x, n)
+    return x
 
 
 class ModelNew(nn.Module):
     """
-    MobileNetV1-like architecture where the final AvgPool2d + fc are fused into a single
-    Triton kernel that computes the spatial average and the final linear layer in one pass.
-    This reduces memory traffic and kernel launch overhead compared to separate avgpool + matmul.
+    MobileNetV1-like architecture optimized for inference by:
+      - Folding BatchNorm parameters into preceding Conv2d weights/biases when switched to eval(),
+        removing BN execution overhead.
+      - Using a Triton-based in-place ReLU kernel in CUDA fp32 inference to reduce kernel-launch &
+        memory traffic overhead compared to PyTorch ReLU.
+    Training behavior is unchanged (no folding, standard BN + ReLU).
     """
     def __init__(self, num_classes=1000, input_channels=3, alpha=1.0):
         super(ModelNew, self).__init__()
 
-        def conv_bn(inp, oup, stride):
-            return nn.Sequential(
-                nn.Conv2d(inp, oup, 3, stride, 1, bias=False),
+        def conv_bn_pair(inp, oup, stride):
+            return [
+                nn.Conv2d(inp, oup, kernel_size=3, stride=stride, padding=1, bias=False),
                 nn.BatchNorm2d(oup),
-                nn.ReLU(inplace=True)
-            )
+            ]
 
-        def conv_dw(inp, oup, stride):
-            return nn.Sequential(
-                nn.Conv2d(inp, inp, 3, stride, 1, groups=inp, bias=False),
+        def conv_dw_pair(inp, oup, stride):
+            # Depthwise conv (groups=inp) + BN, then pointwise conv + BN
+            return [
+                nn.Conv2d(inp, inp, kernel_size=3, stride=stride, padding=1, groups=inp, bias=False),
                 nn.BatchNorm2d(inp),
-                nn.ReLU(inplace=True),
-
-                nn.Conv2d(inp, oup, 1, 1, 0, bias=False),
+                nn.Conv2d(inp, oup, kernel_size=1, stride=1, padding=0, bias=False),
                 nn.BatchNorm2d(oup),
-                nn.ReLU(inplace=True),
-            )
+            ]
 
-        self.model = nn.Sequential(
-            conv_bn(input_channels, int(32 * alpha), 2),
-            conv_dw(int(32 * alpha), int(64 * alpha), 1),
-            conv_dw(int(64 * alpha), int(128 * alpha), 2),
-            conv_dw(int(128 * alpha), int(128 * alpha), 1),
-            conv_dw(int(128 * alpha), int(256 * alpha), 2),
-            conv_dw(int(256 * alpha), int(256 * alpha), 1),
-            conv_dw(int(256 * alpha), int(512 * alpha), 2),
-            conv_dw(int(512 * alpha), int(512 * alpha), 1),
-            conv_dw(int(512 * alpha), int(512 * alpha), 1),
-            conv_dw(int(512 * alpha), int(512 * alpha), 1),
-            conv_dw(int(512 * alpha), int(512 * alpha), 1),
-            conv_dw(int(512 * alpha), int(512 * alpha), 1),
-            conv_dw(int(512 * alpha), int(1024 * alpha), 2),
-            conv_dw(int(1024 * alpha), int(1024 * alpha), 1),
-            # Removed final AvgPool2d(7) - fused into Triton kernel with fc
-        )
+        layers = []
+        relu_after_indices = set()  # indices in layers after which we should apply ReLU
+
+        def append_module(mod):
+            idx = len(layers)
+            layers.append(mod)
+            return idx
+
+        # First conv
+        append_module(nn.Conv2d(input_channels, int(32 * alpha), kernel_size=3, stride=2, padding=1, bias=False))
+        bn_idx = append_module(nn.BatchNorm2d(int(32 * alpha)))
+        relu_after_indices.add(bn_idx)
+
+        # conv_dw blocks
+        def add_conv_dw_block(inp, oup, stride):
+            # depthwise
+            idx0 = append_module(nn.Conv2d(inp, inp, kernel_size=3, stride=stride, padding=1, groups=inp, bias=False))
+            idx1 = append_module(nn.BatchNorm2d(inp))
+            relu_after_indices.add(idx1)
+            # pointwise
+            idx2 = append_module(nn.Conv2d(inp, oup, kernel_size=1, stride=1, padding=0, bias=False))
+            idx3 = append_module(nn.BatchNorm2d(oup))
+            relu_after_indices.add(idx3)
+
+        add_conv_dw_block(int(32 * alpha), int(64 * alpha), 1)
+        add_conv_dw_block(int(64 * alpha), int(128 * alpha), 2)
+        add_conv_dw_block(int(128 * alpha), int(128 * alpha), 1)
+        add_conv_dw_block(int(128 * alpha), int(256 * alpha), 2)
+        add_conv_dw_block(int(256 * alpha), int(256 * alpha), 1)
+        add_conv_dw_block(int(256 * alpha), int(512 * alpha), 2)
+        # five times 512->512
+        for _ in range(5):
+            add_conv_dw_block(int(512 * alpha), int(512 * alpha), 1)
+        add_conv_dw_block(int(512 * alpha), int(1024 * alpha), 2)
+        add_conv_dw_block(int(1024 * alpha), int(1024 * alpha), 1)
+
+        # AvgPool2d(7)
+        append_module(nn.AvgPool2d(7))
+
+        self.model = nn.ModuleList(layers)
+        self.relu_after_indices = relu_after_indices
         self.fc = nn.Linear(int(1024 * alpha), num_classes)
 
+        # Flag to avoid repeated folding
+        self._bn_fused = False
+
+    def fold_conv_bn(self, conv: nn.Conv2d, bn: nn.BatchNorm2d):
+        """
+        Fold BN parameters into conv weights and bias in-place. This uses BN's running statistics
+        and is only correct for inference (eval) mode.
+        """
+        # Only fold if BN is a real BatchNorm2d and not already Identity
+        if not isinstance(bn, nn.BatchNorm2d):
+            return
+
+        # Move parameters to conv device & dtype
+        device = conv.weight.device
+        dtype = conv.weight.dtype
+
+        W = conv.weight.data
+        if conv.bias is None:
+            b = torch.zeros(W.size(0), device=device, dtype=dtype)
+        else:
+            b = conv.bias.data
+
+        # BN params: if any are None, use defaults
+        if bn.weight is None:
+            gamma = torch.ones(bn.num_features, device=device, dtype=dtype)
+        else:
+            gamma = bn.weight.data.to(device=device, dtype=dtype)
+        if bn.bias is None:
+            beta = torch.zeros(bn.num_features, device=device, dtype=dtype)
+        else:
+            beta = bn.bias.data.to(device=device, dtype=dtype)
+
+        running_mean = bn.running_mean.to(device=device, dtype=dtype)
+        running_var = bn.running_var.to(device=device, dtype=dtype)
+        eps = bn.eps
+
+        invstd = gamma.div(torch.sqrt(running_var + eps))  # shape [C]
+
+        # Reshape for broadcasting over convolution weight dims: (out_channels, 1, 1, 1)
+        view_shape = [W.size(0)] + [1] * (W.dim() - 1)
+        W.mul_(invstd.view(*view_shape))
+        new_bias = (b - running_mean) * invstd + beta
+
+        conv.weight.data = W
+        conv.bias = nn.Parameter(new_bias)
+
+    def fold_all_batchnorms(self):
+        """
+        Iterate over model modules and fold every BatchNorm2d into the preceding Conv2d when possible.
+        Replace folded BatchNorm2d modules with nn.Identity to preserve layer indexing.
+        """
+        if self._bn_fused:
+            return
+        # Iterate indices so we can replace modules inside ModuleList by assignment
+        for idx in sorted(self.relu_after_indices):
+            # bn is expected at index idx
+            if idx >= len(self.model):
+                continue
+            bn = self.model[idx]
+            # preceding conv index is idx - 1
+            conv_idx = idx - 1
+            if conv_idx < 0 or conv_idx >= len(self.model):
+                continue
+            conv = self.model[conv_idx]
+            if isinstance(bn, nn.BatchNorm2d) and isinstance(conv, nn.Conv2d):
+                try:
+                    self.fold_conv_bn(conv, bn)
+                    # replace BN with Identity so forward indexing remains valid
+                    self.model[idx] = nn.Identity()
+                except Exception:
+                    # Any folding failure: skip folding this pair
+                    continue
+        self._bn_fused = True
+
+    def eval(self):
+        """
+        Override eval() so that when model is switched to evaluation mode, we fold BN into convs
+        to eliminate BN compute during inference.
+        """
+        super(ModelNew, self).eval()
+        # Perform folding in-place
+        self.fold_all_batchnorms()
+        return self
+
     def forward(self, x):
-        """
-        x: (N, input_channels, H, W)
-        Returns logits shape (N, num_classes)
-        """
-        x = self.model(x)  # -> (N, C, H', W') - expected H'=W'=7 for 224 input
-        # Use fused Triton kernel to compute avgpool + fc in one pass
-        out = triton_fused_avgpool_fc(x, self.fc.weight, self.fc.bias)
-        return out
-
-
-# Keep helper functions consistent with original module API
-batch_size = 10
-input_channels = 3
-height = 224
-width = 224
-num_classes = 1000
-alpha = 1.0
-
-def get_inputs():
-    # Provide CUDA tensor inputs since Triton kernels expect CUDA tensors.
-    return [torch.rand(batch_size, input_channels, height, width).cuda()]
-
-def get_init_inputs():
-    return [num_classes, input_channels, alpha]
+        # Forward through model list. Apply ReLU after positions recorded in relu_after_indices.
+        for idx, layer in enumerate(self.model):
+            x = layer(x)
+            if idx in self.relu_after_indices:
+                # Activation point: use Triton in-place ReLU in CUDA fp32 inference for speed.
+                if x.is_cuda and (not self.training):
+                    x = triton_relu_inplace(x)
+                else:
+                    x = F.relu(x, inplace=True)
+        # After avgpool, flatten and fc
+        x = x.view(x.size(0), -1)
+        x = self.fc(x)
+        return x

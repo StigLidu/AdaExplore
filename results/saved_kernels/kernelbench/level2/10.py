@@ -3,158 +3,140 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
+# Autotune configs for the fused kernel - BLOCKs chosen to be multiples of 32 (warp-aligned)
+AUTOTUNE_CONFIGS = [
+    triton.Config({"BLOCK": 64},   num_warps=4, num_stages=2),
+    triton.Config({"BLOCK": 128},  num_warps=4, num_stages=2),
+    triton.Config({"BLOCK": 256},  num_warps=8, num_stages=2),
+    triton.Config({"BLOCK": 512},  num_warps=8, num_stages=3),
+    triton.Config({"BLOCK": 1024}, num_warps=8, num_stages=3),
+]
 
-# Triton kernel: performs 2x2 max-pool (stride=2), hardtanh clamp, and partial sum reduction.
-# Each program handles a tile (chunk) of pooled spatial locations for a specific (batch,channel) pair.
+# The fused kernel:
+# For each (batch, channel) pair (one program), this kernel:
+#  - performs 2x2 max-pooling with stride 2 over HxW
+#  - applies hardtanh (clamp)
+#  - computes the mean over pooled spatial locations
+# It writes one scalar mean per (batch,channel) into out_ptr (flattened N*C array).
+@triton.autotune(
+    configs=AUTOTUNE_CONFIGS,
+    key=["N", "C", "pooled_total"],
+)
 @triton.jit
-def _pool_clamp_sum_kernel(
-    inp_ptr,        # input pointer (N, C, H, W) contiguous
-    out_ptr,        # output pointer (N*C,) where we accumulate partial sums via atomic add
-    N, C, H, W,     # input dimensions
-    H2, W2, H2W2,   # pooled dimensions and total pooled elements
-    min_val, max_val,  # hardtanh bounds (float scalars)
-    BLOCK: tl.constexpr,  # number of pooled elements processed per program
+def fused_pool_clamp_mean_kernel(
+    inp_ptr,          # pointer to input tensor (N, C, H, W), flattened
+    out_ptr,          # pointer to output tensor (N*C,) flattened
+    N, C, H, W,       # input dimensions
+    pooled_H, pooled_W, pooled_total,  # pooling dimensions and total pooled elements
+    clamp_min, clamp_max,              # hardtanh bounds (fp32)
+    BLOCK: tl.constexpr,
 ):
-    # program indices
-    block_idx = tl.program_id(0)   # which block of pooled positions
-    idx_nc = tl.program_id(1)      # linear index for (n,c) pair: n*C + c
+    # 2D grid: program_id(0)=n (batch), program_id(1)=c (channel)
+    n = tl.program_id(0)
+    c = tl.program_id(1)
+    # base linear offset to (n, c, 0, 0)
+    base = ((n * C + c) * H) * W
 
-    # derive n and c from idx_nc
-    n = idx_nc // C
-    c = idx_nc - n * C
+    # accumulator for the sum of all pooled values (keep as python float -> treated as fp32 accumulation)
+    acc = 0.0
 
-    # compute offsets for pooled positions this program will handle
-    offs = block_idx * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < H2W2
+    # Iterate pooled rows outer and tile pooled columns inner for coalesced loads:
+    for ph in range(pooled_H):
+        base_row = base + (ph * 2) * W  # top-left row offset for this pooled row
+        # inner tiled loop over pooled_W with tile size BLOCK (constexpr)
+        for w_off in range(0, pooled_W, BLOCK):
+            offs = tl.arange(0, BLOCK)              # [0, 1, ..., BLOCK-1]
+            w = w_off + offs                        # pooled column indices for this tile
+            mask = w < pooled_W                     # valid columns in this tile
 
-    # pooled coords
-    ph = offs // W2
-    pw = offs - ph * W2  # offs % W2
+            # compute linear offsets for the top-left of each 2x2 block (contiguous across columns)
+            block_base = base_row + w               # addresses for top-left elements
 
-    # corresponding input top-left coords for each pooled window (2x2, stride 2)
-    h0 = ph * 2
-    w0 = pw * 2
+            # load four values of the 2x2 block for each pooled element (coalesced across columns)
+            a = tl.load(inp_ptr + block_base, mask=mask, other=clamp_min)
+            b = tl.load(inp_ptr + block_base + 1, mask=mask, other=clamp_min)
+            c2 = tl.load(inp_ptr + block_base + W, mask=mask, other=clamp_min)
+            d = tl.load(inp_ptr + block_base + W + 1, mask=mask, other=clamp_min)
 
-    # compute addresses for the four values in each 2x2 window
-    # linear index for element ((n*C + c) * H + h) * W + w
-    base_n_c = (n * C + c) * H * W
-    idx00 = base_n_c + h0 * W + w0
-    idx01 = base_n_c + h0 * W + (w0 + 1)
-    idx10 = base_n_c + (h0 + 1) * W + w0
-    idx11 = base_n_c + (h0 + 1) * W + (w0 + 1)
+            # elementwise 2x2 max
+            m1 = tl.maximum(a, b)
+            m2 = tl.maximum(c2, d)
+            m = tl.maximum(m1, m2)
 
-    # Load the four elements with masking. Use other=min_val to ensure masked lanes don't affect max
-    a = tl.load(inp_ptr + idx00, mask=mask, other=min_val)
-    b = tl.load(inp_ptr + idx01, mask=mask, other=min_val)
-    c_ = tl.load(inp_ptr + idx10, mask=mask, other=min_val)
-    d = tl.load(inp_ptr + idx11, mask=mask, other=min_val)
+            # hardtanh clamp
+            m_clamped = tl.minimum(tl.maximum(m, clamp_min), clamp_max)
 
-    # 2x2 max
-    m1 = tl.maximum(a, b)
-    m2 = tl.maximum(c_, d)
-    m = tl.maximum(m1, m2)
+            # zero out invalid lanes and reduce
+            valid = tl.where(mask, m_clamped, 0.0)
+            s = tl.sum(valid)
+            acc += s
 
-    # hardtanh clamp
-    m_clamped = tl.minimum(tl.maximum(m, min_val), max_val)
+    # compute mean (scalar)
+    mean = acc / pooled_total
 
-    # sum only the valid lanes
-    m_sum = tl.sum(m_clamped * tl.cast(mask, tl.float32))
-
-    # atomic add the partial sum to the output accumulator for this (n,c)
-    # out_ptr is expected to be float32 contiguous of shape (N*C,)
-    tl.atomic_add(out_ptr + idx_nc, m_sum)
+    # store the result into out_ptr at position n*C + c
+    out_idx = n * C + c
+    tl.store(out_ptr + out_idx, mean)
 
 
-def _fused_pool_clamp_mean(x: torch.Tensor, min_val: float, max_val: float):
+def triton_fused_pool_clamp_mean(inp: torch.Tensor, clamp_min: float, clamp_max: float):
     """
-    x: input tensor of shape (N, C, H, W), contiguous on CUDA
-    Performs 2x2 maxpool (stride=2), hardtanh clamp, and returns per-(N,C) mean over pooled spatial dims
-    Returns tensor of shape (N, C)
+    Wrapper that prepares tensors and launches the Triton fused kernel.
+    Input: inp (N, C, H, W)
+    Output: (N, C, 1, 1) with mean over pooled spatial dims (after pooling+clamp).
     """
-    assert x.is_cuda, "Input must be on CUDA"
-    x = x.contiguous()
-    N, C, H, W = x.shape
-    # pooling parameters are fixed: kernel_size=2, stride=2
+    assert inp.is_cuda, "Input must be a CUDA tensor"
+    inp = inp.contiguous()
+    N, C, H, W = inp.shape
+    # Only support even H and W (since pooling 2x2 stride 2)
     assert H % 2 == 0 and W % 2 == 0, "H and W must be divisible by 2 for 2x2 pooling"
-    H2 = H // 2
-    W2 = W // 2
-    H2W2 = H2 * W2
 
-    # Prepare output tensor to accumulate sums (one scalar per (N,C))
-    out = torch.zeros(N * C, device=x.device, dtype=x.dtype)
+    pooled_H = H // 2
+    pooled_W = W // 2
+    pooled_total = pooled_H * pooled_W
 
-    # Triton kernel launch parameters
-    BLOCK = 1024  # number of pooled elements per program (tunable)
-    num_blocks = (H2W2 + BLOCK - 1) // BLOCK
-    grid = lambda meta: (num_blocks, N * C)
+    # prepare output flattened (N*C,)
+    out = torch.empty((N * C,), dtype=inp.dtype, device=inp.device)
 
-    # Launch the kernel
-    _pool_clamp_sum_kernel[grid](
-        x,                  # inp_ptr
-        out,                # out_ptr
-        N, C, H, W,         # dims
-        H2, W2, H2W2,       # pooled dims
-        float(min_val),     # min_val
-        float(max_val),     # max_val
-        BLOCK=BLOCK
+    # grid: 2D grid (N, C) -> program_id(0)=n, program_id(1)=c
+    grid = lambda meta: (N, C)
+
+    # launch kernel
+    fused_pool_clamp_mean_kernel[grid](
+        inp,                 # inp_ptr
+        out,                 # out_ptr
+        N, C, H, W,
+        pooled_H, pooled_W, pooled_total,
+        float(clamp_min), float(clamp_max),
     )
 
-    # compute mean by dividing by number of pooled elements
-    out = out.view(N, C)
-    mean = out / float(H2W2)
-    return mean
+    # reshape to (N, C, 1, 1)
+    out = out.view(N, C, 1, 1)
+    return out
 
 
 class ModelNew(nn.Module):
     """
-    Optimized model that uses a fused Triton kernel to replace MaxPool2d + Hardtanh + mean over spatial dims.
-    The ConvTranspose2d remains as PyTorch implementation.
+    Optimized Model that uses Triton to fuse MaxPool2d(kernel=2,stride=2) + Hardtanh + mean over H,W.
+    The ConvTranspose2d is kept as the PyTorch operator for correctness and leverage of cuDNN.
     """
-    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, maxpool_kernel_size, maxpool_stride, hardtanh_min, hardtanh_max):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding,
+                 maxpool_kernel_size, maxpool_stride, hardtanh_min, hardtanh_max):
         super(ModelNew, self).__init__()
-        # Keep PyTorch ConvTranspose2d for correctness and performance
+        # Keep the transposed convolution as PyTorch operator
         self.conv_transpose = nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding)
-        # store clamp bounds
-        self.hardtanh_min = hardtanh_min
-        self.hardtanh_max = hardtanh_max
-        # Note: maxpool params are assumed to be kernel=2, stride=2 for the fused kernel;
-        # If different values are provided, fall back to PyTorch ops.
-        self.maxpool_kernel_size = maxpool_kernel_size
-        self.maxpool_stride = maxpool_stride
+        # store pooling and clamp params (pooling assumed 2x2 stride 2 for the fused kernel)
+        assert maxpool_kernel_size == 2 and maxpool_stride == 2, "This fused kernel targets 2x2 maxpool with stride 2"
+        self.hardtanh_min = float(hardtanh_min)
+        self.hardtanh_max = float(hardtanh_max)
 
     def forward(self, x):
-        x = self.conv_transpose(x)
-        # If pooling is 2x2 stride 2, use fused Triton kernel
-        if self.maxpool_kernel_size == 2 and self.maxpool_stride == 2 and x.is_cuda and x.dtype == torch.float32:
-            # fused kernel computes per-(N,C) mean after pooling and clamping
-            mean_nc = _fused_pool_clamp_mean(x, float(self.hardtanh_min), float(self.hardtanh_max))
-            # apply tanh and reshape to (N, C, 1, 1)
-            out = torch.tanh(mean_nc).unsqueeze(-1).unsqueeze(-1)
-            return out
-        else:
-            # fallback to original sequence if parameters differ or not CUDA/fp32
-            x = nn.functional.max_pool2d(x, kernel_size=self.maxpool_kernel_size, stride=self.maxpool_stride)
-            x = torch.clamp(x, min=self.hardtanh_min, max=self.hardtanh_max)
-            x = torch.mean(x, dim=(2, 3), keepdim=True)
-            x = torch.tanh(x)
-            return x
+        # conv transpose (use PyTorch's implementation)
+        x = self.conv_transpose(x)  # (N, C, H, W)
 
+        # fuse MaxPool2d(kernel=2,stride=2) + Hardtanh + mean over (H,W) using Triton kernel
+        x = triton_fused_pool_clamp_mean(x, self.hardtanh_min, self.hardtanh_max)  # (N, C, 1, 1)
 
-# Re-create the helper functions to match the original environment (input shapes and init args)
-batch_size = 128
-in_channels  = 64
-out_channels = 64
-height = width = 256
-kernel_size  = 3
-stride = 1
-padding = 1
-maxpool_kernel_size = 2
-maxpool_stride = 2
-hardtanh_min = -1
-hardtanh_max = 1
-
-def get_inputs():
-    return [torch.rand(batch_size, in_channels, height, width).cuda()]
-
-def get_init_inputs():
-    return [in_channels, out_channels, kernel_size, stride, padding, maxpool_kernel_size, maxpool_stride, hardtanh_min, hardtanh_max]
+        # final tanh activation (on small tensor, use PyTorch)
+        x = torch.tanh(x)
+        return x

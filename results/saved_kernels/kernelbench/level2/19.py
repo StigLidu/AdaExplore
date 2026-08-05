@@ -1,177 +1,269 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-# Autotune configurations to pick the best BLOCK (tile) and launch parameters for the device.
-# These were chosen to cover a range of workloads for Ampere GPUs like the A6000.
-AUTOTUNE_CONFIGS = [
-    triton.Config({"BLOCK": 128}, num_warps=2, num_stages=2),
-    triton.Config({"BLOCK": 128}, num_warps=4, num_stages=2),
-    triton.Config({"BLOCK": 256}, num_warps=4, num_stages=2),
-    triton.Config({"BLOCK": 256}, num_warps=8, num_stages=2),
-    triton.Config({"BLOCK": 512}, num_warps=4, num_stages=2),
-    triton.Config({"BLOCK": 512}, num_warps=8, num_stages=2),
-    triton.Config({"BLOCK": 1024}, num_warps=8, num_stages=2),
-    triton.Config({"BLOCK": 2048}, num_warps=8, num_stages=3),
-]
-
-
-@triton.autotune(configs=AUTOTUNE_CONFIGS, key=['M'])
+# Reduction kernel: compute partial sums and sum-of-squares of GELU(x) per (N,G) group and atomically accumulate.
 @triton.jit
-def _gelu_groupnorm_kernel(
-    x_ptr,         # input tensor pointer (N*C*H*W,)
-    y_ptr,         # temporary buffer pointer to store GELU(x) in fp16 (N*C*H*W,)
-    gamma_ptr,     # per-channel scale (C,)
-    beta_ptr,      # per-channel bias (C,)
-    out_ptr,       # output tensor pointer (N*C*H*W,) fp32
-    N, C, H, W, G, # tensor dims and number of groups
-    eps,           # epsilon for stability (float)
-    M,             # number of elements per group (channels_per_group * H * W)
-    BLOCK: tl.constexpr,  # tile size (constexpr)
+def _group_sum_squares_kernel(
+    x_ptr,           # *ptr to input tensor (N, C, H, W)
+    sum_ptr,         # *ptr to accumulated sum (N*G,)
+    sumsq_ptr,       # *ptr to accumulated sumsq (N*G,)
+    N, C, H, W, G, C_per_group, L,  # ints
+    BLOCK: tl.constexpr,
 ):
-    # program handles one (n, g) pair
-    pid = tl.program_id(0)
-    n = pid // G
-    g = pid % G
+    n = tl.program_id(0)
+    g = tl.program_id(1)
+    block_idx = tl.program_id(2)
 
-    channels_per_group = C // G
-    c_off = g * channels_per_group               # channel offset for this group
-    hw_per_channel = H * W
+    block_start = block_idx * BLOCK
+    offs = block_start + tl.arange(0, BLOCK)
+    mask = offs < L
 
-    offs = tl.arange(0, BLOCK)                   # vector of indices in a tile
+    spatial_per_channel = H * W
+    channel_idx = offs // spatial_per_channel
+    spatial_idx = offs - channel_idx * spatial_per_channel
 
-    # First pass: compute GELU(x), store in fp16 temp buffer y_ptr, accumulate sums in fp32
-    s = 0.0
-    ss = 0.0
+    c = g * C_per_group + channel_idx  # shape [BLOCK]
 
-    start = 0
-    # iterate chunks covering M elements
-    while start < M:
-        idx = start + offs
-        mask = idx < M
+    base_nc = n * C
+    addr = (base_nc + c) * spatial_per_channel + spatial_idx
 
-        # map flattened idx -> channel_local, hw
-        c_local = idx // hw_per_channel
-        hw = idx - c_local * hw_per_channel
-        h = hw // W
-        w = hw - h * W
+    # Load x values (masked)
+    x_vals = tl.load(x_ptr + addr, mask=mask, other=0.0)
 
-        c_idx = c_off + c_local
+    # Compute GELU in-kernel using erf: gelu(x) = 0.5 * x * (1 + erf(x / sqrt(2)))
+    inv_sqrt2 = 0.7071067811865476
+    gelu_vals = 0.5 * x_vals * (1.0 + tl.erf(x_vals * inv_sqrt2))
 
-        # linear index into NCHW flattened buffer: ((n*C + c_idx) * H + h) * W + w
-        linear_idx = ((n * C + c_idx) * H + h) * W + w
+    # partial sums over the block (masked positions already zeroed)
+    partial_sum = tl.sum(gelu_vals)
+    partial_sumsq = tl.sum(gelu_vals * gelu_vals)
 
-        x = tl.load(x_ptr + linear_idx, mask=mask, other=0.0)
+    # atomic accumulate into global accumulators for (n,g)
+    idx = n * G + g
+    tl.atomic_add(sum_ptr + idx, partial_sum)
+    tl.atomic_add(sumsq_ptr + idx, partial_sumsq)
 
-        # GELU (fp32), then cast to fp16 for storage
-        y_fp32 = 0.5 * x * (1.0 + tl.erf(x / 1.4142135623730951))
-        # store fp16 to temporary buffer to save memory bandwidth
-        y_fp16 = tl.cast(y_fp32, tl.float16)
-        tl.store(y_ptr + linear_idx, y_fp16, mask=mask)
 
-        # accumulate in fp32 for numerical stability
-        y_masked = tl.where(mask, y_fp32, 0.0)
-        s = s + tl.sum(y_masked)
-        ss = ss + tl.sum(y_masked * y_masked)
+# Finalize kernel: compute mean and rstd from accumulated sum and sumsq
+@triton.jit
+def _group_finalize_kernel(
+    sum_ptr,         # *ptr to accumulated sum (N*G,)
+    sumsq_ptr,       # *ptr to accumulated sumsq (N*G,)
+    mean_ptr,        # *ptr to output mean (N*G,)
+    rstd_ptr,        # *ptr to output rstd (N*G,)
+    N, G, L, eps,    # ints/floats
+):
+    n = tl.program_id(0)
+    g = tl.program_id(1)
+    idx = n * G + g
 
-        start = start + BLOCK
+    s = tl.load(sum_ptr + idx)
+    ss = tl.load(sumsq_ptr + idx)
 
-    # compute mean and invstd for the group (fp32)
-    mean = s / M
-    var = ss / M - mean * mean
-    invstd = 1.0 / tl.sqrt(var + eps)
+    mean = s / L
+    var = ss / L - mean * mean
+    # numerical stability: var might be slightly negative due to fp accumulation, clamp to >= 0
+    var = tl.where(var > 0.0, var, 0.0)
+    rstd = 1.0 / tl.sqrt(var + eps)
 
-    # Second pass: load precomputed GELU (fp16 -> fp32), normalize and apply affine (per-channel)
-    start = 0
-    while start < M:
-        idx = start + offs
-        mask = idx < M
+    tl.store(mean_ptr + idx, mean)
+    tl.store(rstd_ptr + idx, rstd)
 
-        c_local = idx // hw_per_channel
-        hw = idx - c_local * hw_per_channel
-        h = hw // W
-        w = hw - h * W
 
-        c_idx = c_off + c_local
+# Apply kernel: load x, compute GELU, normalize using mean/rstd, apply affine (gamma/beta)
+@triton.jit
+def _groupnorm_affine_kernel(
+    x_ptr,           # *ptr to input tensor (N, C, H, W)
+    out_ptr,         # *ptr to output tensor (N, C, H, W)
+    gamma_ptr,       # *ptr to weight (C,)
+    beta_ptr,        # *ptr to bias (C,)
+    mean_ptr,        # *ptr to mean (N * G,)
+    rstd_ptr,        # *ptr to rstd (N * G,)
+    N, C, H, W, G, C_per_group, L,  # ints
+    BLOCK: tl.constexpr,
+):
+    n = tl.program_id(0)
+    g = tl.program_id(1)
+    block_idx = tl.program_id(2)
 
-        linear_idx = ((n * C + c_idx) * H + h) * W + w
+    block_start = block_idx * BLOCK
+    offs = block_start + tl.arange(0, BLOCK)
+    mask = offs < L
 
-        # load precomputed GELU from temporary fp16 buffer and cast to fp32
-        y_loaded_fp16 = tl.load(y_ptr + linear_idx, mask=mask, other=0.0)
-        y = tl.cast(y_loaded_fp16, tl.float32)
+    spatial_per_channel = H * W
+    channel_idx = offs // spatial_per_channel
+    spatial_idx = offs - channel_idx * spatial_per_channel
 
-        norm = (y - mean) * invstd
+    c = g * C_per_group + channel_idx  # shape [BLOCK]
 
-        gval = tl.load(gamma_ptr + c_idx, mask=mask, other=1.0)
-        bval = tl.load(beta_ptr + c_idx, mask=mask, other=0.0)
+    base_nc = n * C
+    addr = (base_nc + c) * spatial_per_channel + spatial_idx
 
-        out = norm * gval + bval
+    x_vals = tl.load(x_ptr + addr, mask=mask, other=0.0)
 
-        tl.store(out_ptr + linear_idx, out, mask=mask)
+    # compute GELU in-kernel (fused)
+    inv_sqrt2 = 0.7071067811865476
+    gelu_vals = 0.5 * x_vals * (1.0 + tl.erf(x_vals * inv_sqrt2))
 
-        start = start + BLOCK
+    gamma = tl.load(gamma_ptr + c, mask=mask, other=1.0)
+    beta = tl.load(beta_ptr + c, mask=mask, other=0.0)
+
+    mean_idx = n * G + g
+    mean_val = tl.load(mean_ptr + mean_idx)
+    rstd_val = tl.load(rstd_ptr + mean_idx)
+
+    out = (gelu_vals - mean_val) * rstd_val * gamma + beta
+
+    tl.store(out_ptr + addr, out, mask=mask)
+
+
+def triton_groupnorm_affine(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, num_groups: int):
+    """
+    New two-stage Triton-backed groupnorm that:
+      - computes GELU(x) reductions (sum and sumsq) per (N,G) on-device,
+      - finalizes mean and rstd on-device,
+      - applies normalization+affine with GELU fused into the apply kernel.
+
+    Inputs:
+      x: (N,C,H,W) CUDA float32
+      weight: (C,)
+      bias: (C,)
+      num_groups: G
+    Returns:
+      out: normalized tensor (N,C,H,W)
+    """
+    assert x.is_cuda and weight.is_cuda and bias.is_cuda, "All tensors must be on CUDA."
+    assert x.dtype == torch.float32, "Only fp32 supported in this kernel."
+
+    N, C, H, W = x.shape
+    G = num_groups
+    assert C % G == 0, "num_groups must divide num_channels"
+    C_per_group = C // G
+    L = C_per_group * H * W
+
+    x = x.contiguous()
+    out = torch.empty_like(x)
+    weight = weight.contiguous()
+    bias = bias.contiguous()
+
+    # allocate accumulators for sum and sumsq (N*G)
+    device = x.device
+    sum_buf = torch.zeros((N * G,), dtype=torch.float32, device=device)
+    sumsq_buf = torch.zeros((N * G,), dtype=torch.float32, device=device)
+
+    # reduction kernel params
+    BLOCK_REDUCE = 512  # constexpr tuneable
+    num_blocks = (L + BLOCK_REDUCE - 1) // BLOCK_REDUCE
+    grid_reduce = (N, G, num_blocks)
+
+    # launch reduction kernel to accumulate GELU sums and sumsq
+    _group_sum_squares_kernel[grid_reduce](
+        x, sum_buf, sumsq_buf,
+        N, C, H, W, G, C_per_group, L, BLOCK_REDUCE,
+    )
+
+    # finalize kernel: compute mean and rstd per (N,G)
+    mean_buf = torch.empty((N * G,), dtype=torch.float32, device=device)
+    rstd_buf = torch.empty((N * G,), dtype=torch.float32, device=device)
+    eps = float(1e-5)  # default small eps; will override with module eps when used below
+
+    grid_finalize = (N, G)
+    _group_finalize_kernel[grid_finalize](
+        sum_buf, sumsq_buf, mean_buf, rstd_buf,
+        N, G, L, eps,
+    )
+
+    return out, mean_buf, rstd_buf  # returns intermediate buffers; higher-level caller will call apply kernel
 
 
 class ModelNew(nn.Module):
     """
-    Optimized model:
-      - ConvTranspose2d is left to PyTorch (highly optimized).
-      - GELU + GroupNorm are fused into a Triton kernel that computes GELU,
-        reduces per-group mean/variance, normalizes and applies per-channel affine.
+    Optimized model that uses PyTorch ConvTranspose2d and Triton-backed
+    fused GroupNorm affine application. GELU and reductions are performed
+    on-device to reduce memory traffic.
     """
     def __init__(self, in_channels, out_channels, kernel_size, stride, groups, num_groups):
         super(ModelNew, self).__init__()
+        # Keep ConvTranspose2d for correctness and leveraging cuDNN
         self.conv_transpose = nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride=stride)
-        # Keep GroupNorm to hold affine parameters and num_groups metadata
+        # Keep a GroupNorm module to hold learnable parameters (weight, bias) and eps
         self.group_norm = nn.GroupNorm(num_groups=num_groups, num_channels=out_channels)
+        # Keep groups param for compatibility (not used directly here, but preserved)
+        self.groups = groups
+        self.num_groups = num_groups
 
     def forward(self, x):
+        # conv transpose (use PyTorch implementation)
         x = self.conv_transpose(x)
-        # If not on CUDA, fall back to reference implementation for correctness
-        if not x.is_cuda:
-            x = torch.nn.functional.gelu(x)
-            x = self.group_norm(x)
-            return x
 
-        # Ensure contiguous for efficient Triton access
-        x = x.contiguous()
-
+        # We'll perform GELU and reductions/apply in Triton (fused).
         N, C, H, W = x.shape
-        G = self.group_norm.num_groups
-        assert C % G == 0, "Number of channels must be divisible by num_groups"
+        G = self.num_groups
+        assert C % G == 0, "num_groups must divide num_channels"
+        C_per_group = C // G
+        L = C_per_group * H * W
 
-        # prepare gamma and beta (affine parameters). If they are None, create defaults.
-        if self.group_norm.weight is None:
-            gamma = torch.ones(C, dtype=x.dtype, device=x.device)
-        else:
-            gamma = self.group_norm.weight.contiguous()
-
-        if self.group_norm.bias is None:
-            beta = torch.zeros(C, dtype=x.dtype, device=x.device)
-        else:
-            beta = self.group_norm.bias.contiguous()
-
-        # temporary buffer to hold GELU(x) in fp16 to reduce memory bandwidth
-        y_fp16 = torch.empty_like(x, dtype=torch.float16)
-
+        # run reduction + finalize to compute mean and rstd on-device (also fused GELU)
+        x = x.contiguous()
         out = torch.empty_like(x)
+        weight = self.group_norm.weight.contiguous()
+        bias = self.group_norm.bias.contiguous()
 
-        channels_per_group = C // G
-        M = channels_per_group * H * W
+        device = x.device
 
-        # Grid: one program per (n, group)
-        grid = (N * G,)
+        # Allocate accumulators for reduction and buffers for final stats
+        sum_buf = torch.zeros((N * G,), dtype=torch.float32, device=device)
+        sumsq_buf = torch.zeros((N * G,), dtype=torch.float32, device=device)
 
-        # eps for numerical stability
-        eps = 1e-5
+        # Reduction kernel params
+        BLOCK_REDUCE = 512
+        num_blocks = (L + BLOCK_REDUCE - 1) // BLOCK_REDUCE
+        grid_reduce = (N, G, num_blocks)
 
-        # Launch the autotuned Triton kernel. The autotuner will pick an appropriate BLOCK.
-        _gelu_groupnorm_kernel[grid](
-            x, y_fp16, gamma, beta, out,
-            N, C, H, W, G,
-            eps,
-            M
+        # Launch reduction kernel
+        _group_sum_squares_kernel[grid_reduce](
+            x, sum_buf, sumsq_buf,
+            N, C, H, W, G, C_per_group, L, BLOCK_REDUCE,
         )
 
+        # Finalize mean and rstd
+        mean_buf = torch.empty((N * G,), dtype=torch.float32, device=device)
+        rstd_buf = torch.empty((N * G,), dtype=torch.float32, device=device)
+        eps = float(self.group_norm.eps)
+        grid_finalize = (N, G)
+        _group_finalize_kernel[grid_finalize](
+            sum_buf, sumsq_buf, mean_buf, rstd_buf,
+            N, G, L, eps,
+        )
+
+        # Apply kernel params
+        BLOCK_APPLY = 512
+        num_blocks_apply = (L + BLOCK_APPLY - 1) // BLOCK_APPLY
+        grid_apply = (N, G, num_blocks_apply)
+
+        # Launch apply kernel (GELU fused inside)
+        _groupnorm_affine_kernel[grid_apply](
+            x, out, weight, bias, mean_buf, rstd_buf,
+            N, C, H, W, G, C_per_group, L, BLOCK_APPLY,
+        )
         return out
+
+
+# Helper functions for the environment that generate inputs (kept for compatibility)
+batch_size   = 128
+in_channels  = 64
+out_channels = 64
+height = width = 256
+kernel_size  = 3
+stride       = 1
+groups = 8
+num_groups = 8
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width).cuda()]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, stride, groups, num_groups]

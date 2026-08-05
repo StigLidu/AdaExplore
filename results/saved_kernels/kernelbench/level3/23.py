@@ -1,142 +1,113 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-# Triton imports for the reduction kernel
 import triton
 import triton.language as tl
 
-# Autotune configs tuned for NVIDIA A6000 (Ampere) with emphasis on wide channel tiles
-# and spatial tiles matching typical final feature-map sizes (e.g., S=64 for 8x8).
-AUTOTUNE_REDUCE = [
-    triton.Config({"BLOCK_C": 512, "BLOCK_S": 64},  num_warps=16, num_stages=4),
-    triton.Config({"BLOCK_C": 512, "BLOCK_S": 128}, num_warps=16, num_stages=4),
-    triton.Config({"BLOCK_C": 256, "BLOCK_S": 64},  num_warps=8,  num_stages=3),
-    triton.Config({"BLOCK_C": 256, "BLOCK_S": 128}, num_warps=8,  num_stages=3),
-    triton.Config({"BLOCK_C": 128, "BLOCK_S": 256}, num_warps=8,  num_stages=3),
+# Autotune configurations exploring BLOCK (spatial reduction chunk) and C_BLOCK (channels per program)
+# Tuned for Ampere A6000: larger C_BLOCK (32/64) and BLOCK values that are multiples of warp size (128/256).
+# Heavier configs use more warps/stages to better utilize SM resources.
+AUTOTUNE_CONFIGS = [
+    triton.Config({"BLOCK": 256, "C_BLOCK": 32},  num_warps=4, num_stages=2),
+    triton.Config({"BLOCK": 256, "C_BLOCK": 64},  num_warps=8, num_stages=3),
+    triton.Config({"BLOCK": 512, "C_BLOCK": 32},  num_warps=8, num_stages=3),
+    triton.Config({"BLOCK": 1024, "C_BLOCK": 32}, num_warps=8, num_stages=3),
 ]
 
-
-@triton.autotune(configs=AUTOTUNE_REDUCE, key=['B', 'C', 'S'])
+@triton.autotune(
+    configs=AUTOTUNE_CONFIGS,
+    key=["N", "C", "HW"],
+)
 @triton.jit
-def _spatial_mean_kernel(
-    x_ptr,       # pointer to input x flattened as (B, C, S)
-    out_ptr,     # pointer to output means (B, C)
-    B, C, S,     # integer args
-    BLOCK_C: tl.constexpr, BLOCK_S: tl.constexpr,
+def _global_avgpool_kernel(
+    x_ptr,            # pointer to input (flattened N*C*H*W)
+    out_ptr,          # pointer to output (flattened N*C)
+    N,                # batch size
+    C,                # channels
+    HW,               # H*W
+    stride_n,         # stride to advance one sample (in elements)
+    stride_c,         # stride to advance one channel (in elements)
+    BLOCK: tl.constexpr,    # spatial chunk size (constexpr)
+    C_BLOCK: tl.constexpr,  # number of channels processed per program (constexpr)
 ):
     """
-    Triton kernel to compute per-(B, C) spatial mean:
-      out[b, c] = (1/S) * sum_s x[b, c, s]
-    Streams across S in tiles (BLOCK_S) and tiles channels by BLOCK_C.
-    Input: x flattened as (B, C, S), contiguous.
-    Output: out flattened as (B, C), contiguous.
+    Each program handles a tile: one batch element (n) and C_BLOCK consecutive channels.
+    It reduces over the HW spatial elements in chunks of size BLOCK, accumulating per-channel sums.
     """
-    b = tl.program_id(0)
-    c_block = tl.program_id(1)
 
-    c_start = c_block * BLOCK_C
-    offs_c = c_start + tl.arange(0, BLOCK_C)
-    mask_c = offs_c < C  # shape (BLOCK_C,)
+    n = tl.program_id(0)                      # batch index
+    c_block_idx = tl.program_id(1)            # index of channel block
+
+    # channel offsets handled by this program: (c_block_idx * C_BLOCK) + [0..C_BLOCK-1]
+    c_offsets = c_block_idx * C_BLOCK + tl.arange(0, C_BLOCK)
+    mask_c = c_offsets < C  # mask for channels that actually exist
+
+    # Base pointer for each channel in the block at spatial offset 0:
+    # (n * stride_n) + (c_offsets * stride_c)
+    base_ptrs = x_ptr + n * stride_n + c_offsets * stride_c  # shape: (C_BLOCK,)
 
     # accumulator per channel
-    sum_per_c = tl.zeros((BLOCK_C,), dtype=tl.float32)
+    acc = tl.zeros((C_BLOCK,), dtype=tl.float32)
 
-    s_block_start = 0
-    # iterate over spatial tiles
-    while s_block_start < S:
-        s_start = s_block_start
-        offs_s = s_start + tl.arange(0, BLOCK_S)
-        mask_s = offs_s < S  # (BLOCK_S,)
+    # Loop over spatial positions in chunks of BLOCK
+    # For each chunk, we build a pointer matrix of shape (C_BLOCK, BLOCK) and load values
+    for off_start in range(0, HW, BLOCK):
+        offs = off_start + tl.arange(0, BLOCK)  # shape: (BLOCK,)
+        mask_hw = offs < HW                      # shape: (BLOCK,)
 
-        # addresses: ((b * C + c_idx) * S) + s_idx
-        # c_idx shape: (BLOCK_C,1), s_idx shape: (1, BLOCK_S)
-        c_idx = offs_c[:, None]          # (BLOCK_C, 1)
-        s_idx = offs_s[None, :]          # (1, BLOCK_S)
-        base = (b * C + c_idx) * S       # (BLOCK_C, 1)
-        addrs = base + s_idx             # (BLOCK_C, BLOCK_S)
-        mask = mask_c[:, None] & mask_s[None, :]  # (BLOCK_C, BLOCK_S)
+        # Create (C_BLOCK, BLOCK) pointer matrix: base_ptrs[:, None] + offs[None, :]
+        ptrs = base_ptrs[:, None] + offs[None, :]
 
-        vals = tl.load(x_ptr + addrs, mask=mask, other=0.0)  # (BLOCK_C, BLOCK_S)
-        # sum across spatial axis
-        sum_s = tl.sum(vals, 1)  # (BLOCK_C,)
-        sum_per_c += sum_s
+        # Combined mask: channel mask broadcasted over BLOCK and spatial mask broadcasted over C_BLOCK
+        mask = mask_c[:, None] & mask_hw[None, :]
 
-        s_block_start += BLOCK_S
+        vals = tl.load(ptrs, mask=mask, other=0.0)  # shape (C_BLOCK, BLOCK)
+        acc += tl.sum(vals, axis=1)
 
-    invS = 1.0 / S
-    mean_per_c = sum_per_c * invS  # (BLOCK_C,)
+    # Compute average
+    avg = acc / HW  # shape (C_BLOCK,)
 
-    out_addrs = b * C + offs_c
-    tl.store(out_ptr + out_addrs, mean_per_c, mask=mask_c)
+    # Store results into out_ptr at positions (n * C + c_offsets)
+    out_ptrs = out_ptr + n * C + c_offsets
+    tl.store(out_ptrs, avg, mask=mask_c)
 
 
-def fused_global_avgpool_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor):
+def triton_global_avg_pool(x: torch.Tensor):
     """
-    Two-stage fused operation optimized for Ampere:
-      1) Run a Triton reduction kernel to compute spatial means per (B, C).
-      2) Use torch.matmul (cuBLAS) for (B, C) @ (C, K) -> (B, K) with TF32 enabled
-         for faster fp32 matmuls on Ampere devices.
-    weight is nn.Linear.weight convention (K, C).
+    x: Tensor of shape (N, C, H, W), contiguous, cuda float32
+    returns: Tensor of shape (N, C) with global average pooled values
     """
-    assert x.dtype == torch.float32 and weight.dtype == torch.float32
-    if bias is not None:
-        assert bias.dtype == torch.float32
+    assert x.is_cuda and x.dtype == torch.float32, "Triton global avg pool requires CUDA float32 tensor."
+    x = x.contiguous()
+    N, C, H, W = x.shape
+    HW = H * W
 
-    B, C, H, W = x.shape
-    S = H * W
-    K = weight.shape[0]
+    out = torch.empty((N, C), device=x.device, dtype=x.dtype)
 
-    # Flatten x to (B, C, S) contiguous
-    x_flat = x.contiguous().view(B, C, S)
+    stride_n = x.stride(0)
+    stride_c = x.stride(1)
 
-    # Allocate buffer for per-(B, C) means
-    means = torch.empty((B, C), device=x.device, dtype=x.dtype)
+    # Grid: one program per (n, channel_block)
+    grid = lambda meta: (N, (C + meta["C_BLOCK"] - 1) // meta["C_BLOCK"])
 
-    # Launch Triton reduction kernel
-    grid = lambda meta: (B, (C + meta["BLOCK_C"] - 1) // meta["BLOCK_C"])
-    _spatial_mean_kernel[grid](x_flat, means, B, C, S)
-
-    # Prepare weight in (C, K) contiguous layout on the same device (avoid transposing every forward)
-    weight_t = weight.t().contiguous().to(x.device)
-
-    # Temporarily enable TF32 matmul on Ampere to use Tensor Cores for float32 GEMM
-    enable_tf32 = False
-    prev_matmul = None
-    prev_cudnn = None
-    if x.is_cuda:
-        prev_matmul = torch.backends.cuda.matmul.allow_tf32
-        prev_cudnn = torch.backends.cudnn.allow_tf32
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        enable_tf32 = True
-
-    # GEMM using cuBLAS (torch.matmul)
-    out = torch.matmul(means, weight_t)  # (B, K)
-
-    # Restore TF32 flags to previous values
-    if enable_tf32:
-        torch.backends.cuda.matmul.allow_tf32 = prev_matmul
-        torch.backends.cudnn.allow_tf32 = prev_cudnn
-
-    # Add bias if provided
-    if bias is not None:
-        out += bias.view(1, -1).to(out.device)
-
+    _global_avgpool_kernel[grid](
+        x,
+        out,
+        N,
+        C,
+        HW,
+        stride_n,
+        stride_c,
+    )
     return out
 
 
 class ModelNew(nn.Module):
     def __init__(self, num_classes=1000):
         """
-        EfficientNetB1-like architecture optimized for inference on Ampere GPUs.
-
-        Optimizations:
-          - Final global average pooling (spatial mean) is implemented in Triton as a high-throughput reduction.
-          - The per-(B,C) means are consumed by a cuBLAS-backed matmul (torch.matmul) with TF32 enabled
-            temporarily to exploit Tensor Cores on Ampere, yielding significant speedups for the FC layer.
-          - Transposed FC weights (C, K) are cached per-device to avoid repeated transposes.
-          - Utilities to fold BatchNorm into preceding Conv2d layers are provided for inference-time speedups.
+        EfficientNetB1-like model where the global average pooling has been replaced
+        with an optimized Triton kernel that processes multiple channels per program
+        and vectorizes the spatial reduction for better GPU utilization.
         """
         super(ModelNew, self).__init__()
 
@@ -144,7 +115,8 @@ class ModelNew(nn.Module):
         self.conv1 = nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(32)
 
-        # MBConv blocks
+        # MBConv blocks (kept as PyTorch modules for correctness and to avoid
+        # reimplementing convolutional primitives in Triton here)
         self.mbconv1 = self._make_mbconv_block(32, 16, 1, 1)
         self.mbconv2 = self._make_mbconv_block(16, 24, 2, 6)
         self.mbconv3 = self._make_mbconv_block(24, 40, 2, 6)
@@ -157,12 +129,9 @@ class ModelNew(nn.Module):
         self.conv2 = nn.Conv2d(320, 1280, kernel_size=1, stride=1, padding=0, bias=False)
         self.bn2 = nn.BatchNorm2d(1280)
 
-        # Fully connected layer
+        # Fully connected layer: we will compute global average pooling first (with Triton) and then apply fc.
+        # This reduces the amount of work compared to applying a per-class 1x1 conv before pooling.
         self.fc = nn.Linear(1280, num_classes)
-
-        # Cache for transposed weight per device and underlying storage pointer
-        # key: (device_index, weight_data_ptr)
-        self._weight_t_cache = {}
 
     def _make_mbconv_block(self, in_channels, out_channels, stride, expand_ratio):
         hidden_dim = round(in_channels * expand_ratio)
@@ -177,92 +146,10 @@ class ModelNew(nn.Module):
             nn.BatchNorm2d(out_channels),
         )
 
-    def _fuse_conv_bn(self, conv: nn.Conv2d, bn: nn.BatchNorm2d):
-        """
-        Fold batchnorm 'bn' into convolution 'conv' in-place for inference.
-        """
-        if not isinstance(conv, nn.Conv2d) or not isinstance(bn, nn.BatchNorm2d):
-            return
-
-        conv_w = conv.weight.data
-        device = conv_w.device
-        dtype = conv_w.dtype
-
-        # Ensure conv has a bias tensor to write into
-        if conv.bias is not None:
-            conv_b = conv.bias.data
-        else:
-            conv_b = torch.zeros(conv_w.size(0), device=device, dtype=dtype)
-            conv.bias = nn.Parameter(conv_b.clone())
-
-        gamma = bn.weight.data.to(device=device, dtype=dtype)
-        beta = bn.bias.data.to(device=device, dtype=dtype)
-        running_mean = bn.running_mean.to(device=device, dtype=dtype)
-        running_var = bn.running_var.to(device=device, dtype=dtype)
-        eps = bn.eps
-
-        denom = torch.sqrt(running_var + eps)
-        scale = (gamma / denom)
-
-        scale_w = scale.reshape(-1, 1, 1, 1)
-        conv.weight.data.mul_(scale_w)
-        conv.bias = nn.Parameter(((conv_b - running_mean) * scale + beta).clone())
-
-    def fold_all_batchnorms(self):
-        """
-        Public helper to fold BatchNorm layers into preceding Conv2d layers.
-        Call this when switching the model to evaluation/inference mode to reduce runtime.
-        """
-        for module in self.modules():
-            children = list(module.named_children())
-            for idx, (name, child) in enumerate(children):
-                if isinstance(child, nn.Conv2d) and idx + 1 < len(children):
-                    next_name, next_child = children[idx + 1]
-                    if isinstance(next_child, nn.BatchNorm2d):
-                        conv_mod = getattr(module, name)
-                        bn_mod = getattr(module, next_name)
-                        self._fuse_conv_bn(conv_mod, bn_mod)
-                        setattr(module, next_name, nn.Identity())
-
-        # Also try folding top-level common pairs
-        top_pairs = [("conv1", "bn1"), ("conv2", "bn2")]
-        for conv_name, bn_name in top_pairs:
-            if hasattr(self, conv_name) and hasattr(self, bn_name):
-                conv_mod = getattr(self, conv_name)
-                bn_mod = getattr(self, bn_name)
-                if isinstance(conv_mod, nn.Conv2d) and isinstance(bn_mod, nn.BatchNorm2d):
-                    self._fuse_conv_bn(conv_mod, bn_mod)
-                    setattr(self, bn_name, nn.Identity())
-
-    def _get_cached_weight_t(self, device: torch.device):
-        """
-        Return cached (C, K) transposed weight on the given device.
-        Cache keyed by (device_index, data_ptr) to detect weight updates.
-        """
-        device_idx = device.index if device.type == 'cuda' else -1
-        weight_ptr = self.fc.weight.data_ptr()
-        key = (device_idx, weight_ptr)
-
-        cached = self._weight_t_cache.get(key, None)
-        if cached is not None:
-            if cached.device != device:
-                cached = cached.to(device)
-                self._weight_t_cache[key] = cached
-            return cached
-
-        # Build and cache transposed weight (C, K)
-        with torch.no_grad():
-            w_t = self.fc.weight.detach().t().contiguous().to(device)
-            self._weight_t_cache[key] = w_t
-            return w_t
-
     def forward(self, x):
         """
-        Forward pass:
-          - Convolutions and BatchNorms are executed by PyTorch.
-          - Final global average pooling + linear is computed via a Triton reduction kernel
-            to compute per-(B,C) means, followed by a cuBLAS-backed matmul (torch.matmul)
-            with TF32 enabled on Ampere devices for improved throughput.
+        Forward pass. Uses Triton-optimized global average pooling for the final pooling step.
+        The rest of the network uses standard PyTorch layers.
         """
         x = F.relu(self.bn1(self.conv1(x)))
 
@@ -276,26 +163,13 @@ class ModelNew(nn.Module):
 
         x = F.relu(self.bn2(self.conv2(x)))
 
-        if x.is_cuda:
-            # Use Triton reduction + cuBLAS matmul for best throughput on CUDA
-            weight_t = self._get_cached_weight_t(x.device)  # (C, K)
-            out = fused_global_avgpool_linear(x, weight_t.t(), self.fc.bias)
-        else:
-            # CPU fallback (pure PyTorch) for correctness
-            x_avg = F.adaptive_avg_pool2d(x, (1, 1))
-            x_flat = torch.flatten(x_avg, 1)
-            out = self.fc(x_flat)
+        # Compute global average pooling first (Triton-optimized), then apply the final linear layer.
+        # This reduces computation from O(HW * C * num_classes) to O(C * num_classes) per sample.
+        x = x.contiguous()
+        pooled = triton_global_avg_pool(x)  # shape (N, C=1280)
 
+        # Apply the linear layer using a matmul for efficiency.
+        out = pooled.matmul(self.fc.weight.t())
+        if self.fc.bias is not None:
+            out = out + self.fc.bias.unsqueeze(0)
         return out
-
-
-# Recreate the simple helper functions from the original file to be compatible with testing harnesses
-batch_size = 10
-input_shape = (3, 240, 240)
-num_classes = 1000
-
-def get_inputs():
-    return [torch.rand(batch_size, *input_shape)]
-
-def get_init_inputs():
-    return [num_classes]

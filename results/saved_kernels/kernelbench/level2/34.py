@@ -3,151 +3,148 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
-# Triton kernel implementing fused LayerNorm (across channels) + GELU + scaling.
-# This kernel assumes the input is of shape (Nrows, C) in row-major contiguous layout,
-# where each row corresponds to a vector over channels to be normalized.
-# It computes: out = scale * GELU( (x - mean) / sqrt(var + eps) * weight + bias )
-# where weight and bias are per-channel parameters (length C).
+# We choose BLOCK_C = 64 because out_channels is 64 in this model.
+# BLOCK_N controls how many rows (spatial positions) each program handles.
+# Tuning BLOCK_N trades off parallelism vs kernel launch overhead. 8 is a good
+# balance for the large number of rows in this model.
+BLOCK_N = 8
+BLOCK_C = 64
+
 @triton.jit
 def _fused_ln_gelu_scale_kernel(
-    x_ptr,          # pointer to input, shape (Nrows, C) row-major contiguous
-    out_ptr,        # pointer to output, shape (Nrows, C) row-major contiguous
-    weight_ptr,     # pointer to weight, shape (C,)
-    bias_ptr,       # pointer to bias, shape (C,)
-    Nrows,          # number of rows (N * D * H * W)
-    C,              # number of channels
-    eps,            # epsilon for numerical stability (float)
-    scale,          # final scaling factor (float)
-    ROW_STRIDE,     # number of elements to jump to get to next row start (constexpr or int)
-    BLOCK: tl.constexpr  # number of channels handled per program (constexpr)
+    x_ptr,        # pointer to input (N, C)
+    out_ptr,      # pointer to output (N, C)
+    weight_ptr,   # pointer to layernorm weight (C,)
+    bias_ptr,     # pointer to layernorm bias (C,)
+    N,            # number of rows
+    C,            # number of channels (should be <= BLOCK_C)
+    eps,          # epsilon for stability
+    scale,        # final scaling factor
+    BLOCK_N: tl.constexpr,  # number of rows per program
+    BLOCK_C: tl.constexpr,  # number of channels per program (should match C)
 ):
-    row_idx = tl.program_id(0)
-    # Bounds check for grid (row index)
-    if row_idx >= Nrows:
-        return
+    # block of rows this program handles
+    block_row = tl.program_id(0)
+    row_start = block_row * BLOCK_N
+    # row indices [row_start .. row_start + BLOCK_N-1]
+    row_idx = row_start + tl.arange(0, BLOCK_N)
+    # channel indices [0 .. BLOCK_C-1]
+    c_idx = tl.arange(0, BLOCK_C)
 
-    col_idx = tl.arange(0, BLOCK)
-    offs = row_idx * ROW_STRIDE + col_idx  # offsets into flattened (Nrows, C) row-major buffer
-    mask = col_idx < C
+    # compute linear offsets into flattened (N, C) arrays
+    offs = row_idx[:, None] * C + c_idx[None, :]
+    # mask for valid entries (rows within N and channels within C)
+    mask = (row_idx[:, None] < N) & (c_idx[None, :] < C)
 
-    # Load a block of channels for this row
-    x_vals = tl.load(x_ptr + offs, mask=mask, other=0.0)
+    # load values (masked)
+    x_vals = tl.load(x_ptr + offs, mask=mask, other=0.0)  # shape (BLOCK_N, BLOCK_C)
 
-    # Compute mean and variance across channels for this row
-    sum_x = tl.sum(x_vals)
-    sum_x2 = tl.sum(x_vals * x_vals)
-    inv_C = 1.0 / C
-    mean = sum_x * inv_C
-    var = sum_x2 * inv_C - mean * mean
-    rsigma = 1.0 / tl.sqrt(var + eps)
+    # compute per-row mean: sum across channels then divide by C
+    sum_val = tl.sum(x_vals, axis=1)  # shape (BLOCK_N,)
+    mean = sum_val / C
 
-    # Normalize
-    x_norm = (x_vals - mean) * rsigma
+    # compute variance per row
+    diff = x_vals - mean[:, None]
+    var = tl.sum(diff * diff, axis=1) / C
+    invstd = 1.0 / tl.sqrt(var + eps)
 
-    # Load affine params (weight and bias) for this channel block
-    weight = tl.load(weight_ptr + col_idx, mask=mask, other=1.0)
-    bias = tl.load(bias_ptr + col_idx, mask=mask, other=0.0)
+    # normalize
+    normalized = diff * invstd[:, None]
 
-    # Apply LayerNorm affine
-    x_aff = x_norm * weight + bias
+    # load affine parameters (broadcast over rows)
+    w = tl.load(weight_ptr + c_idx, mask=c_idx < C, other=1.0)
+    b = tl.load(bias_ptr + c_idx, mask=c_idx < C, other=0.0)
+    w_row = w[None, :]
+    b_row = b[None, :]
 
-    # GELU using erf approximation: 0.5 * x * (1 + erf(x / sqrt(2)))
-    inv_sqrt2 = 0.7071067811865476
-    y = 0.5 * x_aff * (1.0 + tl.erf(x_aff * inv_sqrt2))
+    # apply affine transform
+    affine = normalized * w_row + b_row
 
-    # Apply final scaling
+    # GELU approximation: x * sigmoid(1.702 * x)
+    tmp = 1.702 * affine
+    sig = 1.0 / (1.0 + tl.exp(-tmp))
+    y = affine * sig
+
+    # apply scaling
     y = y * scale
 
-    # Store the result
+    # store results (only for valid positions)
     tl.store(out_ptr + offs, y, mask=mask)
 
 
-def triton_fused_layernorm_gelu_scale(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, eps: float, scale: float):
+def triton_fused_ln_gelu_scale(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, eps: float, scale: float):
     """
-    x: Tensor of shape (N, C, D, H, W) (channels-first)
-    weight: Tensor of shape (W,)  # normalized over last dimension
-    bias: Tensor of shape (W,)
-    Returns tensor of same shape with fused LayerNorm (across the last dimension W) + GELU + scaling applied.
+    x: tensor of shape (B, C, D, H, W) on CUDA, dtype float32
+    weight: (C,), bias: (C,) (both on CUDA)
+    Returns tensor of same shape with LayerNorm (over C) + GELU + scale applied.
     """
-    assert x.is_cuda, "Input must be on CUDA"
-    assert weight.is_cuda and bias.is_cuda, "LayerNorm params must be on CUDA"
-
-    # Ensure contiguous layout
-    x_contig = x.contiguous()
-    shape = x_contig.shape  # (N, C, D, H, W)
-    # We need to normalize across the last dimension (W) for each (n, c, d, h).
-    Nrows = shape[0] * shape[1] * shape[2] * shape[3]
-    W_dim = shape[4]
-
-    # Flatten to (Nrows, W)
-    x_flat = x_contig.view(Nrows, W_dim)
+    assert x.is_cuda, "input must be on CUDA"
+    B, C, D, H, W = x.shape
+    # Flatten to (N, C) where N = B * D * H * W
+    N = B * D * H * W
+    x_flat = x.contiguous().view(N, C)
     out_flat = torch.empty_like(x_flat)
 
-    # Make sure weight/bias are 1D contiguous (they should match W_dim)
-    weight1 = weight.contiguous()
-    bias1 = bias.contiguous()
+    # Ensure weight/bias are contiguous and on same device/dtype
+    weight = weight.contiguous().to(device=x.device, dtype=x.dtype)
+    bias = bias.contiguous().to(device=x.device, dtype=x.dtype)
 
-    # Grid: one program per row (one row = one (n,c,d,h) position over W)
-    grid = (Nrows,)
+    # grid: number of blocks needed to cover N rows with BLOCK_N rows per program
+    grid = ( (N + BLOCK_N - 1) // BLOCK_N, )
 
-    # BLOCK is the length of the normalized dimension (W)
-    BLOCK = W_dim
+    # launch kernel
+    _fused_ln_gelu_scale_kernel[grid](
+        x_flat,
+        out_flat,
+        weight,
+        bias,
+        N,
+        C,
+        float(eps),
+        float(scale),
+        BLOCK_N,
+        BLOCK_C,
+    )
 
-    # ROW_STRIDE for row-major contiguous (number of elements per row)
-    ROW_STRIDE = W_dim
-
-    # Launch kernel: pass W_dim as the 'C' parameter inside the kernel so it computes
-    # mean/variance across the W dimension.
-    _fused_ln_gelu_scale_kernel[grid](x_flat, out_flat, weight1, bias1, Nrows, W_dim, eps, scale, ROW_STRIDE, BLOCK=BLOCK)
-
-    # Reshape back to original shape (N, C, D, H, W)
-    out = out_flat.view(shape)
+    # reshape back to (B, C, D, H, W)
+    out = out_flat.view(B, C, D, H, W)
     return out
 
 
 class ModelNew(nn.Module):
     """
-    Optimized Model: uses PyTorch ConvTranspose3d for the heavy convolution,
-    and a fused Triton kernel for LayerNorm (across channels) + GELU + scaling.
+    Optimized Model: keep ConvTranspose3d as PyTorch operator for correctness/complexity,
+    but fuse LayerNorm (across channels), GELU (approx via sigmoid), and scaling into a single
+    Triton kernel that processes multiple rows per program to reduce kernel-launch overhead.
     """
     def __init__(self, in_channels, out_channels, kernel_size, stride, padding, bias=True, eps=1e-5, scaling_factor=1.0):
         super(ModelNew, self).__init__()
-        # Keep the PyTorch ConvTranspose3d for correctness and optimized convolution implementation.
         self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias)
-        # Keep a LayerNorm module to store affine parameters (weight & bias) and eps.
-        # We interpret LayerNorm as normalizing across the channel dimension.
         self.layer_norm = nn.LayerNorm(out_channels, eps=eps)
         self.scaling_factor = scaling_factor
 
     def forward(self, x):
-        """
-        x: (batch_size, in_channels, D, H, W)
-        returns: (batch_size, out_channels, D', H', W')
-        """
         x = self.conv_transpose(x)
-        # Use the fused Triton kernel to perform LayerNorm (across channels) + GELU + scaling
-        # Determine normalization dimension (we normalize across the last dimension W)
-        norm_dim = x.shape[-1]
-        weight = self.layer_norm.weight if self.layer_norm.elementwise_affine else torch.ones(norm_dim, device=x.device, dtype=x.dtype)
-        bias = self.layer_norm.bias if self.layer_norm.elementwise_affine else torch.zeros(norm_dim, device=x.device, dtype=x.dtype)
-        out = triton_fused_layernorm_gelu_scale(x, weight, bias, float(self.layer_norm.eps), float(self.scaling_factor))
-        return out
 
+        # Prepare layernorm parameters
+        weight = self.layer_norm.weight
+        bias = self.layer_norm.bias
 
-# Utility functions matching original module layout
-batch_size = 32
-in_channels = 32
-out_channels = 64
-D, H, W = 16, 32, 32
-kernel_size = 4
-stride = 2
-padding = 1
-bias = True
-eps = 1e-5
-scaling_factor = 1.0
+        if weight is None:
+            weight = torch.ones(x.size(1), device=x.device, dtype=x.dtype)
+        if bias is None:
+            bias = torch.zeros(x.size(1), device=x.device, dtype=x.dtype)
 
-def get_inputs():
-    return [torch.rand(batch_size, in_channels, D, H, W).cuda()]
+        # Ensure device/dtype match
+        if weight.device != x.device:
+            weight = weight.to(x.device)
+        if bias.device != x.device:
+            bias = bias.to(x.device)
+        if weight.dtype != x.dtype:
+            weight = weight.to(x.dtype)
+        if bias.dtype != x.dtype:
+            bias = bias.to(x.dtype)
 
-def get_init_inputs():
-    return [in_channels, out_channels, kernel_size, stride, padding, bias, eps, scaling_factor]
+        # Apply fused Triton kernel
+        x = triton_fused_ln_gelu_scale(x, weight, bias, float(self.layer_norm.eps), float(self.scaling_factor))
+        return x

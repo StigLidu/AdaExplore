@@ -2,180 +2,127 @@ import torch
 import torch.nn as nn
 import triton
 import triton.language as tl
+import torch.nn.functional as F
 
-# Autotune configurations tuned for NVIDIA A6000 (Ampere).
-# Mix of tile sizes favoring tensor-core usage and high arithmetic intensity.
+# Enable TF32 matmuls on Ampere GPUs for faster GEMM (safe on A6000)
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+if hasattr(torch, "set_float32_matmul_precision"):
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
+
+# Autotune configs for the fp16->fp32 + ReLU conversion kernel
 AUTOTUNE_CONFIGS = [
-    triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32}, num_warps=8, num_stages=3),
-    triton.Config({"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 32}, num_warps=8, num_stages=3),
-    triton.Config({"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 32}, num_warps=8, num_stages=3),
-    triton.Config({"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 64}, num_warps=16, num_stages=4),
-    triton.Config({"BLOCK_M": 512, "BLOCK_N": 256, "BLOCK_K": 64}, num_warps=16, num_stages=4),
-    triton.Config({"BLOCK_M": 256, "BLOCK_N": 512, "BLOCK_K": 64}, num_warps=16, num_stages=4),
-    triton.Config({"BLOCK_M": 512, "BLOCK_N": 512, "BLOCK_K": 128}, num_warps=16, num_stages=4),
-    triton.Config({"BLOCK_M": 1024, "BLOCK_N": 256, "BLOCK_K": 128}, num_warps=16, num_stages=4),
+    triton.Config({"BLOCK": 4096},  num_warps=4, num_stages=2),
+    triton.Config({"BLOCK": 8192},  num_warps=4, num_stages=2),
+    triton.Config({"BLOCK": 16384}, num_warps=8, num_stages=3),
+    triton.Config({"BLOCK": 32768}, num_warps=8, num_stages=3),
 ]
 
-@triton.autotune(configs=AUTOTUNE_CONFIGS, key=["M", "N", "K"])
+@triton.autotune(configs=AUTOTUNE_CONFIGS, key=['n_elements'])
 @triton.jit
-def _matmul_relu_div_kernel(
-    A_ptr,           # A: [M, K] (fp16)
-    B_ptr,           # B: [K, N] (fp16) - pre-transposed as [K, N]
-    C_ptr,           # out: [M, N] (fp32)
-    M, N, K,         # matrix dims
-    lda, ldb, ldc,   # row-strides (lda=K, ldb=N, ldc=N)
-    bias_ptr,        # bias: [N] (fp32)
-    divisor,         # scalar divisor (float)
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
+def _fp16_to_fp32_relu_kernel(
+    x_ptr,        # pointer to fp16 input
+    out_ptr,      # pointer to fp32 output
+    n_elements,   # total number of elements
+    BLOCK: tl.constexpr
 ):
     """
-    Fused matmul (A @ B) + bias + ReLU + division.
-    A: [M, K] fp16
-    B: [K, N] fp16 (pre-transposed)
-    C: [M, N] fp32
-    bias: [N] fp32
+    Convert contiguous fp16 buffer to fp32 with ReLU (out = max(0, x_fp32))
+    Each program handles BLOCK elements.
     """
-    # Block indices
-    row_block = tl.program_id(0)
-    col_block = tl.program_id(1)
+    pid = tl.program_id(0)
+    start = pid * BLOCK
+    offs = start + tl.arange(0, BLOCK)
+    mask = offs < n_elements
 
-    row_start = row_block * BLOCK_M
-    col_start = col_block * BLOCK_N
-
-    # Row and column index vectors for this tile
-    rows = row_start + tl.arange(0, BLOCK_M)
-    cols = col_start + tl.arange(0, BLOCK_N)
-
-    # Masks for bounds
-    mask_rows = rows < M
-    mask_cols = cols < N
-
-    # accumulator in fp32
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-
-    # k offsets within a K-block
-    k_offsets = tl.arange(0, BLOCK_K)
-
-    # Main K loop - iterate over blocks of size BLOCK_K
-    for k_start in range(0, K, BLOCK_K):
-        k_idx = k_start + k_offsets  # shape [BLOCK_K]
-
-        # Load A tile: shape [BLOCK_M, BLOCK_K], fp16
-        a_ptrs = A_ptr + (rows[:, None] * lda) + k_idx[None, :]
-        a_mask = mask_rows[:, None] & (k_idx[None, :] < K)
-        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
-
-        # Load B tile: shape [BLOCK_K, BLOCK_N], fp16
-        b_ptrs = B_ptr + (k_idx[:, None] * ldb) + cols[None, :]
-        b_mask = (k_idx[:, None] < K) & mask_cols[None, :]
-        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
-
-        # Accumulate (Triton uses fp32 accumulation for fp16 inputs)
-        acc += tl.dot(a, b)
-
-    # Add bias (broadcast across rows)
-    bias_vals = tl.load(bias_ptr + cols, mask=mask_cols, other=0.0)
-    acc = acc + bias_vals[None, :]
-
-    # Fused ReLU and division
-    acc = tl.maximum(acc, 0.0)
-    acc = acc / divisor
-
-    # Store results (fp32)
-    out_ptrs = C_ptr + (rows[:, None] * ldc) + cols[None, :]
-    store_mask = mask_rows[:, None] & mask_cols[None, :]
-    tl.store(out_ptrs, acc, mask=store_mask)
+    vals_fp16 = tl.load(x_ptr + offs, mask=mask, other=tl.zeros((), tl.float16))
+    vals_fp32 = vals_fp16.to(tl.float32)
+    res = tl.where(vals_fp32 > 0.0, vals_fp32, 0.0)
+    tl.store(out_ptr + offs, res, mask=mask)
 
 
-def triton_linear_relu_div(x: torch.Tensor, weight_t: torch.Tensor, bias: torch.Tensor, divisor: float):
+def triton_fp16_to_fp32_relu(x_half: torch.Tensor, out_fp32: torch.Tensor):
     """
-    Wrapper to call Triton kernel:
-      out = relu(x @ weight + bias) / divisor
-
-    weight_t: pre-transposed weight stored as [K, N] in fp16
-    x: [M, K] float32 (converted to fp16 here)
+    Wrapper to launch the Triton kernel that converts an fp16 tensor to fp32
+    while applying ReLU. Both tensors must be CUDA and contiguous.
     """
-    assert x.is_cuda and weight_t.is_cuda, "Tensors must be on CUDA."
+    assert x_half.is_cuda and out_fp32.is_cuda, "Tensors must be on CUDA."
+    x_half = x_half.contiguous()
+    out_fp32 = out_fp32.contiguous()
 
-    # Convert x to fp16 on host to reduce memory bandwidth and utilize Tensor Cores
-    A = x.half().contiguous()  # [M, K]
-    B = weight_t.contiguous()
-    if B.dtype != torch.half:
-        B = B.half()
+    n_elements = x_half.numel()
+    if n_elements == 0:
+        return out_fp32
 
-    bias_c = bias.contiguous().to(device=A.device, dtype=torch.float32)
-
-    M, K = A.shape
-    K_b, N = B.shape
-    assert K == K_b, f"K dimension mismatch: {K} vs {K_b}"
-
-    out = torch.empty((M, N), device=A.device, dtype=torch.float32)
-
-    # Row-major strides
-    lda = K
-    ldb = N
-    ldc = N
-
-    grid = lambda meta: ((M + meta["BLOCK_M"] - 1) // meta["BLOCK_M"],
-                         (N + meta["BLOCK_N"] - 1) // meta["BLOCK_N"])
-
-    _matmul_relu_div_kernel[grid](
-        A, B, out,
-        M, N, K,
-        lda, ldb, ldc,
-        bias_c,
-        float(divisor),
-    )
-    return out
+    grid = lambda meta: ((n_elements + meta["BLOCK"] - 1) // meta["BLOCK"],)
+    _fp16_to_fp32_relu_kernel[grid](x_half, out_fp32, n_elements)
+    return out_fp32
 
 
 class ModelNew(nn.Module):
     """
-    Optimized model using a fused Triton kernel for:
-      linear -> ReLU -> division
-
-    Key optimizations:
-      - Cache a device-resident transposed weight in fp16 to avoid per-forward transpose/convert.
-      - Use mixed precision (fp16 inputs & weights) to halve memory bandwidth and leverage Tensor Cores.
-      - Fuse matmul + bias + relu + division in a single Triton kernel.
-      - Autotuned tile sizes for A6000.
+    Optimized model:
+      - Folds scalar division into weights and bias at init.
+      - Stores fp16 folded parameters as buffers to exploit Tensor Cores / TF32.
+      - Performs the large GEMM in fp16 using a single cublas call (via torch.matmul on half tensors),
+        then fuses ReLU+fp16->fp32 conversion with a Triton kernel to minimize memory traffic.
+      - Avoids unnecessary copies and keeps operations contiguous where possible.
     """
     def __init__(self, in_features, out_features, divisor):
         super(ModelNew, self).__init__()
-        # Keep nn.Linear to manage parameters & initialization
+        self.in_features = in_features
+        self.out_features = out_features
         self.linear = nn.Linear(in_features, out_features)
+        inv_div = float(1.0 / divisor)
+        # create folded fp16 copies of parameters as buffers (do not mutate original params)
+        with torch.no_grad():
+            w_folded = self.linear.weight.data * inv_div
+            # store fp16 contiguous weight for fast fused linear (shape: out_features, in_features)
+            self.register_buffer("weight_half", w_folded.half().contiguous())
+            if self.linear.bias is not None:
+                b_folded = self.linear.bias.data * inv_div
+                self.register_buffer("bias_half", b_folded.half().contiguous())
+            else:
+                self.register_buffer("bias_half", None)
+        # store divisor for interface completeness
         self.divisor = float(divisor)
-        # Cached transposed weight on device in fp16 (lazy init)
-        self._weight_t = None
-        self._weight_t_device = None
-        self._weight_t_shape = None
-
-    def _refresh_weight_t(self, device):
-        # Create a device resident transposed weight in fp16 for efficient matmul.
-        w = self.linear.weight.detach()
-        # Transpose to [K, N] where K=in_features, N=out_features
-        self._weight_t = w.t().contiguous().to(device=device, dtype=torch.half)
-        self._weight_t_device = device
-        self._weight_t_shape = self._weight_t.shape
 
     def forward(self, x):
-        device = x.device
-        expected_shape = (self.linear.weight.size(1), self.linear.weight.size(0))
-        if (self._weight_t is None) or (self._weight_t_device != device) or (self._weight_t_shape != expected_shape):
-            self._refresh_weight_t(device)
-        return triton_linear_relu_div(x, self._weight_t, self.linear.bias, self.divisor)
+        assert x.is_cuda, "Input must be on CUDA"
+        orig_dtype = x.dtype
+
+        # Ensure contiguous for matmul performance
+        if not x.is_contiguous():
+            x = x.contiguous()
+
+        # Perform GEMM in fp16 without allocating an explicit x.half() temporary by using autocast.
+        # autocast lets the backend cast inputs on-the-fly and may select fast Tensor Core kernels.
+        with torch.cuda.amp.autocast(dtype=torch.float16):
+            out_half = torch.nn.functional.linear(x, self.weight_half, self.bias_half)
+
+        # Allocate output fp32 and run Triton kernel to convert fp16->fp32 while applying ReLU
+        out_fp32 = torch.empty(out_half.size(0), out_half.size(1), device=out_half.device, dtype=torch.float32).contiguous()
+        out_fp32 = triton_fp16_to_fp32_relu(out_half, out_fp32)
+
+        # Preserve original dtype interface: input was float32 -> return float32
+        if orig_dtype == torch.float32:
+            return out_fp32
+        else:
+            return out_fp32.to(orig_dtype)
 
 
-# Keep the same helper functions as in the original script
+# retain the original helper functions (CPU creation replaced with CUDA for kernels)
 batch_size = 1024
 in_features = 8192
 out_features = 8192
 divisor = 2.0
 
 def get_inputs():
-    return [torch.rand(batch_size, in_features).cuda().to(torch.float32)]
+    # inputs should be on CUDA for best performance with Triton kernels
+    return [torch.rand(batch_size, in_features, device='cuda', dtype=torch.float32)]
 
 def get_init_inputs():
     return [in_features, out_features, divisor]

@@ -4,346 +4,286 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-# Triton kernel: In-place elementwise Add (out += identity) followed by ReLU on NCHW layout.
-# Two kernels are provided:
-#  - _add_relu_inplace_nchw_contig: fast path for contiguous NCHW tensors. Vectorizes over spatial
-#    dimension (treated as a single linear dimension S=H*W) and uses BLOCK_S as a multiple of 4.
-#  - _add_relu_inplace_nchw_tile: generic kernel that uses a merged "spatial_block" program-id
-#    (spatial_block -> bh, bw) to reduce grid dimensionality compared to separate bh/bw ids.
+# Prefer cuDNN runtime heuristics for convolution selection on Ampere GPUs
+# (low-risk global hint that improves conv kernel choices in many cases).
+torch.backends.cudnn.benchmark = True
+
+# Autotune configurations chosen for Ampere-like GPUs (A6000)
+# Prefer BLOCK sizes that are multiples of common vector widths (128/256/512)
+# for better coalescing and vectorized memory operations.
+AUTOTUNE_CONFIGS = [
+    triton.Config({"BLOCK": 512}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK": 256}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK": 128}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK": 64},  num_warps=4, num_stages=2),
+]
+
+
+@triton.autotune(configs=AUTOTUNE_CONFIGS, key=['N', 'C', 'HW'])
 @triton.jit
-def _add_relu_inplace_nchw_contig_maskless(
-    out_ptr,        # pointer to tensor to be modified (NCHW contiguous)
-    id_ptr,         # pointer to identity tensor (NCHW contiguous)
-    C, N, S,        # S = H * W
-    out_stride_n, out_stride_c,
-    id_stride_n, id_stride_c,
-    BLOCK_C: tl.constexpr,   # channels per tile (constexpr)
-    BLOCK_S: tl.constexpr,   # spatial elements per tile (constexpr, multiple of 16)
-):
-    # program ids: c_block, n, spatial_block
-    c_block = tl.program_id(0)
-    n = tl.program_id(1)
-    s_block = tl.program_id(2)
+def _bn_affine_relu_kernel(x_ptr, s_ptr, b_ptr, out_ptr, N, C, HW, BLOCK: tl.constexpr):
+    """
+    Per-(sample,channel) tiled BN affine + ReLU (inference path).
+    Grid: (N, C, ceil(HW / BLOCK))
+    Each program handles one (n, c) and a spatial tile of size BLOCK.
+    """
+    n = tl.program_id(0)
+    c = tl.program_id(1)
+    block_idx = tl.program_id(2)
 
-    # channel indices for this program (assumed full BLOCK_C; caller ensures c_block only iterates full blocks)
-    c_base = c_block * BLOCK_C
-    ch_idx = c_base + tl.arange(0, BLOCK_C)                 # [BLOCK_C]
+    offs = block_idx * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < HW
 
-    # spatial (linearized H*W) offsets for this program (assumed full BLOCK_S; caller ensures s_block only iterates full blocks)
-    s_base = s_block * BLOCK_S
-    offs_s = s_base + tl.arange(0, BLOCK_S)                 # [BLOCK_S]
+    base = ((n * C + c) * HW)
+    ptr = x_ptr + base + offs
 
-    # compute base addresses per channel (contiguous spatial)
-    base_out = n * out_stride_n + ch_idx * out_stride_c     # [BLOCK_C]
-    base_out = base_out[:, None]                            # [BLOCK_C,1]
-    base_id = n * id_stride_n + ch_idx * id_stride_c
-    base_id = base_id[:, None]
+    x = tl.load(ptr, mask=mask, other=0.0)
 
-    offs_s = offs_s[None, :]                                # [1, BLOCK_S]
-    addrs_out = base_out + offs_s                           # [BLOCK_C, BLOCK_S]
-    addrs_id = base_id + offs_s
+    # load per-channel scale and bias once
+    s = tl.load(s_ptr + c)
+    b = tl.load(b_ptr + c)
 
-    # flatten addresses and perform maskless loads/stores (safe because we only launch for full blocks)
-    addrs_out = tl.reshape(addrs_out, (-1,))
-    addrs_id = tl.reshape(addrs_id, (-1,))
+    y = x * s + b
+    # ReLU
+    y = tl.where(y > 0.0, y, 0.0)
 
-    out_vals = tl.load(out_ptr + addrs_out)
-    id_vals = tl.load(id_ptr + addrs_id)
-
-    res = out_vals + id_vals
-    res = tl.maximum(res, 0.0)
-
-    tl.store(out_ptr + addrs_out, res)
+    tl.store(out_ptr + base + offs, y, mask=mask)
 
 
+@triton.autotune(configs=AUTOTUNE_CONFIGS, key=['N', 'C', 'HW'])
 @triton.jit
-def _add_relu_inplace_nchw_contig_masked(
-    out_ptr,        # pointer to tensor to be modified (NCHW contiguous)
-    id_ptr,         # pointer to identity tensor (NCHW contiguous)
-    C, N, S,        # S = H * W
-    out_stride_n, out_stride_c,
-    id_stride_n, id_stride_c,
-    s_block_offset,             # linear offset (in elements) to add to s_base for this launch (regular arg)
-    BLOCK_C: tl.constexpr,      # channels per tile (constexpr)
-    BLOCK_S: tl.constexpr,      # spatial elements per tile (constexpr)
-):
-    # program ids: c_block, n, spatial_block (spatial_block enumerates only the tail blocks launched)
-    c_block = tl.program_id(0)
-    n = tl.program_id(1)
-    s_block = tl.program_id(2)
+def _bn_affine_add_relu_kernel(conv_ptr, id_ptr, s_ptr, b_ptr, out_ptr, N, C, HW, BLOCK: tl.constexpr):
+    """
+    Per-(sample,channel) tiled BN affine + add(identity) + ReLU:
+    Grid: (N, C, ceil(HW / BLOCK))
+    """
+    n = tl.program_id(0)
+    c = tl.program_id(1)
+    block_idx = tl.program_id(2)
 
-    # channel indices for this program (may be partial; still mask channels)
-    c_base = c_block * BLOCK_C
-    ch_idx = c_base + tl.arange(0, BLOCK_C)                 # [BLOCK_C]
-    mask_c = ch_idx < C
+    offs = block_idx * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < HW
 
-    # spatial offsets for this (tail) block - include s_block_offset
-    s_base = s_block_offset + s_block * BLOCK_S
-    offs_s = s_base + tl.arange(0, BLOCK_S)                 # [BLOCK_S]
-    mask_s = offs_s < S
+    base = ((n * C + c) * HW)
+    conv = tl.load(conv_ptr + base + offs, mask=mask, other=0.0)
+    ident = tl.load(id_ptr + base + offs, mask=mask, other=0.0)
 
-    base_out = n * out_stride_n + ch_idx * out_stride_c     # [BLOCK_C]
-    base_out = base_out[:, None]                            # [BLOCK_C,1]
-    base_id = n * id_stride_n + ch_idx * id_stride_c
-    base_id = base_id[:, None]
+    s = tl.load(s_ptr + c)
+    b = tl.load(b_ptr + c)
 
-    offs_s = offs_s[None, :]
-    addrs_out = base_out + offs_s
-    addrs_id = base_id + offs_s
+    y = conv * s + b + ident
+    # ReLU
+    y = tl.where(y > 0.0, y, 0.0)
 
-    mask = mask_c[:, None] & mask_s[None, :]
-    addrs_out = tl.reshape(addrs_out, (-1,))
-    addrs_id = tl.reshape(addrs_id, (-1,))
-    mask = tl.reshape(mask, (-1,))
-
-    out_vals = tl.load(out_ptr + addrs_out, mask=mask, other=0.0)
-    id_vals = tl.load(id_ptr + addrs_id, mask=mask, other=0.0)
-
-    res = out_vals + id_vals
-    res = tl.maximum(res, 0.0)
-
-    tl.store(out_ptr + addrs_out, res, mask=mask, other=0.0)
+    tl.store(out_ptr + base + offs, y, mask=mask)
 
 
+# Small autotune configs for channel-tiling kernels (each program handles multiple channels)
+# Expanded to include larger channel blocks and vector-friendly BLOCK sizes to improve
+# memory coalescing and L2 reuse on Ampere.
+AUTOTUNE_CONFIGS_CH = [
+    triton.Config({"BLOCK": 512, "CHANNEL_BLOCK": 16}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK": 256, "CHANNEL_BLOCK": 16}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK": 256, "CHANNEL_BLOCK": 32}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK": 128, "CHANNEL_BLOCK": 32}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK": 128, "CHANNEL_BLOCK": 16}, num_warps=8, num_stages=2),
+]
+
+@triton.autotune(configs=AUTOTUNE_CONFIGS_CH, key=['N', 'C', 'HW'])
 @triton.jit
-def _add_relu_inplace_nchw_tile_maskless(
-    out_ptr,        # pointer to tensor to be modified (NCHW layout)
-    id_ptr,         # pointer to identity tensor (NCHW layout)
-    C, N, H, W,
-    out_stride_n, out_stride_c, out_stride_h, out_stride_w,
-    id_stride_n, id_stride_c, id_stride_h, id_stride_w,
-    num_w_blocks_full,          # number of full blocks along W for the interior grid (regular arg)
-    BLOCK_C: tl.constexpr,      # tile size in channel dimension (full)
-    BLOCK_H: tl.constexpr,      # tile size in H dimension (full)
-    BLOCK_W: tl.constexpr,      # tile size in W dimension (full)
-):
-    # block indices: c_block, n, spatial_block (merged HxW for the interior full grid)
-    c_block = tl.program_id(0)
-    n = tl.program_id(1)
-    spatial_block = tl.program_id(2)
+def _bn_affine_relu_kernel_ch(x_ptr, s_ptr, b_ptr, out_ptr, N, C, HW, BLOCK: tl.constexpr, CHANNEL_BLOCK: tl.constexpr):
+    """
+    Channel-tiling variant: each program handles a small block of channels and a spatial tile.
+    Grid: (N, ceil(C/CHANNEL_BLOCK), ceil(HW/BLOCK))
+    """
+    n = tl.program_id(0)
+    ch_block = tl.program_id(1)
+    block_idx = tl.program_id(2)
 
-    # recover bh, bw from merged spatial_block (interior full grid)
-    bh = spatial_block // num_w_blocks_full
-    bw = spatial_block % num_w_blocks_full
+    offs = block_idx * BLOCK + tl.arange(0, BLOCK)
+    c_offs = ch_block * CHANNEL_BLOCK + tl.arange(0, CHANNEL_BLOCK)
 
-    # channel indices for this program (assumed full BLOCK_C)
-    c_base = c_block * BLOCK_C
-    ch_idx = c_base + tl.arange(0, BLOCK_C)                 # [BLOCK_C]
+    mask_hw = offs < HW
+    mask_c = c_offs < C
+    mask = mask_hw[None, :] & mask_c[:, None]
 
-    # spatial offsets (assumed full BLOCK_H,BLOCK_W)
-    offs_h = bh * BLOCK_H + tl.arange(0, BLOCK_H)           # [BLOCK_H]
-    offs_w = bw * BLOCK_W + tl.arange(0, BLOCK_W)           # [BLOCK_W]
+    base = (n * C) * HW + c_offs * HW  # shape [CHANNEL_BLOCK]
+    ptr = x_ptr + base[:, None] + offs[None, :]
+    x = tl.load(ptr, mask=mask, other=0.0)  # shape [CHANNEL_BLOCK, BLOCK]
 
-    # compute strides and address base per channel
-    base_out = n * out_stride_n + ch_idx * out_stride_c           # [BLOCK_C]
-    base_out = base_out[:, None, None]                            # [BLOCK_C,1,1]
-    base_id = n * id_stride_n + ch_idx * id_stride_c
-    base_id = base_id[:, None, None]
+    s = tl.load(s_ptr + c_offs, mask=mask_c, other=0.0)[:, None]
+    b = tl.load(b_ptr + c_offs, mask=mask_c, other=0.0)[:, None]
 
-    offs_h_out = (offs_h * out_stride_h)[None, :, None]         # [1,BLOCK_H,1]
-    offs_w_out = (offs_w * out_stride_w)[None, None, :]         # [1,1,BLOCK_W]
+    y = x * s + b
+    # ReLU
+    y = tl.where(y > 0.0, y, 0.0)
 
-    addrs_out = base_out + offs_h_out + offs_w_out                  # [BLOCK_C, BLOCK_H, BLOCK_W]
-    addrs_id = base_id + (offs_h * id_stride_h)[None, :, None] + (offs_w * id_stride_w)[None, None, :]
-
-    addrs_out = tl.reshape(addrs_out, (-1,))
-    addrs_id = tl.reshape(addrs_id, (-1,))
-
-    out_vals = tl.load(out_ptr + addrs_out)
-    id_vals = tl.load(id_ptr + addrs_id)
-
-    res = out_vals + id_vals
-    res = tl.maximum(res, 0.0)
-
-    tl.store(out_ptr + addrs_out, res)
+    tl.store(out_ptr + base[:, None] + offs[None, :], y, mask=mask)
 
 
+@triton.autotune(configs=AUTOTUNE_CONFIGS_CH, key=['N', 'C', 'HW'])
 @triton.jit
-def _add_relu_inplace_nchw_tile_masked(
-    out_ptr,        # pointer to tensor to be modified (NCHW layout)
-    id_ptr,         # pointer to identity tensor (NCHW layout)
-    C, N, H, W,
-    out_stride_n, out_stride_c, out_stride_h, out_stride_w,
-    id_stride_n, id_stride_c, id_stride_h, id_stride_w,
-    bh_offset,        # starting block index in H (regular arg)
-    bw_offset,        # starting block index in W (regular arg)
-    tail_num_w,       # number of W-blocks in this tail group (regular arg)
-    BLOCK_C: tl.constexpr,      # tile size in channel dimension
-    BLOCK_H: tl.constexpr,      # tile size in H dimension
-    BLOCK_W: tl.constexpr,      # tile size in W dimension
-):
-    # spatial_block enumerates blocks within the tail group; map to bh,bw using offsets
-    c_block = tl.program_id(0)
-    n = tl.program_id(1)
-    spatial_block = tl.program_id(2)
-
-    bh = bh_offset + (spatial_block // tail_num_w)
-    bw = bw_offset + (spatial_block % tail_num_w)
-
-    # channel indices for this program (may be partial; still mask channels)
-    c_base = c_block * BLOCK_C
-    ch_idx = c_base + tl.arange(0, BLOCK_C)                 # [BLOCK_C]
-    mask_c = ch_idx < C
-
-    # spatial offsets
-    offs_h = bh * BLOCK_H + tl.arange(0, BLOCK_H)           # [BLOCK_H]
-    offs_w = bw * BLOCK_W + tl.arange(0, BLOCK_W)           # [BLOCK_W]
-    mask_h = offs_h < H
-    mask_w = offs_w < W
-
-    # compute strides and address base per channel
-    base_out = n * out_stride_n + ch_idx * out_stride_c           # [BLOCK_C]
-    base_out = base_out[:, None, None]                            # [BLOCK_C,1,1]
-    base_id = n * id_stride_n + ch_idx * id_stride_c
-    base_id = base_id[:, None, None]
-
-    offs_h_out = (offs_h * out_stride_h)[None, :, None]         # [1,BLOCK_H,1]
-    offs_w_out = (offs_w * out_stride_w)[None, None, :]         # [1,1,BLOCK_W]
-
-    offs_h_id = (offs_h * id_stride_h)[None, :, None]
-    offs_w_id = (offs_w * id_stride_w)[None, None, :]
-
-    addrs_out = base_out + offs_h_out + offs_w_out                  # [BLOCK_C, BLOCK_H, BLOCK_W]
-    addrs_id = base_id + offs_h_id + offs_w_id
-
-    mask = mask_c[:, None, None] & mask_h[None, :, None] & mask_w[None, None, :]
-    addrs_out = tl.reshape(addrs_out, (-1,))
-    addrs_id = tl.reshape(addrs_id, (-1,))
-    mask = tl.reshape(mask, (-1,))
-
-    out_vals = tl.load(out_ptr + addrs_out, mask=mask, other=0.0)
-    id_vals = tl.load(id_ptr + addrs_id, mask=mask, other=0.0)
-
-    res = out_vals + id_vals
-    res = tl.maximum(res, 0.0)
-
-    tl.store(out_ptr + addrs_out, res, mask=mask, other=0.0)
-
-
-def triton_add_relu_inplace_nchw(out: torch.Tensor, identity: torch.Tensor):
+def _bn_affine_add_relu_kernel_ch(conv_ptr, id_ptr, s_ptr, b_ptr, out_ptr, N, C, HW, BLOCK: tl.constexpr, CHANNEL_BLOCK: tl.constexpr):
     """
-    In-place out = relu(out + identity) using a Triton kernel tiled for NCHW layout.
-    Two execution paths:
-      - fast contiguous path (vectorized spatial tile) when both tensors are contiguous NCHW
-      - generic merged-spatial path otherwise
-
-    Tuning notes:
-      - Use small BLOCK_C (8) and large spatial tiles for contiguous path to maximize contiguous vector loads.
-      - For merged spatial path, make BLOCK_W large (64/32/16/8) and BLOCK_H small (1..4) so bw (W-block)
-        varies fastest and threads in a warp access consecutive W addresses.
+    Channel-tiling variant of BN affine + add(identity) + ReLU.
+    Grid: (N, ceil(C/CHANNEL_BLOCK), ceil(HW/BLOCK))
     """
-    assert out.is_cuda and identity.is_cuda and out.dtype == torch.float32 and identity.dtype == torch.float32
-    assert out.shape == identity.shape, "out and identity must have same shape"
+    n = tl.program_id(0)
+    ch_block = tl.program_id(1)
+    block_idx = tl.program_id(2)
 
-    N, C, H, W = out.shape
-    out_stride_n, out_stride_c, out_stride_h, out_stride_w = out.stride()
-    id_stride_n, id_stride_c, id_stride_h, id_stride_w = identity.stride()
+    offs = block_idx * BLOCK + tl.arange(0, BLOCK)
+    c_offs = ch_block * CHANNEL_BLOCK + tl.arange(0, CHANNEL_BLOCK)
 
-    # Fast contiguous path: handle common contiguous NCHW case with vectorized spatial loads/stores.
-    if out.is_contiguous() and identity.is_contiguous():
-        S = H * W
-        # Prefer a small channel tile to reduce register pressure and allow long spatial tiles.
-        BLOCK_C = 8 if C >= 8 else max(1, C)
-        # Compute the maximum spatial tile such that BLOCK_C * BLOCK_S <= 1024 and prefer multiples of 16.
-        if S >= 16:
-            max_s = max(16, 1024 // BLOCK_C)
-            # round down to multiple of 16
-            BLOCK_S = (max_s // 16) * 16
-            if BLOCK_S < 16:
-                BLOCK_S = 16
-            BLOCK_S = min(BLOCK_S, S)
-        else:
-            # Small S: use a multiple-of-4 fallback to keep vector loads friendly.
-            BLOCK_S = max(4, (S // 4) * 4)
+    mask_hw = offs < HW
+    mask_c = c_offs < C
+    mask = mask_hw[None, :] & mask_c[:, None]
 
-        num_c_blocks = (C + BLOCK_C - 1) // BLOCK_C
-        num_s_blocks = (S + BLOCK_S - 1) // BLOCK_S
+    base = (n * C) * HW + c_offs * HW  # shape [CHANNEL_BLOCK]
+    conv = tl.load(conv_ptr + base[:, None] + offs[None, :], mask=mask, other=0.0)
+    ident = tl.load(id_ptr + base[:, None] + offs[None, :], mask=mask, other=0.0)
 
-        grid = (num_c_blocks, N, num_s_blocks)
+    s = tl.load(s_ptr + c_offs, mask=mask_c, other=0.0)[:, None]
+    b = tl.load(b_ptr + c_offs, mask=mask_c, other=0.0)[:, None]
 
-        _add_relu_inplace_nchw_contig[grid](
-            out, identity,
-            C, N, S,
-            out_stride_n, out_stride_c,
-            id_stride_n, id_stride_c,
-            BLOCK_C=BLOCK_C, BLOCK_S=BLOCK_S
-        )
-        return out
+    y = conv * s + b + ident
+    # ReLU
+    y = tl.where(y > 0.0, y, 0.0)
 
-    # Generic merged-spatial path: compute BLOCK_C,BLOCK_H,BLOCK_W and merge bh/bw into spatial_block.
-    def _choose_block_w(W):
-        if W >= 64:
-            return 64
-        elif W >= 32:
-            return 32
-        elif W >= 16:
-            return 16
-        elif W >= 8:
-            return 8
-        else:
-            return 1
-
-    BLOCK_W = _choose_block_w(W)
-    # Use a small channel tile to avoid register pressure; if channels are tiny, let BLOCK_C = C.
-    BLOCK_C = 8 if C >= 8 else max(1, C)
-    # Prefer small H tile (1..4) so W-blocking yields long contiguous runs.
-    BLOCK_H = 1024 // (BLOCK_C * BLOCK_W)
-    if BLOCK_H <= 0:
-        BLOCK_H = 1
-    elif BLOCK_H > 4:
-        BLOCK_H = 4
-
-    num_c_blocks = (C + BLOCK_C - 1) // BLOCK_C
-    num_h_blocks = (H + BLOCK_H - 1) // BLOCK_H
-    num_w_blocks = (W + BLOCK_W - 1) // BLOCK_W
-    num_spatial_blocks = num_h_blocks * num_w_blocks
-
-    grid = (num_c_blocks, N, num_spatial_blocks)
-
-    _add_relu_inplace_nchw_tile[grid](
-        out, identity,
-        C, N, H, W,
-        out_stride_n, out_stride_c, out_stride_h, out_stride_w,
-        id_stride_n, id_stride_c, id_stride_h, id_stride_w,
-        num_w_blocks,
-        BLOCK_C=BLOCK_C, BLOCK_H=BLOCK_H, BLOCK_W=BLOCK_W
-    )
-    return out
+    tl.store(out_ptr + base[:, None] + offs[None, :], y, mask=mask)
 
 
-# Utility: fold conv + bn into conv weight & bias
-def fold_conv_bn(conv: nn.Conv2d, bn: nn.BatchNorm2d):
+def _compute_bn_affine_params(bn: nn.BatchNorm2d, device, dtype):
     """
-    Fold BatchNorm parameters into Conv2d weights and biases (using running stats).
-    Returns (w_fold, b_fold) as tensors (not Parameters).
+    Compute scale and bias for BN inference:
+      s = gamma / sqrt(running_var + eps)
+      b = beta - running_mean * s
     """
-    w = conv.weight
-    device = w.device
-    dtype = w.dtype
+    gamma = bn.weight
+    beta = bn.bias
+    running_mean = bn.running_mean
+    running_var = bn.running_var
+    eps = bn.eps
+    s = (gamma / torch.sqrt(running_var + eps)).to(device=device, dtype=dtype).contiguous()
+    b = (beta - running_mean * s).to(device=device, dtype=dtype).contiguous()
+    return s, b
 
-    if conv.bias is not None:
-        conv_bias = conv.bias.to(device=device, dtype=dtype)
-    else:
-        conv_bias = torch.zeros(w.shape[0], device=device, dtype=dtype)
 
-    running_mean = bn.running_mean.to(device=device, dtype=dtype)
-    running_var = bn.running_var.to(device=device, dtype=dtype)
+def _fold_conv_bn(conv: nn.Conv2d, bn: nn.BatchNorm2d, device, dtype):
+    """
+    Fold BatchNorm affine into conv weights and bias for inference:
+      W' = W * s.reshape(out_channels,1,1,1)
+      b' = (conv.bias if present else 0) * s + b
+    Returns (W_folded, b_folded) on device/dtype.
+
+    To support a safe fp16 TensorCore path, compute the BN coefficients (s, b)
+    in float32 for numerical stability, then cast the folded weights/bias to
+    the requested dtype (e.g., float16) before returning.
+    """
+    # detach original params (do not modify originals)
+    W = conv.weight.detach()
+    conv_bias = conv.bias.detach() if conv.bias is not None else None
+
+    gamma = bn.weight.detach()
+    beta = bn.bias.detach()
+    running_mean = bn.running_mean
+    running_var = bn.running_var
     eps = bn.eps
 
-    if bn.affine:
-        gamma = bn.weight.to(device=device, dtype=dtype)
-        beta = bn.bias.to(device=device, dtype=dtype)
+    # compute per-channel scale and bias in FP32 to preserve accuracy
+    s_fp32 = (gamma / torch.sqrt(running_var + eps)).to(device=device, dtype=torch.float32)
+    b_fp32 = (beta - running_mean * s_fp32).to(device=device, dtype=torch.float32)
+
+    # cast per requested dtype for folding (weights/bias)
+    if dtype == torch.float16:
+        s = s_fp32.to(device=device, dtype=torch.float16).contiguous()
+        b = b_fp32.to(device=device, dtype=torch.float16).contiguous()
+        W = W.to(device=device, dtype=torch.float16).contiguous()
     else:
-        gamma = torch.ones(w.shape[0], device=device, dtype=dtype)
-        beta = torch.zeros(w.shape[0], device=device, dtype=dtype)
+        s = s_fp32.to(device=device, dtype=dtype).contiguous()
+        b = b_fp32.to(device=device, dtype=dtype).contiguous()
+        W = W.to(device=device, dtype=dtype).contiguous()
 
-    denom = torch.sqrt(running_var + eps)
-    scale = gamma / denom  # (out_channels,)
+    W_fold = W * s.reshape(-1, 1, 1, 1)
+    if conv_bias is not None:
+        b_fold = conv_bias.to(device=device, dtype=dtype).contiguous() * s + b
+    else:
+        b_fold = b
 
-    w_fold = w * scale.reshape(-1, 1, 1, 1)
-    b_fold = beta - running_mean * scale + conv_bias * scale
+    return W_fold, b_fold
 
-    return w_fold.detach(), b_fold.detach()
+
+def _get_or_make_folded(conv: nn.Conv2d, bn: nn.BatchNorm2d, device, dtype):
+    """
+    Get cached folded (W, b) for given conv+bn on (device, dtype) or compute and cache it.
+    The cache is stored on the conv module as attribute _fold_cache (a dict keyed by (device, dtype)).
+    """
+    cache = getattr(conv, "_fold_cache", None)
+    key = (device, dtype)
+    if cache is None:
+        cache = {}
+        setattr(conv, "_fold_cache", cache)
+    if key in cache:
+        return cache[key]
+    W_fold, b_fold = _fold_conv_bn(conv, bn, device, dtype)
+    # keep a reference to the GPU tensor on the conv module via the cache dict
+    cache[key] = (W_fold, b_fold)
+    return W_fold, b_fold
+
+
+def _bn_affine_relu_triton(x: torch.Tensor, bn: nn.BatchNorm2d):
+    """
+    Apply BatchNorm (inference) then ReLU using Triton.
+    For inference & CUDA & no grad: operate in-place on x's buffer to minimize memory traffic.
+    Falls back to PyTorch if training or requires_grad or not CUDA.
+    """
+    if x.requires_grad:
+        return F.relu(bn(x))
+
+    if (not x.is_cuda) or bn.training:
+        return F.relu(bn(x))
+
+    device = x.device
+    dtype = x.dtype
+    with torch.no_grad():
+        s, b = _compute_bn_affine_params(bn, device, dtype)
+
+        # avoid unnecessary device->device copies if already contiguous
+        x_contig = x if x.is_contiguous() else x.contiguous()
+        N, C, H, W = x_contig.shape
+        HW = H * W
+
+        # in-place (write back to same buffer)
+        grid = lambda meta: (N, C, (HW + meta['BLOCK'] - 1) // meta['BLOCK'])
+        _bn_affine_relu_kernel[grid](x_contig, s, b, x_contig, N, C, HW)
+        return x_contig
+
+
+def _bn_affine_add_relu_triton(conv_out: torch.Tensor, identity: torch.Tensor, bn: nn.BatchNorm2d):
+    """
+    Apply BN affine to conv_out (inference) + identity + ReLU via Triton in-place on conv_out buffer.
+    Falls back to PyTorch for training/autograd/CPU cases.
+    """
+    if conv_out.requires_grad or identity.requires_grad:
+        return F.relu(bn(conv_out) + identity)
+
+    if (not conv_out.is_cuda) or (not identity.is_cuda) or bn.training:
+        return F.relu(bn(conv_out) + identity)
+
+    device = conv_out.device
+    dtype = conv_out.dtype
+    with torch.no_grad():
+        s, b = _compute_bn_affine_params(bn, device, dtype)
+        # avoid unnecessary device->device copies if already contiguous
+        x_contig = conv_out if conv_out.is_contiguous() else conv_out.contiguous()
+        id_contig = identity if identity.is_contiguous() else identity.contiguous()
+
+        N, C, H, W = x_contig.shape
+        HW = H * W
+
+        grid = lambda meta: (N, C, (HW + meta['BLOCK'] - 1) // meta['BLOCK'])
+        _bn_affine_add_relu_kernel[grid](x_contig, id_contig, s, b, x_contig, N, C, HW)
+        return x_contig
 
 
 class BottleneckNew(nn.Module):
@@ -353,166 +293,71 @@ class BottleneckNew(nn.Module):
         super(BottleneckNew, self).__init__()
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
         self.bn1 = nn.BatchNorm2d(out_channels)
-
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(out_channels)
-
         self.conv3 = nn.Conv2d(out_channels, out_channels * self.expansion, kernel_size=1, bias=False)
         self.bn3 = nn.BatchNorm2d(out_channels * self.expansion)
-
         self.relu = nn.ReLU(inplace=True)
+        # downsample is usually nn.Sequential(conv, bn)
         self.downsample = downsample
         self.stride = stride
-
-        # caches for folded weights (filled on-demand or by parent)
-        self._folded = False
-        self._has_folded_downsample = False
-        self._w1_f = None
-        self._b1_f = None
-        self._w2_f = None
-        self._b2_f = None
-        self._w3_f = None
-        self._b3_f = None
-        self._wds_f = None
-        self._bds_f = None
-        self._ds_stride = None
-        self._ds_padding = None
-        self._ds_dilation = None
-
-    def _compute_folded_weights(self, device=None, dtype=None):
-        if self._folded:
-            return
-
-        # compute folded weights on conv/bn pairs
-        self._w1_f, self._b1_f = fold_conv_bn(self.conv1, self.bn1)
-        self._w2_f, self._b2_f = fold_conv_bn(self.conv2, self.bn2)
-        self._w3_f, self._b3_f = fold_conv_bn(self.conv3, self.bn3)
-
-        # downsample folding if present
-        self._has_folded_downsample = False
-        if self.downsample is not None:
-            ds_conv = None
-            ds_bn = None
-            if isinstance(self.downsample, nn.Sequential):
-                for mod in self.downsample:
-                    if isinstance(mod, nn.Conv2d) and ds_conv is None:
-                        ds_conv = mod
-                    elif isinstance(mod, nn.BatchNorm2d) and ds_bn is None:
-                        ds_bn = mod
-                if ds_conv is not None and ds_bn is not None:
-                    self._wds_f, self._bds_f = fold_conv_bn(ds_conv, ds_bn)
-                    self._ds_stride = ds_conv.stride
-                    self._ds_padding = ds_conv.padding
-                    self._ds_dilation = ds_conv.dilation
-                    self._has_folded_downsample = True
-            else:
-                try:
-                    convs = [m for m in self.downsample.modules() if isinstance(m, nn.Conv2d)]
-                    bns = [m for m in self.downsample.modules() if isinstance(m, nn.BatchNorm2d)]
-                    if len(convs) >= 1 and len(bns) >= 1:
-                        ds_conv = convs[0]
-                        ds_bn = bns[0]
-                        self._wds_f, self._bds_f = fold_conv_bn(ds_conv, ds_bn)
-                        self._ds_stride = ds_conv.stride
-                        self._ds_padding = ds_conv.padding
-                        self._ds_dilation = ds_conv.dilation
-                        self._has_folded_downsample = True
-                except Exception:
-                    self._has_folded_downsample = False
-
-        # move folded tensors to desired device/dtype to avoid future transfers
-        if device is None or dtype is None:
-            params = list(self.parameters())
-            device = params[0].device if len(params) > 0 else torch.device("cuda")
-            dtype = params[0].dtype if len(params) > 0 else torch.float32
-
-        self._w1_f = self._w1_f.to(device=device, dtype=dtype)
-        self._b1_f = self._b1_f.to(device=device, dtype=dtype)
-        self._w2_f = self._w2_f.to(device=device, dtype=dtype)
-        self._b2_f = self._b2_f.to(device=device, dtype=dtype)
-        self._w3_f = self._w3_f.to(device=device, dtype=dtype)
-        self._b3_f = self._b3_f.to(device=device, dtype=dtype)
-        if self._has_folded_downsample:
-            self._wds_f = self._wds_f.to(device=device, dtype=dtype)
-            self._bds_f = self._bds_f.to(device=device, dtype=dtype)
-
-        self._folded = True
-
-    def train(self, mode: bool = True):
-        res = super(BottleneckNew, self).train(mode)
-        if mode:
-            # invalidate folded cache when switching back to training
-            self._folded = False
-            self._has_folded_downsample = False
-        return res
-
-    def eval(self):
-        res = super(BottleneckNew, self).eval()
-        # mark folded stale so parent can precompute if desired
-        self._folded = False
-        self._has_folded_downsample = False
-        return res
 
     def forward(self, x):
         identity = x
 
-        # Fast folded path when all BNs are in eval mode
-        can_fold = (not self.bn1.training) and (not self.bn2.training) and (not self.bn3.training)
-        if can_fold:
-            # compute folded weights lazily (or use parent's precompute)
-            self._compute_folded_weights(device=x.device, dtype=x.dtype)
+        # Fast inference path: fold conv+bn into single convs and use cuDNN (F.conv2d) for convolutions.
+        # This minimizes memory passes (no separate BN step) and leverages optimized conv kernels.
+        if (not self.training) and (not x.requires_grad) and x.is_cuda:
+            device = x.device
+            dtype = x.dtype
 
-            # conv1 (folded conv+bn)
-            out = F.conv2d(x, self._w1_f, self._b1_f, stride=self.conv1.stride, padding=self.conv1.padding, dilation=self.conv1.dilation)
-            out = F.relu(out, inplace=True)
+            # Prefer channels-last activations so cuDNN can use fast NHWC/TensorCore paths on Ampere.
+            # This is safe in the inference-only branch and avoids autograd concerns.
+            x = x.contiguous(memory_format=torch.channels_last)
+            identity = identity.contiguous(memory_format=torch.channels_last)
 
-            # conv2 (folded)
-            out = F.conv2d(out, self._w2_f, self._b2_f, stride=self.conv2.stride, padding=self.conv2.padding, dilation=self.conv2.dilation)
-            out = F.relu(out, inplace=True)
+            # conv1 folded (cached)
+            w1, b1 = _get_or_make_folded(self.conv1, self.bn1, device, dtype)
+            out = F.conv2d(x, w1, bias=b1, stride=1, padding=0)
+            out = F.relu(out)
 
-            # conv3 (folded)
-            out = F.conv2d(out, self._w3_f, self._b3_f, stride=self.conv3.stride, padding=self.conv3.padding, dilation=self.conv3.dilation)
+            # conv2 folded (preserve stride and padding) (cached)
+            w2, b2 = _get_or_make_folded(self.conv2, self.bn2, device, dtype)
+            out = F.conv2d(out, w2, bias=b2, stride=self.stride, padding=1)
+            out = F.relu(out)
 
-            # identity: folded downsample if available else compute via module
+            # conv3 folded (cached)
+            w3, b3 = _get_or_make_folded(self.conv3, self.bn3, device, dtype)
+            out = F.conv2d(out, w3, bias=b3, stride=1, padding=0)
+
+            # fold downsample if present (cached)
             if self.downsample is not None:
-                if self._has_folded_downsample:
-                    identity = F.conv2d(identity, self._wds_f, self._bds_f, stride=self._ds_stride, padding=self._ds_padding, dilation=self._ds_dilation)
-                else:
-                    identity = self.downsample(identity)
+                ds_conv = self.downsample[0]
+                ds_bn = self.downsample[1]
+                wds, bds = _get_or_make_folded(ds_conv, ds_bn, device, dtype)
+                identity = F.conv2d(x, wds, bias=bds, stride=self.stride, padding=0)
 
-            # in-place fused add + ReLU via Triton to minimize extra allocations and memory traffic
-            out = triton_add_relu_inplace_nchw(out, identity)
+            out = out + identity
+            out = F.relu(out)
             return out
 
-        # Fallback (training or cannot fold): standard PyTorch path
+        # Training / autograd / CPU path: keep original semantics, but use Triton fusions where safe in inference-like cases.
         out = self.conv1(x)
-        out = self.bn1(out)
-        out = self.relu(out)
+        out = _bn_affine_relu_triton(out, self.bn1)
 
         out = self.conv2(out)
-        out = self.bn2(out)
-        out = self.relu(out)
+        out = _bn_affine_relu_triton(out, self.bn2)
 
         out = self.conv3(out)
-        out = self.bn3(out)
-
         if self.downsample is not None:
             identity = self.downsample(x)
 
-        out += identity
-        out = self.relu(out)
-
+        out = _bn_affine_add_relu_triton(out, identity, self.bn3)
         return out
 
 
 class ModelNew(nn.Module):
     def __init__(self, layers, num_classes=1000):
-        """
-        Optimized ResNet-like model that uses:
-         - conv+bn folding in eval to reduce kernels and memory traffic
-         - Triton fused in-place add+ReLU kernel for the residual connection
-         - Precomputation hooks to fold weights eagerly in eval to avoid first-pass overhead
-        """
         super(ModelNew, self).__init__()
         self.in_channels = 64
 
@@ -531,11 +376,6 @@ class ModelNew(nn.Module):
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.fc = nn.Linear(512 * block.expansion, num_classes)
 
-        # stem folded caches
-        self._stem_folded = False
-        self._conv1_wf = None
-        self._conv1_bf = None
-
     def _make_layer(self, block, out_channels, blocks, stride=1):
         downsample = None
         if stride != 1 or self.in_channels != out_channels * block.expansion:
@@ -552,97 +392,19 @@ class ModelNew(nn.Module):
 
         return nn.Sequential(*layers)
 
-    def _compute_stem_fold(self, device=None, dtype=None):
-        if self._stem_folded:
-            return
-        if device is None or dtype is None:
-            params = list(self.parameters())
-            if len(params) > 0:
-                device = params[0].device
-                dtype = params[0].dtype
-            else:
-                device = torch.device("cuda")
-                dtype = torch.float32
-        self._conv1_wf, self._conv1_bf = fold_conv_bn(self.conv1, self.bn1)
-        self._conv1_wf = self._conv1_wf.to(device=device, dtype=dtype)
-        self._conv1_bf = self._conv1_bf.to(device=device, dtype=dtype)
-        self._stem_folded = True
-
-    def _precompute_all_folds(self, device=None, dtype=None):
-        """
-        Precompute folded weights for stem and all BottleneckNew modules.
-        This avoids repeated CPU->GPU transfers on the first eval forward pass.
-        """
-        if device is None or dtype is None:
-            params = list(self.parameters())
-            if len(params) > 0:
-                device = params[0].device
-                dtype = params[0].dtype
-            else:
-                device = torch.device("cuda")
-                dtype = torch.float32
-
-        # stem
-        if not self._stem_folded:
-            self._compute_stem_fold(device=device, dtype=dtype)
-
-        # iterate modules and compute folded weights for BottleneckNew
-        for m in self.modules():
-            if isinstance(m, BottleneckNew):
-                if not m._folded:
-                    m._compute_folded_weights(device=device, dtype=dtype)
-
-    def train(self, mode: bool = True):
-        res = super(ModelNew, self).train(mode)
-        if mode:
-            # Invalidate precomputed folded caches when switching to train
-            self._stem_folded = False
-            for m in self.modules():
-                if isinstance(m, BottleneckNew):
-                    m._folded = False
-                    m._has_folded_downsample = False
-        return res
-
-    def eval(self):
-        res = super(ModelNew, self).eval()
-        # Precompute all folded weights eagerly to avoid first-forward overhead in eval.
-        # Explicitly pass device/dtype derived from the model parameters so folded tensors are
-        # created on the correct device/dtype and avoid blocking device-to-device casts later.
-        try:
-            params = list(self.parameters())
-            if len(params) > 0:
-                device = params[0].device
-                dtype = params[0].dtype
-            else:
-                # Fallback to a sensible default if there are no parameters (shouldn't normally happen).
-                device = torch.device("cuda")
-                dtype = torch.float32
-            self._precompute_all_folds(device=device, dtype=dtype)
-        except Exception:
-            # If for some reason precompute fails, it's safe to continue; folding will happen lazily.
-            pass
-        return res
-
     def forward(self, x):
-        # Fast folded stem if possible
-        if not self.bn1.training:
-            # use precomputed folded stem if available, else compute lazily
-            if not self._stem_folded:
-                self._compute_stem_fold(device=x.device, dtype=x.dtype)
-            # folded tensors are moved to correct device/dtype during _compute_stem_fold;
-            # use them directly to avoid per-forward .to(...) allocations.
-            if self._conv1_wf.device != x.device or self._conv1_wf.dtype != x.dtype:
-                # One-time fallback move to keep behavior safe; this will update the stored folded tensors so
-                # subsequent forwards do not pay the cast cost.
-                self._conv1_wf = self._conv1_wf.to(device=x.device, dtype=x.dtype)
-                self._conv1_bf = self._conv1_bf.to(device=x.device, dtype=x.dtype)
-            x = F.conv2d(x, self._conv1_wf, self._conv1_bf, stride=self.conv1.stride, padding=self.conv1.padding, dilation=self.conv1.dilation)
-            x = F.relu(x, inplace=True)
+        # Fast inference path: fold conv1 + bn1 when possible to use a single conv
+        if (not self.training) and (not x.requires_grad) and x.is_cuda:
+            device = x.device
+            dtype = x.dtype
+            # Prefer channels-last activations to let cuDNN pick NHWC/TensorCore kernels on Ampere.
+            x = x.contiguous(memory_format=torch.channels_last)
+            w1, b1 = _get_or_make_folded(self.conv1, self.bn1, device, dtype)
+            x = F.conv2d(x, w1, bias=b1, stride=2, padding=3)
+            x = F.relu(x)
         else:
             x = self.conv1(x)
-            x = self.bn1(x)
-            x = F.relu(x, inplace=True)
-
+            x = _bn_affine_relu_triton(x, self.bn1)
         x = self.maxpool(x)
 
         x = self.layer1(x)
@@ -653,5 +415,18 @@ class ModelNew(nn.Module):
         x = self.avgpool(x)
         x = torch.flatten(x, 1)
         x = self.fc(x)
-
         return x
+
+
+# Utilities to match original module signature (input generation helpers)
+batch_size = 10
+height = 224
+width = 224
+layers = [3, 4, 23, 3]
+num_classes = 1000
+
+def get_inputs():
+    return [torch.rand(batch_size, 3, height, width)]
+
+def get_init_inputs():
+    return [layers, num_classes]

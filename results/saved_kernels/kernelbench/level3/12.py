@@ -4,297 +4,231 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-# Autotune configs targeted for NVIDIA A6000 (Ampere) shapes encountered in VGG classifier.
-AUTOTUNE_CONFIGS = [
-    triton.Config({"BLOCK_M": 8,   "BLOCK_N": 256, "BLOCK_K": 64},  num_warps=4, num_stages=2),
-    triton.Config({"BLOCK_M": 16,  "BLOCK_N": 256, "BLOCK_K": 64},  num_warps=4, num_stages=2),
-    triton.Config({"BLOCK_M": 16,  "BLOCK_N": 512, "BLOCK_K": 64},  num_warps=8, num_stages=2),
-    triton.Config({"BLOCK_M": 32,  "BLOCK_N": 512, "BLOCK_K": 64},  num_warps=8, num_stages=3),
-    triton.Config({"BLOCK_M": 32,  "BLOCK_N": 1024, "BLOCK_K": 32}, num_warps=8, num_stages=3),
-    triton.Config({"BLOCK_M": 64,  "BLOCK_N": 512,  "BLOCK_K": 32}, num_warps=8, num_stages=3),
-]
+# Tuned block sizes for Ampere (A6000)
+_RELU_BLOCK = 1024
+_FUSED_BLOCK = 1024
 
-@triton.autotune(
-    configs=AUTOTUNE_CONFIGS,
-    key=["M", "N", "K"],
-)
+# Simple in-place ReLU Triton kernel (vector-friendly)
 @triton.jit
-def _triton_gemm_kernel(
-    A_ptr,           # pointer to A (M, K)
-    B_ptr,           # pointer to B (K, N)  -> we pass weight.t() so shape K x N
-    C_ptr,           # pointer to output C (M, N)
-    bias_ptr,        # pointer to bias (N) or any placeholder
-    M,
-    N,
-    K,
-    stride_am,       # stride of A along rows (elements)
-    stride_ak,       # stride of A along cols (elements)
-    stride_bk,       # stride of B along rows (elements)
-    stride_bn,       # stride of B along cols (elements)
-    stride_cm,       # stride of C along rows (elements)
-    stride_cn,       # stride of C along cols (elements)
-    RELU: tl.constexpr,    # whether to apply ReLU after bias add
-    HAS_BIAS: tl.constexpr,# whether bias_ptr points to valid bias values
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-):
-    # 2D program ids selecting a tile of the output
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+def _relu_kernel(x_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    vals = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    out = tl.where(vals > 0.0, vals, 0.0)
+    tl.store(x_ptr + offsets, out, mask=mask)
 
-    # row and column offsets for this program
-    row_off = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    col_off = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-
-    # masks for valid rows/cols
-    rm = row_off < M
-    cm = col_off < N
-
-    # accumulator for the tile
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-
-    # iterate over K dimension in chunks of BLOCK_K
-    num_k_blocks = (K + BLOCK_K - 1) // BLOCK_K
-    for bk in range(0, num_k_blocks):
-        k0 = bk * BLOCK_K
-        k_off = k0 + tl.arange(0, BLOCK_K)
-        km = k_off < K
-
-        # pointers for A and B blocks
-        a_ptrs = A_ptr + (row_off[:, None] * stride_am) + (k_off[None, :] * stride_ak)
-        b_ptrs = B_ptr + (k_off[:, None] * stride_bk) + (col_off[None, :] * stride_bn)
-
-        mask_a = (rm[:, None]) & (km[None, :])
-        mask_b = (km[:, None]) & (cm[None, :])
-
-        # load blocks; shapes: a_block (BLOCK_M, BLOCK_K), b_block (BLOCK_K, BLOCK_N)
-        a_block = tl.load(a_ptrs, mask=mask_a, other=0.0)
-        b_block = tl.load(b_ptrs, mask=mask_b, other=0.0)
-
-        # vectorized multiply-accumulate over K-block
-        # Use broadcasting multiplication and sum over K axis
-        prod = a_block[:, :, None] * b_block[None, :, :]
-        acc += tl.sum(prod, axis=1)
-
-    # add bias if present
-    if HAS_BIAS:
-        bias_vals = tl.load(bias_ptr + col_off, mask=cm, other=0.0)
-    else:
-        bias_vals = tl.zeros((BLOCK_N,), dtype=tl.float32)
-    acc = acc + bias_vals[None, :]
-
-    # optional fused ReLU
-    if RELU:
-        acc = tl.maximum(acc, 0.0)
-
-    # store the output tile
-    c_ptrs = C_ptr + (row_off[:, None] * stride_cm) + (col_off[None, :] * stride_cn)
-    mask_store = (rm[:, None]) & (cm[None, :])
-    tl.store(c_ptrs, acc, mask=mask_store)
-
-
-def triton_linear_from_wt(input: torch.Tensor, Wt: torch.Tensor, bias: torch.Tensor = None, relu: bool = False):
+def triton_relu_(x: torch.Tensor):
     """
-    Triton-accelerated linear where the weight is provided already transposed (Wt == weight.t()).
-    This avoids per-forward transposition overhead by allowing the forward pass to reuse a cached Wt.
-    Expects CUDA tensors for Triton execution; falls back to PyTorch on CPU.
+    In-place ReLU via Triton. Falls back to torch.relu_ on CPU.
     """
-    # Fallback to PyTorch if not CUDA to preserve correctness on CPU
-    if not (input.is_cuda and Wt.is_cuda):
-        # If Wt was provided, reconstruct weight by transposing
-        W = Wt.t().contiguous()
-        out = nn.functional.linear(input, W, bias)
-        if relu:
-            out = torch.relu(out)
-        return out
+    if not x.is_cuda:
+        return x.relu_()
+    if not x.is_contiguous():
+        x = x.contiguous()
+    n_elements = x.numel()
+    grid = ((n_elements + _RELU_BLOCK - 1) // _RELU_BLOCK,)
+    # Launch in-place: kernel writes back to same pointer
+    _relu_kernel[grid](x, n_elements, BLOCK_SIZE=_RELU_BLOCK)
+    return x
 
-    # ensure contiguity
-    x = input.contiguous()
-    Wt_c = Wt.contiguous()
+# Fused ReLU + 2x2 MaxPool (stride=2) Triton kernel
+# Input layout: N, C, H, W (contiguous). Output: N, C, H//2, W//2
+@triton.jit
+def _relu_maxpool2_kernel(inp_ptr, out_ptr,
+                          N, C, H, W, H_out, W_out,
+                          n_elements, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
 
-    M = x.shape[0]
-    K = x.shape[1]
-    N = Wt_c.shape[1]  # because Wt is (K, N)
+    # offsets index into output flattened as ((n*C + c)*H_out + h_out)*W_out + w_out
+    offs = offsets
 
-    # Prepare bias placeholder if None
-    if bias is None:
-        bias_tensor = torch.empty(1, dtype=x.dtype, device=x.device)
-        has_bias = False
-    else:
-        bias_tensor = bias.contiguous()
-        has_bias = True
+    w_out = offs % W_out
+    t = offs // W_out
+    h_out = t % H_out
+    t = t // H_out
+    c = t % C
+    n = t // C
 
-    out = torch.empty((M, N), dtype=x.dtype, device=x.device)
+    # compute input coordinates (top-left of 2x2 window)
+    h_in = h_out * 2
+    w_in = w_out * 2
 
-    # Strides in elements (not bytes)
-    stride_am = x.stride(0)
-    stride_ak = x.stride(1)
-    stride_bk = Wt_c.stride(0)
-    stride_bn = Wt_c.stride(1)
-    stride_cm = out.stride(0)
-    stride_cn = out.stride(1)
+    # flatten input index: ((n*C + c)*H + h_in)*W + w_in
+    base_idx = ((n * C + c) * H + h_in) * W + w_in
 
-    # Grid for 2D tiling
-    grid = lambda meta: (
-        (M + meta["BLOCK_M"] - 1) // meta["BLOCK_M"],
-        (N + meta["BLOCK_N"] - 1) // meta["BLOCK_N"],
-    )
+    # Offsets for 4 values in the 2x2 window
+    idx0 = base_idx
+    idx1 = base_idx + 1
+    idx2 = base_idx + W
+    idx3 = base_idx + W + 1
 
-    # Launch Triton kernel
-    _triton_gemm_kernel[grid](
-        x,                    # A_ptr
-        Wt_c,                 # B_ptr (K, N)
-        out,                  # C_ptr
-        bias_tensor,          # bias_ptr
-        M,
-        N,
-        K,
-        stride_am,
-        stride_ak,
-        stride_bk,
-        stride_bn,
-        stride_cm,
-        stride_cn,
-        bool(relu),           # RELU constexpr
-        bool(has_bias),       # HAS_BIAS constexpr
-    )
+    # Load (use a very negative other to avoid affecting max when out-of-bounds,
+    # though shapes should ensure in-bounds accesses)
+    neg_inf = -1e20
+    x0 = tl.load(inp_ptr + idx0, mask=mask, other=neg_inf)
+    x1 = tl.load(inp_ptr + idx1, mask=mask, other=neg_inf)
+    x2 = tl.load(inp_ptr + idx2, mask=mask, other=neg_inf)
+    x3 = tl.load(inp_ptr + idx3, mask=mask, other=neg_inf)
+
+    # Apply ReLU then max over the four values
+    x0 = tl.where(x0 > 0.0, x0, 0.0)
+    x1 = tl.where(x1 > 0.0, x1, 0.0)
+    x2 = tl.where(x2 > 0.0, x2, 0.0)
+    x3 = tl.where(x3 > 0.0, x3, 0.0)
+
+    m1 = tl.maximum(x0, x1)
+    m2 = tl.maximum(x2, x3)
+    out = tl.maximum(m1, m2)
+
+    tl.store(out_ptr + offsets, out, mask=mask)
+
+def triton_relu_maxpool2(x: torch.Tensor) -> torch.Tensor:
+    """
+    Fused ReLU + 2x2 MaxPool (stride 2). Returns a new downsampled tensor.
+    Falls back to F.relu + F.max_pool2d on CPU.
+    """
+    if not x.is_cuda:
+        return F.max_pool2d(F.relu(x), kernel_size=2, stride=2)
+
+    # Ensure contiguous input
+    x = x.contiguous()
+    N, C, H, W = x.shape
+    assert H % 2 == 0 and W % 2 == 0, "H and W must be divisible by 2 for 2x2 pool"
+    H_out, W_out = H // 2, W // 2
+
+    out = torch.empty((N, C, H_out, W_out), device=x.device, dtype=x.dtype)
+
+    n_elements = out.numel()
+    grid = ((n_elements + _FUSED_BLOCK - 1) // _FUSED_BLOCK,)
+
+    _relu_maxpool2_kernel[grid](x, out,
+                                N, C, H, W, H_out, W_out,
+                                n_elements,
+                                BLOCK_SIZE=_FUSED_BLOCK)
     return out
 
+# Marker module for where pooling should occur (replaces MaxPool2d in the module list)
+class PoolMark(nn.Module):
+    def forward(self, x):
+        # Acts as placeholder; fused kernel will be applied in the forward loop
+        return x
 
 class ModelNew(nn.Module):
     """
-    VGG19 optimized for A6000:
-      - Convolutional feature extractor computed in mixed precision (fp16) using torch.cuda.amp
-        to leverage Tensor Cores for convolutions.
-      - Classifier: three Linear layers kept as nn.Linear modules for state_dict compatibility,
-        but during forward we reuse cached transposed weight tensors (Wt = weight.t().contiguous())
-        to avoid repeated transpositions and accelerate Triton GEMM launches.
-      - Triton GEMM fuses bias-add and optional ReLU.
+    VGG19-like model where:
+      - Elementwise ReLUs are run in-place via Triton for conv/linear outputs.
+      - The final ReLU before each 2x2 MaxPool is fused with the pooling into a single Triton kernel
+        that performs ReLU and 2x2 max pooling in one pass, reducing memory traffic.
     """
     def __init__(self, num_classes=1000):
         super(ModelNew, self).__init__()
 
-        # Feature extractor (same as original VGG19)
+        # Build features: replace ReLU with Identity placeholders and MaxPool2d with PoolMark.
+        # We'll run Triton ReLU after each Conv2d, except the conv immediately before a PoolMark,
+        # for which we'll run the fused relu+pool kernel.
         self.features = nn.Sequential(
             # Block 1
             nn.Conv2d(3, 64, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
+            nn.Identity(),  # placeholder for ReLU
             nn.Conv2d(64, 64, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.Identity(),
+            PoolMark(),
 
             # Block 2
             nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
+            nn.Identity(),
             nn.Conv2d(128, 128, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.Identity(),
+            PoolMark(),
 
             # Block 3
             nn.Conv2d(128, 256, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
+            nn.Identity(),
             nn.Conv2d(256, 256, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
+            nn.Identity(),
             nn.Conv2d(256, 256, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
+            nn.Identity(),
             nn.Conv2d(256, 256, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.Identity(),
+            PoolMark(),
 
             # Block 4
             nn.Conv2d(256, 512, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
+            nn.Identity(),
             nn.Conv2d(512, 512, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
+            nn.Identity(),
             nn.Conv2d(512, 512, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
+            nn.Identity(),
             nn.Conv2d(512, 512, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.Identity(),
+            PoolMark(),
 
             # Block 5
             nn.Conv2d(512, 512, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
+            nn.Identity(),
             nn.Conv2d(512, 512, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
+            nn.Identity(),
             nn.Conv2d(512, 512, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
+            nn.Identity(),
             nn.Conv2d(512, 512, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2, stride=2)
+            nn.Identity(),
+            PoolMark()
         )
 
-        # Keep classifier parameters so weights/biases are visible in state_dict.
+        # Classifier: keep linear layers, apply Triton in-place ReLU after each Linear
         self.classifier = nn.Sequential(
             nn.Linear(512 * 7 * 7, 4096),
-            nn.ReLU(inplace=True),
+            nn.Identity(),
             nn.Dropout(p=0.0),
             nn.Linear(4096, 4096),
-            nn.ReLU(inplace=True),
+            nn.Identity(),
             nn.Dropout(p=0.0),
             nn.Linear(4096, num_classes)
         )
 
-        # Buffers to cache transposed weights for Triton usage.
-        # They will be created lazily on the first forward when model is on CUDA.
-        self._cached_wt0 = None
-        self._cached_wt1 = None
-        self._cached_wt2 = None
-
-    def _ensure_cached_wt(self, linear_module, cache_name):
-        """
-        Ensure that cache_name attribute holds a contiguous transposed weight tensor
-        on the same device/dtype as linear_module.weight. Create or refresh when needed.
-        """
-        cached = getattr(self, cache_name)
-        w = linear_module.weight
-        # If no cached tensor or device/dtype/shape mismatch, (re)create it
-        if cached is None or cached.device != w.device or cached.dtype != w.dtype or cached.shape != (w.shape[1], w.shape[0]):
-            # store transposed contiguous weight for reuse
-            wt = w.t().contiguous()
-            setattr(self, cache_name, wt)
-
     def forward(self, x):
-        # Mixed precision for convolutional feature extractor on CUDA to leverage Tensor Cores.
-        if x.is_cuda:
-            with torch.cuda.amp.autocast(enabled=True):
-                x = self.features(x)
-        else:
-            x = self.features(x)
+        # Iterate through feature modules. Apply Triton kernels opportunistically:
+        # - After each Conv2d: if the conv is immediately before a PoolMark (i+2), run fused relu+pool.
+        # - Otherwise, run in-place Triton ReLU on the conv output.
+        i = 0
+        L = len(self.features)
+        while i < L:
+            layer = self.features[i]
+            x = layer(x)
 
-        # Flatten features to (batch, 512*7*7)
+            if isinstance(layer, nn.Conv2d):
+                # Check if this conv is the one right before a PoolMark (pattern conv, Identity, PoolMark)
+                if (i + 2) < L and isinstance(self.features[i + 2], PoolMark):
+                    # Use fused Triton ReLU + 2x2 MaxPool (stride 2)
+                    x = triton_relu_maxpool2(x)
+                    # continue; placeholders (Identity and PoolMark) will be skipped logically,
+                    # but the loop will still visit them; they are no-ops so it's fine.
+                else:
+                    # Regular in-place Triton ReLU
+                    triton_relu_(x)
+            # For other layers (Identity, PoolMark) do nothing; they are placeholders
+            i += 1
+
         x = torch.flatten(x, 1)
 
-        # Ensure classifier inputs are float32 for Triton GEMM (kernels assume fp32 loads/compute)
-        if x.is_cuda:
-            x = x.to(torch.float32)
-
-        # Layer 1: Linear(512*7*7 -> 4096) + ReLU
-        l0 = self.classifier[0]
-        if x.is_cuda and l0.weight.is_cuda:
-            # Ensure cached transposed weight exists on correct device/dtype
-            self._ensure_cached_wt(l0, "_cached_wt0")
-            x = triton_linear_from_wt(x, self._cached_wt0, l0.bias, relu=True)
-        else:
-            x = l0(x)
-            x = torch.relu(x)
-
-        # Layer 2: Linear(4096 -> 4096) + ReLU
-        l1 = self.classifier[3]
-        if x.is_cuda and l1.weight.is_cuda:
-            self._ensure_cached_wt(l1, "_cached_wt1")
-            x = triton_linear_from_wt(x, self._cached_wt1, l1.bias, relu=True)
-        else:
-            x = l1(x)
-            x = torch.relu(x)
-
-        # Layer 3: Linear(4096 -> num_classes) (no ReLU)
-        l2 = self.classifier[6]
-        if x.is_cuda and l2.weight.is_cuda:
-            self._ensure_cached_wt(l2, "_cached_wt2")
-            x = triton_linear_from_wt(x, self._cached_wt2, l2.bias, relu=False)
-        else:
-            x = l2(x)
+        # Classifier: apply linear layers and then in-place Triton ReLU after each Linear
+        for layer in self.classifier:
+            x = layer(x)
+            if isinstance(layer, nn.Linear):
+                triton_relu_(x)
 
         return x
+
+# Test helpers analogous to the original module
+batch_size = 10
+num_classes = 1000
+
+def get_inputs():
+    return [torch.rand(batch_size, 3, 224, 224, dtype=torch.float32)]
+
+def get_init_inputs():
+    return [num_classes]

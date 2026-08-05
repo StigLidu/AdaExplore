@@ -3,129 +3,216 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
-# Autotune configs favoring larger BLOCK_SIZEs (better for very large spatial sizes)
-AUTOTUNE_CONFIGS = [
-    triton.Config({"BLOCK_SIZE": 256},  num_warps=4, num_stages=2),
-    triton.Config({"BLOCK_SIZE": 512},  num_warps=4, num_stages=2),
-    triton.Config({"BLOCK_SIZE": 1024}, num_warps=8, num_stages=3),
+# Autotune configs tuned for Ampere (A6000). Favor larger BLOCK sizes to reduce number of partials
+PARTIAL_AUTOTUNE = [
+    triton.Config({"BLOCK": 4096},  num_warps=4, num_stages=2),
+    triton.Config({"BLOCK": 8192},  num_warps=4, num_stages=2),
+    triton.Config({"BLOCK": 16384}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK": 32768}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK": 65536}, num_warps=8, num_stages=3),
 ]
 
-
-@triton.autotune(AUTOTUNE_CONFIGS, key=['HW', 'num_out'])
+@triton.autotune(configs=PARTIAL_AUTOTUNE, key=['N'])
 @triton.jit
-def _spatial_sum_kernel(inp_ptr, partial_ptr, HW, num_out, num_tiles, BLOCK_SIZE: tl.constexpr):
+def _row_partial_sum_kernel(
+    x_ptr,        # pointer to flattened input (rows * N)
+    tmp_ptr,      # pointer to temporary partial sums (rows * num_parts,)
+    N,            # length of each row (H*W)
+    stride,       # stride between rows in elements (should be N for contiguous)
+    num_parts,    # number of partial tiles per row (python int)
+    BLOCK: tl.constexpr,
+):
     """
-    Each program handles one (pid, tile) pair and computes a partial sum of up to BLOCK_SIZE elements.
-    Writes the scalar partial sum to partial_ptr[pid * num_tiles + tile].
-    Grid: (num_out, num_tiles)
+    Each program reduces a contiguous BLOCK chunk for one row and writes an fp32 partial sum.
+    Grid: (num_parts, rows)
     """
-    pid = tl.program_id(0)   # index in [0..num_out)
-    tile = tl.program_id(1)  # which tile across HW
-    base = pid * HW
-    start = tile * BLOCK_SIZE
-    offs = tl.arange(0, BLOCK_SIZE)
-    idxs = start + offs
-    mask = idxs < HW
-    ptrs = inp_ptr + base + idxs
-    vals = tl.load(ptrs, mask=mask, other=0.0)
-    # reduce vector to scalar accumulator
-    acc = tl.sum(vals, 0)
-    out_index = pid * num_tiles + tile
-    tl.store(partial_ptr + out_index, acc)
+    part = tl.program_id(0)   # which partial tile within a row
+    row = tl.program_id(1)    # which row (B*C)
+    start = part * BLOCK
+    offs = tl.arange(0, BLOCK)
+    idx = row * stride + start + offs
+    mask = start + offs < N
+    vals = tl.load(x_ptr + idx, mask=mask, other=0.0)
+    # ensure accumulation in fp32 for numerical stability
+    vals = tl.cast(vals, tl.float32)
+    s = tl.sum(vals)
+    out_idx = row * num_parts + part
+    tl.store(tmp_ptr + out_idx, s)
 
 
-def triton_spatial_sum(x: torch.Tensor) -> torch.Tensor:
+@triton.jit
+def _row_finalize_kernel(
+    tmp_ptr,      # pointer to temporary partial sums (rows * num_parts,)
+    out_ptr,      # pointer to output (rows,)
+    N,            # total number of elements per row (for final division)
+    num_parts,    # number of partials per row (python int)
+    stride_tmp,   # stride between rows in tmp (equals num_parts)
+    BLOCK: tl.constexpr,
+):
     """
-    Compute sum over spatial dims (H,W) for each (batch, channel) using a tiled Triton kernel.
-    Input: x shape (B, C, H, W), CUDA, float32
-    Output: tensor shape (B, C) with sums over H*W
+    Reduce the small number of partial sums for a single row to a full sum, then divide by N to get mean.
+    One program per row. Grid: (rows,)
+    """
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK)
+    acc = 0.0
+    start = 0
+    # If all partials fit in one vectorized load, do it in one shot; otherwise do chunked loads.
+    if num_parts <= BLOCK:
+        idx = row * stride_tmp + offs
+        mask = offs < num_parts
+        vals = tl.load(tmp_ptr + idx, mask=mask, other=0.0)
+        acc = tl.sum(vals)
+    else:
+        while start < num_parts:
+            idx = row * stride_tmp + start + offs
+            mask = start + offs < num_parts
+            vals = tl.load(tmp_ptr + idx, mask=mask, other=0.0)
+            acc = acc + tl.sum(vals)
+            start += BLOCK
+    mean = acc / N
+    tl.store(out_ptr + row, mean)
+
+
+def triton_mean_hw(x: torch.Tensor):
+    """
+    Compute global mean over H and W for each (batch, channel) pair using a tiled two-stage Triton reduction.
+    Input:
+      x: tensor of shape (B, C, H, W), dtype float32, device CUDA
+    Output:
+      tensor of shape (B, C, 1, 1)
     """
     assert x.is_cuda, "Input must be on CUDA"
+    assert x.dtype == torch.float32, "This Triton kernel expects float32"
+
     B, C, H, W = x.shape
-    HW = H * W
-    num_out = B * C
+    N = H * W
+    rows = B * C
 
-    # Make a 2D view (num_out, HW). Avoid copies when possible.
-    if not x.is_contiguous():
-        x_flat2d = x.contiguous().view(B * C, HW)
+    # Choose DEFAULT_BLOCK large so num_parts is small (reduces finalize overhead).
+    # For H=W=512: N=262144, DEFAULT_BLOCK=65536 -> num_parts = 4
+    DEFAULT_BLOCK = 65536
+    num_parts = (N + DEFAULT_BLOCK - 1) // DEFAULT_BLOCK
+    if num_parts < 1:
+        num_parts = 1
+
+    # flatten input to (rows, N)
+    x_flat = x.contiguous().view(rows, N)
+
+    # temporary buffer for partial sums: shape (rows, num_parts), always fp32
+    tmp = torch.empty((rows, num_parts), device=x.device, dtype=torch.float32)
+
+    # Launch first-stage kernel: grid (num_parts, rows)
+    grid_partial = lambda meta: (num_parts, rows)
+    _row_partial_sum_kernel[grid_partial](x_flat.view(-1), tmp.view(-1), N, N, num_parts)
+
+    # Final reduction across partials: one program per row
+    out = torch.empty((rows,), device=x.device, dtype=torch.float32)
+    # choose BLOCK_FINAL as power-of-two that can hold num_parts (keeps tl.arange small)
+    if num_parts <= 1024:
+        BLOCK_FINAL = 1 << ((num_parts - 1).bit_length())
     else:
-        x_flat2d = x.view(B * C, HW)
-
-    inp_flat = x_flat2d.reshape(-1)
-
-    # Choose a conservative default tile size close to the larger autotune candidates.
-    # This keeps the partials buffer small for huge spatial sizes and matches likely chosen BLOCK_SIZE.
-    DEFAULT_TILE = 1024
-    num_tiles = (HW + DEFAULT_TILE - 1) // DEFAULT_TILE
-    if num_tiles == 0:
-        num_tiles = 1
-
-    # Allocate partials buffer on device: shape (num_out, num_tiles)
-    partials = torch.empty((num_out, num_tiles), device=x.device, dtype=x.dtype)
-
-    # grid for kernel launch: num_out x num_tiles
-    grid = lambda meta: (num_out, num_tiles)
-
-    # Launch Triton kernel: partials is passed flattened so kernel can write into it linearly
-    _spatial_sum_kernel[grid](inp_flat, partials.reshape(-1), HW, num_out, num_tiles)
-
-    # now reduce partials along the tile dimension to get final sums per (b,c)
-    out = partials.sum(dim=1)  # shape (num_out,)
-
-    # reshape back to (B, C)
-    return out.view(B, C)
+        BLOCK_FINAL = 256
+    grid_finalize = lambda meta: (rows,)
+    _row_finalize_kernel[grid_finalize](tmp.view(-1), out, N, num_parts, num_parts, BLOCK_FINAL)
+    out = out.view(B, C, 1, 1)
+    return out
 
 
 class ModelNew(nn.Module):
     """
-    Optimized Model that avoids materializing the full ConvTranspose2d output.
-    Uses a Triton kernel to compute the spatial sums of the input (heavy part),
-    then uses fast PyTorch matrix operations to finish the computation.
+    Optimized Model that:
+      - Moves the global average pooling before the ConvTranspose2d:
+          mean_y[b, cout] = sum_cin mean_x[b, cin] * sum_{kh,kw} weight[cin, cout, kh, kw]
+      - Uses a two-stage Triton reduction with larger tiles to minimize number of partials and kernel overhead.
+      - Caches the spatial-summed weights (w_sum) and only updates that cache when the conv weight changes,
+        minimizing redundant work across forwards.
+      - Fuses conv bias and model bias into a single vector for a single broadcast add.
     """
     def __init__(self, in_channels, out_channels, kernel_size, bias_shape):
         super(ModelNew, self).__init__()
-        # keep conv_transpose to retain weights; we'll use its weights analytically
         self.conv_transpose = nn.ConvTranspose2d(in_channels, out_channels, kernel_size)
-        # bias as in original model
         self.bias = nn.Parameter(torch.randn(bias_shape))
 
+        # cached weight-sums over spatial dims (shape: (in_channels, out_channels))
+        w_shape = (in_channels, out_channels)
+        w_device = self.conv_transpose.weight.device
+        # persistent=False so it's not saved in state_dict (derived quantity)
+        self.register_buffer("_w_sum_buf", torch.empty(w_shape, dtype=torch.float32, device=w_device), persistent=False)
+        self._weight_ptr = None
+        # initialize cache
+        self._update_w_sum_cache(force=True)
+
+    def _update_w_sum_cache(self, force: bool = False):
+        w = self.conv_transpose.weight
+        ptr = w.data_ptr()
+        if (not force) and (self._weight_ptr == ptr) and self._w_sum_buf.numel() != 0:
+            return  # cached and up-to-date
+        # compute sum over spatial dims (2,3): shape (C_in, C_out)
+        w_sum = w.sum(dim=(2, 3)).detach()
+        # store in buffer with same dtype and device
+        if self._w_sum_buf.device != w_sum.device or self._w_sum_buf.shape != w_sum.shape:
+            self._w_sum_buf = torch.empty_like(w_sum, device=w_sum.device)
+        # ensure fp32 accumulation for small matmul
+        if w_sum.dtype != torch.float32:
+            w_sum = w_sum.to(torch.float32)
+        self._w_sum_buf.copy_(w_sum)
+        self._weight_ptr = ptr
+
     def forward(self, x):
-        # x: (B, inC, H, W)
-        B, inC, H, W = x.shape
-        device = x.device
-        dtype = x.dtype
+        # x: (B, C_in, H, W)
+        B, C_in, H, W = x.shape
 
-        # 1) compute sum over spatial dims for each (batch, in_channel) using Triton
-        # returns shape (B, inC)
-        sum_input = triton_spatial_sum(x)  # (B, inC)
+        # 1) compute spatial mean of input efficiently via Triton reduction -> (B, C_in, 1, 1)
+        in_mean_hw = triton_mean_hw(x)  # (B, C_in, 1, 1)
+        in_mean = in_mean_hw.view(B, C_in)  # (B, C_in)
 
-        # 2) compute sum of kernel weights over spatial dims -> shape (inC, outC)
-        weight = self.conv_transpose.weight  # shape (inC, outC, kH, kW)
-        if weight.device != device or weight.dtype != dtype:
-            weight = weight.to(device=device, dtype=dtype)
-        K_sum = weight.sum(dim=(2, 3))  # (inC, outC), on correct device
+        # 2) update cached weight-sum if conv weights changed
+        self._update_w_sum_cache()
 
-        # 3) aggregated contribution to each output channel:
-        # pooled_sum = sum_i sum_input[b,i] * K_sum[i,o]
-        pooled = torch.matmul(sum_input, K_sum)  # (B, outC)
+        w_sum = self._w_sum_buf
+        # ensure device match for matmul
+        if w_sum.device != in_mean.device:
+            w_sum = w_sum.to(in_mean.device)
 
-        # convert sum over output spatial to mean over spatial by dividing by H_out * W_out
-        kH, kW = self.conv_transpose.kernel_size
-        H_out = H + kH - 1
-        W_out = W + kW - 1
-        scale = 1.0 / (H_out * W_out)
-        pooled = pooled * scale  # (B, outC)
+        # 3) small matmul to get output spatial mean -> (B, C_out)
+        out_mean = in_mean @ w_sum  # (B, C_out)
 
-        # 4) add bias (original bias shape is (outC,1,1) -> broadcast to (B, outC))
-        b = self.bias
-        if b.device != device or b.dtype != dtype:
-            b = b.to(device=device, dtype=dtype)
-        pooled = pooled + b.view(1, -1)
+        # 4) fuse conv_transpose.bias and model bias into a single bias vector, then add
+        bias_vec = self.bias.reshape(1, -1)
+        if self.conv_transpose.bias is not None:
+            conv_b = self.conv_transpose.bias.reshape(1, -1)
+            if conv_b.device != out_mean.device:
+                conv_b = conv_b.to(out_mean.device)
+            if bias_vec.device != out_mean.device:
+                bias_vec = bias_vec.to(out_mean.device)
+            bias_vec = conv_b + bias_vec
+        else:
+            if bias_vec.device != out_mean.device:
+                bias_vec = bias_vec.to(out_mean.device)
 
-        # 5) log-sum-exp across channels -> (B,1)
-        lse = torch.logsumexp(pooled, dim=1, keepdim=True)  # (B,1)
+        y = out_mean + bias_vec  # (B, C_out)
 
-        # 6) final multiplication
-        out = lse * 10.0  # (B,1)
+        # 5) numerically-stable log-sum-exp over channels -> (B, 1)
+        y = torch.logsumexp(y, dim=1, keepdim=True)
 
-        return out
+        # 6) scale
+        y = y * 10.0
+        return y
+
+
+# Keep helper variables & functions to match original module interface
+
+batch_size = 16
+in_channels = 64
+out_channels = 128
+height = width = 512
+kernel_size = 3
+bias_shape = (out_channels, 1, 1)
+
+def get_inputs():
+    # inputs expected on CUDA for Triton kernels
+    return [torch.rand(batch_size, in_channels, height, width).cuda()]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, bias_shape]

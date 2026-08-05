@@ -3,98 +3,92 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
-# Tuned block sizes to try; choose a larger block to increase memory bandwidth utilization
-# while still being a multiple of 32 (warp size). We avoid autotune complexity and pick a
-# single well-performing BLOCK for A6000.
-_BLOCK = 4096  # must be multiple of 32
-
-
+# Fused Triton kernel: in-place on conv output
+# Performs: y = x + add_val; y = min(y, 0.0); y = gelu_approx(y); y = y * mul_val
+# Processes BLOCK * V elements per program (V elements per lane).
 @triton.jit
-def _fused_pointwise_kernel(
-    x_ptr,        # pointer to input tensor (fp32)
-    out_ptr,      # pointer to output tensor (fp32) - can alias x_ptr for in-place
-    add_val,      # float scalar: value to add
-    mul_val,      # float scalar: value to multiply
-    n_elements,   # total number of elements (int)
-    BLOCK: tl.constexpr,  # compile-time block size
+def fused_elemwise_inplace_kernel(
+    x_ptr,            # pointer to input/output
+    n_elements,       # total number of elements
+    add_val,          # scalar add value (fp32)
+    mul_val,          # scalar multiply value (fp32)
+    BLOCK: tl.constexpr,  # number of program lanes
+    V: tl.constexpr       # vectorization (elements per lane)
 ):
     pid = tl.program_id(0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    # each program handles BLOCK * V elements
+    start = pid * BLOCK * V
+    # build linear offsets directly (BLOCK and V are constexpr so BLOCK * V is compile-time)
+    offs = start + tl.arange(0, BLOCK * V)                 # shape [BLOCK * V]
     mask = offs < n_elements
-
-    # Load values (masked)
     x = tl.load(x_ptr + offs, mask=mask, other=0.0)
 
     # add
-    x = x + add_val
-
-    # min(x, 0.0) -> keep negative values, clamp positives to 0
-    x = tl.where(x < 0.0, x, 0.0)
+    y = x + add_val
+    # min with 0.0 (keep negatives)
+    # After this, positives are zeroed, so GELU(0)=0 and we can avoid extra work conceptually.
+    neg_mask = y < 0.0
+    y = tl.where(neg_mask, y, 0.0)
 
     # GELU approximation: x * sigmoid(1.702 * x)
-    # sigmoid(z) = 1 / (1 + exp(-z))
-    sig = 1.0 / (1.0 + tl.exp(-1.702 * x))
-    x = x * sig
+    # Compute using the clamped values; positives are already zero so result will be zero for them.
+    z = 1.702 * y
+    s = 1.0 / (1.0 + tl.exp(-z))
+    y = y * s
 
-    # multiply
-    x = x * mul_val
+    # final multiply
+    y = y * mul_val
 
-    # Store result (masked)
-    tl.store(out_ptr + offs, x, mask=mask)
+    tl.store(x_ptr + offs, y, mask=mask)
 
 
-def fused_pointwise_inplace(x: torch.Tensor, add_value: float, multiply_value: float):
+def triton_fused_inplace(x: torch.Tensor, add_val: float, mul_val: float):
     """
-    Fuse the sequence of elementwise ops (add, min(x,0), GELU approximation, multiply)
-    into a single Triton kernel and run it in-place on the provided tensor to avoid
-    an extra allocation/copy. The tensor is flattened and processed as contiguous memory.
+    Wrapper for the fused Triton kernel.
+    - Operates in-place on x (the conv_transpose output).
+    - x is flattened; kernel performs masked loads/stores and writes back to x.
     """
-    assert x.is_cuda, "Input must be on CUDA."
-    x = x.contiguous()
-    out = x  # in-place
+    assert x.is_cuda, "Input must be on CUDA"
+    assert x.dtype == torch.float32, "Only fp32 supported"
+    x_flat = x.contiguous().view(-1)
+    n_elements = x_flat.numel()
 
-    n_elements = x.numel()
-    if n_elements == 0:
-        return out
+    # Tunable parameters for Ampere (A6000)
+    # Choose BLOCK (threads per program) and V (vectorization per thread).
+    # BLOCK is constexpr; V is constexpr. Each program handles BLOCK * V elements.
+    # Use a smaller BLOCK for better occupancy on Ampere; V keeps loads vectorized.
+    BLOCK = 256   # number of program lanes
+    V = 4         # elements per lane -> each program handles 1024 elements
 
-    BLOCK = _BLOCK
-    num_blocks = (n_elements + BLOCK - 1) // BLOCK
-    grid = (num_blocks,)
-
-    # Launch kernel (BLOCK is a constexpr argument)
-    _fused_pointwise_kernel[grid](
-        x, out,
-        float(add_value),
-        float(multiply_value),
-        n_elements,
-        BLOCK=BLOCK,
-    )
-    return out
+    grid = lambda meta: ((n_elements + meta["BLOCK"] * V - 1) // (meta["BLOCK"] * V),)
+    fused_elemwise_inplace_kernel[grid](x_flat, n_elements, float(add_val), float(mul_val), BLOCK=BLOCK, V=V)
+    return x_flat.view_as(x)
 
 
 class ModelNew(nn.Module):
     """
     Optimized model:
-      - Uses PyTorch's nn.ConvTranspose2d for the transposed convolution (leveraging cuDNN/cuBLAS).
-      - Fuses the subsequent elementwise operations (add, min with 0, GELU, multiply)
-        into a single Triton kernel which operates in-place to avoid extra allocations and copies.
+      - Uses the original nn.ConvTranspose2d for the heavy convolution transpose.
+      - Fuses add -> min(.,0) -> GELU -> multiply into a single Triton kernel,
+        operating in-place on the conv output to avoid intermediate allocations.
     """
     def __init__(self, in_channels, out_channels, kernel_size, stride, add_value, multiply_value):
         super(ModelNew, self).__init__()
         self.conv_transpose = nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride=stride)
-        # store scalars as Python floats for passing to Triton
         self.add_value = float(add_value)
         self.multiply_value = float(multiply_value)
 
     def forward(self, x):
-        # conv transpose using highly-optimized PyTorch implementation
+        # conv_transpose uses efficient PyTorch CUDA implementation
         x = self.conv_transpose(x)
-        # fused elementwise operations via Triton (in-place)
-        x = fused_pointwise_inplace(x, self.add_value, self.multiply_value)
+        # ensure contiguous so Triton can safely flatten and write in-place
+        x = x.contiguous()
+        # fused in-place elementwise operations
+        x = triton_fused_inplace(x, self.add_value, self.multiply_value)
         return x
 
 
-# Model parameters and helper functions for compatibility
+# Keep input generation helpers compatible with expected harness
 batch_size = 128
 in_channels = 64
 out_channels = 128
@@ -105,8 +99,7 @@ add_value = 0.5
 multiply_value = 2.0
 
 def get_inputs():
-    # Return a CUDA tensor for inference
-    return [torch.rand(batch_size, in_channels, height, width).cuda()]
+    return [torch.rand(batch_size, in_channels, height, width).cuda().to(torch.float32)]
 
 def get_init_inputs():
     return [in_channels, out_channels, kernel_size, stride, add_value, multiply_value]

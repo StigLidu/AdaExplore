@@ -1,184 +1,213 @@
 import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-# Lightweight GELU retained for compatibility (not used in fused attention)
-class NewGELU(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, x):
-        return 0.5 * x * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * torch.pow(x, 3.0))))
-
-# Triton kernel: apply causal mask + ReLU to a flattened att_all block for many elements per program.
-# We choose a larger BLOCK to reduce kernel launch overhead on Ampere GPUs.
+# Triton kernel: apply causal mask (j > i_global -> 0) and ReLU in-place on a scores block tensor
+# scores layout: (N, BQ, BK) where BK == i1 (number of keys considered for this query block)
+# We launch the kernel with grid = (num_row_tiles, num_col_tiles, N)
 @triton.jit
-def _mask_relu_tile_kernel(
-    att_ptr,        # pointer to att_all (flattened per head)
-    T,              # global sequence length (unused in logic but kept for compatibility)
-    m_start,        # global start index for rows (queries) for this tile
-    k_start,        # global start index for cols (keys) for this tile
-    M,              # number of rows in this tile (queries)
-    N,              # number of cols in this tile (keys)
-    n_elements,     # total elements in this tile = M * N
-    stride_head,    # number of elements per head for this tile = M * N (used to index into head)
-    BLOCK: tl.constexpr
+def _mask_and_relu_scores_kernel(
+    scores_ptr,      # pointer to scores tensor (N, BQ, BK) in fp16
+    N,               # number of combined heads (B * NH)
+    BQ,              # number of query positions in this block
+    BK,              # number of key positions in this block (i1)
+    i0,              # global start index for this query block (so global_i = i0 + i_rel)
+    stride0,         # scores.stride(0)
+    stride1,         # scores.stride(1)
+    stride2,         # scores.stride(2)
+    BLOCK_M: tl.constexpr,  # tile rows (over BQ)
+    BLOCK_N: tl.constexpr,  # tile cols (over BK)
 ):
-    head_id = tl.program_id(0)    # which head (H = B * n_head)
-    block_id = tl.program_id(1)   # which flattened block in the M*N space
+    # program ids
+    row_block = tl.program_id(0)
+    col_block = tl.program_id(1)
+    n = tl.program_id(2)
 
-    block_start = block_id * BLOCK
-    offs = block_start + tl.arange(0, BLOCK)
-    mask_offs = offs < n_elements
+    row_start = row_block * BLOCK_M
+    col_start = col_block * BLOCK_N
 
-    # compute local row and col within the tile
-    row = offs // N                 # [0..M-1]
-    col = offs - row * N           # [0..N-1]
+    rows = row_start + tl.arange(0, BLOCK_M)   # shape (BLOCK_M,)
+    cols = col_start + tl.arange(0, BLOCK_N)   # shape (BLOCK_N,)
 
-    # compute global indices
-    global_row = m_start + row
-    global_col = k_start + col
+    row_in_bounds = rows < BQ
+    col_in_bounds = cols < BK
 
-    # element pointers for loading/storing (per head)
-    ptrs = att_ptr + head_id * stride_head + offs
+    # pairwise i_rel (rows) and j_rel (cols)
+    i_rel = rows[:, None]      # (BLOCK_M, 1)
+    j_rel = cols[None, :]      # (1, BLOCK_N)
 
-    # load values (guarded by mask_offs)
-    vals = tl.load(ptrs, mask=mask_offs, other=0.0)
+    # global i indices = i0 + i_rel
+    # causal condition: j_rel <= (i0 + i_rel)
+    # Note: j_rel contains key indices in [0, BK-1] relative to the current key block whose global j = j_rel (since keys start at 0 each block)
+    tri_mask = j_rel <= (i0 + i_rel)  # (BLOCK_M, BLOCK_N)
 
-    # causal mask: allow when key index <= query index
-    keep_mask = mask_offs & (global_col <= global_row)
+    # valid bounds mask
+    valid_mask = (row_in_bounds[:, None]) & (col_in_bounds[None, :])  # (BLOCK_M, BLOCK_N)
 
-    # zero out positions not in causal region then apply ReLU
-    vals = tl.where(keep_mask, vals, 0.0)
-    vals = tl.where(vals > 0.0, vals, 0.0)
+    # compute flattened offsets for load/store
+    base = n * stride0
+    offs = base + i_rel * stride1 + j_rel * stride2  # (BLOCK_M, BLOCK_N)
+    offs_flat = tl.reshape(offs, (BLOCK_M * BLOCK_N,))
+
+    mask_flat = tl.reshape(valid_mask, (BLOCK_M * BLOCK_N,))
+
+    # Fast path: if this tile is fully above diagonal (all j > i), we can store zeros
+    # That happens when col_start > (i0 + row_start + BLOCK_M - 1)
+    if col_start > (i0 + row_start + BLOCK_M - 1):
+        zeros = tl.zeros((BLOCK_M * BLOCK_N,), dtype=tl.float16)
+        tl.store(scores_ptr + offs_flat, zeros, mask=mask_flat)
+        return
+
+    # Load values (out-of-bounds filled with 0.0)
+    vals = tl.load(scores_ptr + offs_flat, mask=mask_flat, other=0.0)  # fp16 flat
+    vals = tl.reshape(vals, (BLOCK_M, BLOCK_N))  # (BLOCK_M, BLOCK_N)
+
+    # Apply triangular causal mask: keep entries where tri_mask is true, else zero
+    tri_mask_f = tri_mask & valid_mask
+    zeros_f = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float16)
+    vals = tl.where(tri_mask_f, vals, zeros_f)
+
+    # Apply ReLU: convert to fp32 for comparison, then back to fp16
+    vals_f32 = vals.to(tl.float32)
+    vals_f32 = tl.where(vals_f32 > 0.0, vals_f32, 0.0)
+    vals = vals_f32.to(tl.float16)
 
     # store back
-    tl.store(ptrs, vals, mask=mask_offs)
+    vals_flat = tl.reshape(vals, (BLOCK_M * BLOCK_N,))
+    tl.store(scores_ptr + offs_flat, vals_flat, mask=mask_flat)
 
 
-def triton_mask_relu_tile(att_block: torch.Tensor, m_start: int, k_start: int):
+def triton_causal_mask_relu_scores_(scores: torch.Tensor, i0: int, BLOCK_M: int = 64, BLOCK_N: int = 64):
     """
-    In-place causal mask + ReLU for att_block of shape (H, M, N), where H is head-batch (B*n_head).
-    This launches a Triton kernel across heads and flattened M*N tiles with a larger BLOCK to reduce launches.
+    In-place apply causal mask and ReLU to scores tensor of shape (N, BQ, BK)
+    where BK equals the number of keys considered (i1), and i0 is the global start index for queries.
+    This function launches a Triton kernel to efficiently zero out j > (i0 + i_rel) and apply ReLU.
     """
-    assert att_block.is_cuda, "att_block must be on CUDA"
-    assert att_block.dtype in (torch.float16, torch.float32), "att_block dtype must be float16/float32"
-    assert att_block.dim() == 3, "att_block must be 3D: (H, M, N)"
+    assert scores.is_cuda and scores.dtype == torch.float16
+    assert scores.dim() == 3
+    N, BQ, BK = scores.shape
 
-    H, M, N = att_block.shape
-    device = att_block.device
+    scores = scores.contiguous()
+    stride0, stride1, stride2 = scores.stride()
+    num_row = (BQ + BLOCK_M - 1) // BLOCK_M
+    num_col = (BK + BLOCK_N - 1) // BLOCK_N
 
-    # number of elements per head in this tile
-    n_elements = M * N
-    # stride in elements to go from head 0 to head 1 in flattened memory
-    stride_head = n_elements
-
-    # Choose a larger BLOCK size tuned for Ampere to reduce kernel launch overhead.
-    # 4096 is a good tradeoff for big contiguous regions while keeping per-program work reasonable.
-    BLOCK = 4096
-    num_blocks = (n_elements + BLOCK - 1) // BLOCK
-
-    grid = (H, num_blocks)
-    # Launch kernel
-    # Note: pass T for compatibility though kernel logic does not use it.
-    _mask_relu_tile_kernel[grid](att_block, M + 0, m_start, k_start, M, N, n_elements, stride_head, BLOCK=BLOCK)
+    grid = (num_row, num_col, N)
+    _mask_and_relu_scores_kernel[grid](
+        scores, N, BQ, BK, i0,
+        stride0, stride1, stride2,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N
+    )
 
 
 class ModelNew(nn.Module):
     """
-    Optimized Model using a fused high-throughput strategy:
-      - Perform q@k^T and att@v in fp16 to leverage Tensor Cores.
-      - Compute the full qk matrix per head-batch in one large bmm to maximize GEMM throughput.
-      - Apply causal mask + ReLU in-place using a Triton kernel that processes large contiguous chunks
-        (tuned BLOCK to reduce kernel launches).
-      - Compute final att@v in fp16 and accumulate in fp32 for numerical stability.
-    This reduces memory traffic and kernel-launch overhead compared to repeated small-block approaches.
+    Optimized multi-head causal attention with ReLU using blocked streaming + Triton-assisted
+    in-place causal masking and ReLU on score blocks.
+
+    Approach:
+    - Project inputs to Q,K,V and reshape to (N=B*NH, T, HS).
+    - Use FP16 for heavy GEMMs to utilize Tensor Cores.
+    - Process queries in blocks (BQ). For each query block [i0:i1), compute scores = q_block @ k_all^T
+      (where k_all are keys for j in [0, i1)), then call a Triton kernel to apply causal mask & ReLU
+      in-place on the scores tensor, and finally do out_block = scores @ v_all to accumulate results.
+    - This avoids materializing a full (N, T, T) attention matrix and reduces memory traffic,
+      while using a Triton kernel to efficiently apply masking + ReLU per score block.
     """
+
     def __init__(self, n_embd, n_head, max_seqlen):
         super().__init__()
         assert n_embd % n_head == 0
         self.c_attn = nn.Linear(n_embd, 3 * n_embd)
-        # c_proj kept for API compatibility (not used in this forward)
+        # keep c_proj for API parity (original forward didn't use it, but included earlier)
         self.c_proj = nn.Linear(n_embd, n_embd)
-        # causal bias buffer retained for compatibility (not used directly; mask handled by Triton)
         self.register_buffer("bias", torch.tril(torch.ones(max_seqlen, max_seqlen))
                                      .view(1, 1, max_seqlen, max_seqlen))
         self.n_head = n_head
         self.n_embd = n_embd
-        self.max_seqlen = max_seqlen
-        self.head_dim = n_embd // n_head
+
+        # Tunable block sizes. These are chosen to balance GEMM sizes for Tensor Cores
+        # and the overhead of launching kernels / allocating temporaries.
+        self.block_size_q = 256  # number of query positions per block
+        self.block_size_k = 256  # number of key positions considered per block (i1)
 
     def forward(self, x):
-        """
-        x: (B, T, C)
-        returns: y (B, T, C)
-        """
+        # x: (B, T, C)
+        assert x.is_cuda, "This optimized implementation expects CUDA tensors."
         B, T, C = x.size()
-        assert C == self.n_embd, "Input embedding dim must match model configuration"
-        assert T <= self.max_seqlen, "Sequence length exceeds maximum sequence length"
+        assert C == self.n_embd
 
-        # compute q,k,v
-        qkv = self.c_attn(x)  # (B, T, 3*C)
-        q, k, v = qkv.split(self.n_embd, dim=2)
+        # Project to q, k, v
+        qkv = self.c_attn(x)  # (B, T, 3C)
+        q, k, v = qkv.split(self.n_embd, dim=2)  # each (B, T, C)
 
-        # reshape to (B, n_head, T, head_dim)
-        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2).contiguous()
-        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2).contiguous()
-        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2).contiguous()
+        HS = C // self.n_head
+        N = B * self.n_head
 
-        # Flatten batch and head into H = B * n_head
-        H = B * self.n_head
-        HS = self.head_dim
+        # reshape to (N, T, HS)
+        def to_heads(z):
+            z = z.view(B, T, self.n_head, HS).transpose(1, 2).contiguous()
+            return z.view(N, T, HS)
 
-        q_view = q.view(H, T, HS)
-        k_view = k.view(H, T, HS)
-        v_view = v.view(H, T, HS)
+        qh = to_heads(q)
+        kh = to_heads(k)
+        vh = to_heads(v)
 
-        # scale factor
+        device = qh.device
+        dtype_fp16 = torch.float16
+
+        # Use mixed precision: scale Q and cast to fp16 for GEMMs
         scale = 1.0 / math.sqrt(HS)
+        qh = (qh * scale).half().contiguous()   # (N, T, HS) fp16
+        kh = kh.half().contiguous()
+        vh = vh.half().contiguous()
 
-        # Move to fp16 once and pre-scale q to avoid extra multiplies
-        # Keep contiguous layout for efficient bmm
-        q_half = q_view.to(torch.float16).contiguous() * float(scale)
-        k_half = k_view.to(torch.float16).contiguous()
-        v_half = v_view.to(torch.float16).contiguous()
+        # Pre-transpose kh to (N, HS, T) once to avoid repeated transposes
+        kh_T = kh.transpose(1, 2).contiguous()  # (N, HS, T)
 
-        # Accumulator in fp32 for numeric stability
-        y = torch.zeros((H, T, HS), dtype=torch.float32, device=q_view.device)
+        BQ = self.block_size_q
+        # Prepare output accumulator in fp16
+        out = torch.zeros((N, T, HS), dtype=dtype_fp16, device=device)
 
-        # Compute attention scores for ALL queries vs ALL keys in one large bmm:
-        # att_all: (H, T, T) = q_half @ k_half^T  -> fp16
-        # Keep contiguity to ensure efficient memory layout for the Triton kernel
-        att_all = torch.bmm(q_half, k_half.transpose(1, 2)).contiguous()  # fp16 (H, T, T)
+        # Precompute index tensors on device to build masks when needed (but main masking done in Triton)
+        idx_k_full = torch.arange(T, device=device)
 
-        # Apply causal mask + ReLU in-place using Triton for efficient blocked elementwise ops.
-        # We pass m_start=0 (queries start at 0) and k_start=0 (keys start at 0) for full matrix.
-        triton_mask_relu_tile(att_all, 0, 0)
+        # Loop over query blocks
+        for i0 in range(0, T, BQ):
+            i1 = min(i0 + BQ, T)
+            bq = i1 - i0  # actual query block size
 
-        # Multiply with v_half to get contributions for all queries:
-        # contrib: (H, T, HS) = att_all @ v_half   (fp16)
-        contrib_fp16 = torch.bmm(att_all, v_half)  # fp16
-        # Accumulate in fp32
-        y += contrib_fp16.to(torch.float32)
+            # q_block: (N, bq, HS)
+            q_block = qh[:, i0:i1, :]  # fp16
 
-        # reshape back to (B, n_head, T, HS) -> (B, T, C)
-        y = y.view(B, self.n_head, T, HS).transpose(1, 2).contiguous().view(B, T, C)
+            # keys considered: j in [0, i1)
+            k_all_T = kh_T[:, :, :i1]  # (N, HS, i1)
+            v_all = vh[:, :i1, :]      # (N, i1, HS)
 
-        return y
+            # scores: (N, bq, i1) = q_block @ k_all_T
+            scores = torch.bmm(q_block, k_all_T)  # fp16, contiguous
+
+            # In-place apply causal mask and ReLU on scores using Triton kernel.
+            # Provide i0 so Triton can compute triangular masking: keep j <= (i0 + i_rel)
+            triton_causal_mask_relu_scores_(scores, i0, BLOCK_M=64, BLOCK_N=64)
+
+            # Accumulate: out_block = scores @ v_all  -> (N, bq, HS)
+            out_block = torch.bmm(scores, v_all)  # fp16
+
+            # Store block
+            out[:, i0:i1, :] = out_block
+
+        # reshape back to (B, T, C) in fp32
+        out = out.view(B, self.n_head, T, HS).transpose(1, 2).contiguous().view(B, T, C).float()
+        return out
 
 
-# Model input helpers (kept for compatibility)
-batch_size = 16
-max_seqlen = 1024
-n_embd = 768
-n_head = 12
+# Provide NewGELU in case external code expects it (original model defined it).
+class NewGELU(nn.Module):
+    def __init__(self):
+        super(NewGELU, self).__init__()
 
-def get_inputs():
-    # Return CUDA inputs to ensure Triton kernels operate on device tensors
-    return [torch.rand(batch_size, max_seqlen, n_embd).cuda()]
-
-def get_init_inputs():
-    return [n_embd, n_head, max_seqlen]
+    def forward(self, x):
+        return 0.5 * x * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * torch.pow(x, 3.0))))

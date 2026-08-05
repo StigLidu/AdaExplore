@@ -1,170 +1,180 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-# Triton GEMM kernel (row-major A, B, C)
+
+# Triton kernel: fused Hardtanh + Mish + GroupNorm for fp16 GEMM outputs.
+# Operates on fp16 input (GEMM output in fp16) and computes GroupNorm with fp32 accumulation,
+# writing back fp16 results. Each program processes ROWS_PER_PROGRAM rows and one channel group.
 @triton.jit
-def _triton_gemm_kernel(
-    A_ptr, B_ptr, C_ptr, BIAS_ptr,
-    M, N, K,
-    stride_am, stride_ak,
-    stride_bk, stride_bn,
-    stride_cm, stride_cn,
-    stride_bias,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr
+def _fused_hardtanh_mish_groupnorm_fp16_kernel(
+    x_ptr,            # input/output tensor (B, C) stored in fp16
+    bias_ptr,         # per-channel bias added after GEMM (C,) stored in fp32
+    gn_weight_ptr,    # groupnorm weight (C,) stored in fp32
+    gn_bias_ptr,      # groupnorm bias (C,) stored in fp32
+    B,                # batch size
+    C,                # num channels
+    G,                # num groups
+    group_size,       # channels per group (BLOCK)
+    eps,              # epsilon (fp32)
+    ROWS_PER_PROGRAM: tl.constexpr,  # how many rows each program handles
+    BLOCK: tl.constexpr,  # block == group_size (constexpr)
 ):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    # Program tiling:
+    #   program_id(0) indexes a tile of ROWS_PER_PROGRAM rows
+    #   program_id(1) indexes group index
+    row_start = tl.program_id(0) * ROWS_PER_PROGRAM
+    g = tl.program_id(1)
+    group_start = g * group_size
+    offs = tl.arange(0, BLOCK)                     # 0..BLOCK-1
+    cols = group_start + offs
+    mask_cols = offs < group_size
 
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    # Hoist per-channel loads (fp32)
+    bias_cols = tl.load(bias_ptr + cols, mask=mask_cols, other=0.0)
+    w_cols = tl.load(gn_weight_ptr + cols, mask=mask_cols, other=1.0)
+    gb_cols = tl.load(gn_bias_ptr + cols, mask=mask_cols, other=0.0)
 
-    # pointers to the beginning of the a and b blocks
-    a_ptrs = A_ptr + offs_m[:, None] * stride_am + tl.arange(0, BLOCK_K)[None, :] * stride_ak
-    b_ptrs = B_ptr + tl.arange(0, BLOCK_K)[:, None] * stride_bk + offs_n[None, :] * stride_bn
+    # For each row handled by this program
+    for r in range(ROWS_PER_PROGRAM):
+        row = row_start + r
+        row_in_bounds = row < B
+        idx = row * C + cols
+        mask = mask_cols & row_in_bounds
 
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        # Load fp16 GEMM outputs and convert to fp32 for numerics
+        vals_fp16 = tl.load(x_ptr + idx, mask=mask, other=0.0)
+        v = vals_fp16.to(tl.float32)
 
-    # Double-buffered preload: load first tile
-    rk = tl.arange(0, BLOCK_K)
-    k0 = 0
-    mask_a = (offs_m[:, None] < M) & ((k0 + rk[None, :]) < K)
-    mask_b = ((k0 + rk[:, None]) < K) & (offs_n[None, :] < N)
+        # Add external bias (fp32)
+        v = v + bias_cols
 
-    a = tl.load(a_ptrs + k0 * stride_ak, mask=mask_a, other=0.0)
-    b = tl.load(b_ptrs + k0 * stride_bk, mask=mask_b, other=0.0)
-    # Cast tiles to FP16 for compute to utilize Tensor Cores; accumulation remains FP32
-    a = a.to(tl.float16)
-    b = b.to(tl.float16)
+        # Hardtanh clamp to [-1, 1]
+        v = tl.minimum(tl.maximum(v, -1.0), 1.0)
 
-    # iterate over remaining K tiles, preloading the next tile while computing current
-    for k0 in range(BLOCK_K, K, BLOCK_K):
-        next_mask_a = (offs_m[:, None] < M) & ((k0 + rk[None, :]) < K)
-        next_mask_b = ((k0 + rk[:, None]) < K) & (offs_n[None, :] < N)
+        # Mish: v * tanh(softplus(v)). Compute robustly
+        e = tl.exp(v)
+        # softplus: stable for large v
+        sp = tl.where(v > 20.0, v, tl.log(1.0 + e))
+        # tanh(sp) via exp trick to avoid calling tanh
+        exp_neg2sp = tl.exp(-2.0 * sp)
+        tanh_sp = (1.0 - exp_neg2sp) / (1.0 + exp_neg2sp)
+        v = v * tanh_sp  # still fp32
 
-        a_next = tl.load(a_ptrs + k0 * stride_ak, mask=next_mask_a, other=0.0)
-        b_next = tl.load(b_ptrs + k0 * stride_bk, mask=next_mask_b, other=0.0)
-        a_next = a_next.to(tl.float16)
-        b_next = b_next.to(tl.float16)
+        # Compute mean and variance across group lanes (fp32 accumulation)
+        s = tl.sum(v)            # sum over BLOCK lanes
+        s2 = tl.sum(v * v)
+        mean = s / group_size
+        var = s2 / group_size - mean * mean
+        invstd = 1.0 / tl.sqrt(var + eps)
 
-        # compute on the currently-loaded tile (FP16 dot), cast result to FP32 and accumulate
-        acc += tl.dot(a, b).to(tl.float32)
+        # Normalize and apply affine params (w_cols, gb_cols are fp32)
+        diff = v - mean
+        out = (diff * invstd) * w_cols + gb_cols
 
-        # advance buffers
-        a = a_next
-        b = b_next
-
-    # final tile compute
-    acc += tl.dot(a, b).to(tl.float32)
-
-    # Load fused bias for outputs (shape: N,), broadcast along M
-    bias_vals = tl.load(BIAS_ptr + offs_n * stride_bias, mask=(offs_n < N), other=0.0)  # shape (BLOCK_N,)
-    acc += bias_vals[None, :]
-
-    # Apply Hardtanh clamp to [-1.0, 1.0] (fused)
-    acc = tl.maximum(acc, -1.0)
-    acc = tl.minimum(acc, 1.0)
-
-    # store results
-    c_ptrs = C_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
-    mask_c = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-    tl.store(c_ptrs, acc, mask=mask_c)
+        # Cast back to fp16 and store
+        out_fp16 = out.to(tl.float16)
+        tl.store(x_ptr + idx, out_fp16, mask=mask)
 
 
-def triton_gemm(a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor):
+def _fused_hardtanh_mish_groupnorm_fp16(x: torch.Tensor, bias: torch.Tensor, weight: torch.Tensor, bias_gn: torch.Tensor, num_groups: int, eps: float = 1e-5, rows_per_program: int = 32):
     """
-    Compute a @ b where:
-      - a: (M, K) row-major
-      - b: (N, K) row-major (native weight layout: out_features, in_features)
-    Returns C: (M, N) row-major
-    Uses Triton kernel with fixed block sizes tuned for Ampere.
-    The kernel expects B laid out so that K is the fastest-changing dimension (stride along K == 1),
-    and it will add the provided fused bias and apply Hardtanh clamp before storing.
+    Wrapper to launch the fused kernel that performs:
+      - Bias add
+      - Hardtanh
+      - Mish
+      - GroupNorm (per-group mean/var and affine)
+    Assumptions:
+      - x is fp16 (GEMM output in fp16). Kernel performs fp32 accumulation internally.
+      - bias, weight and bias_gn are fp32.
     """
-    assert a.is_cuda and b.is_cuda and bias.is_cuda, "Triton GEMM requires CUDA tensors"
-    assert a.dtype == torch.float32 and b.dtype == torch.float32 and bias.dtype == torch.float32
+    assert x.is_cuda and bias.is_cuda and weight.is_cuda and bias_gn.is_cuda, "Inputs must be CUDA tensors"
+    assert x.dtype == torch.float16, "Input x must be fp16"
+    B, C = x.shape
+    G = num_groups
+    assert C % G == 0, "num_channels must be divisible by num_groups"
+    group_size = C // G
+    block = group_size  # choose BLOCK == group_size for coalesced loads
 
-    M, K = a.shape
-    N, Kb = b.shape
-    assert K == Kb, "Incompatible shapes for GEMM (a: MxK, b: N x K expected)"
+    x_ = x.contiguous()
+    b_ = bias.contiguous()
+    w_ = weight.contiguous()
+    bgn_ = bias_gn.contiguous()
 
-    # Make contiguous in their native layouts
-    a_ = a.contiguous()
-    b_ = b.contiguous()      # b_ shape: (N, K) so stride along K is b_.stride(1) (ideally 1)
-    bias_ = bias.contiguous()  # shape: (N,)
-
-    # output
-    c = torch.empty((M, N), device=a_.device, dtype=torch.float32)
-
-    # block sizes (tuned for better occupancy on A6000/Ampere)
-    # smaller M/N tiles allow more concurrent programs; K blocking of 64 is a good tradeoff
-    BLOCK_M = 64
-    BLOCK_N = 64
-    BLOCK_K = 64
-
-    grid = ( (M + BLOCK_M - 1) // BLOCK_M, (N + BLOCK_N - 1) // BLOCK_N )
-
-    _triton_gemm_kernel[grid](
-        a_, b_, c, bias_,
-        M, N, K,
-        a_.stride(0), a_.stride(1),
-        b_.stride(1), b_.stride(0),   # stride_bk (along K) is b_.stride(1); stride_bn (along N) is b_.stride(0)
-        c.stride(0), c.stride(1),
-        bias_.stride(0),
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K
+    grid = ((B + rows_per_program - 1) // rows_per_program, G)
+    _fused_hardtanh_mish_groupnorm_fp16_kernel[grid](
+        x_, b_, w_, bgn_, B, C, G, group_size, eps, rows_per_program, block
     )
-    return c
+    return x_
 
 
 class ModelNew(nn.Module):
     """
-    Optimized Model with custom Triton GEMM kernel for the heavy matrix multiply.
-    Preserves the original module parameters (Linear and GroupNorm) and behavior.
-    The sequence remains:
-      x -> Linear (GEMM + linear_bias) -> extra bias -> Hardtanh -> Mish -> GroupNorm
+    Optimized model:
+      - Uses nn.Linear with autocast to perform GEMM in fp16 (Tensor Cores).
+      - Fuses bias add (folded at init), Hardtanh, Mish, and GroupNorm into a single Triton kernel.
+      - Keeps GroupNorm affine parameters as fp32 for numeric stability.
     """
-
     def __init__(self, in_features, out_features, bias_shape, num_groups):
         super(ModelNew, self).__init__()
-        # Keep the original modules so parameters remain registered and usable by optimizers.
-        self.gemm = nn.Linear(in_features, out_features)  # has weight and bias
-        # extra bias added after gemm
-        self.bias = nn.Parameter(torch.randn(bias_shape))
-        # GroupNorm (affine=True by default) to match original behavior
+        # Standard Linear layer (weights and bias in fp32). We'll use AMP to run GEMM in fp16.
+        self.gemm = nn.Linear(in_features, out_features)
+
+        # Keep an explicit bias parameter to match the original architecture semantics.
+        self.bias = nn.Parameter(torch.randn(bias_shape, dtype=torch.float32))
+
+        # Keep a GroupNorm module to own affine params (fp32). We don't use its forward.
         self.groupnorm = nn.GroupNorm(num_groups=num_groups, num_channels=out_features)
-        # hardtanh parameters are fixed defaults in original model; using clamp during forward
-        # Mish will be computed via PyTorch ops (on GPU) after Triton GEMM
 
     def forward(self, x):
-        # If not on CUDA or types mismatch, fall back to PyTorch implementation for correctness
-        if not x.is_cuda or self.gemm.weight.device != x.device or x.dtype != torch.float32:
-            # fall back to reference implementation
+        # Ensure tensors are on the same device as parameters
+        device = next(self.gemm.parameters()).device
+        if x.device != device:
+            x = x.to(device)
+
+        # Run GEMM with AMP in fp16 to leverage Tensor Cores on Ampere.
+        with torch.cuda.amp.autocast(enabled=True, dtype=torch.float16):
             x = self.gemm(x)
-            x = x + self.bias
-            x = torch.clamp(x, min=self.gemm.bias.min().item() if False else -1.0, max=1.0)  # hardtanh default (-1,1)
-            # Mish: x * tanh(softplus(x))
-            x = x * torch.tanh(F.softplus(x))
-            x = self.groupnorm(x)
-            return x
 
-        # Perform GEMM via Triton: x @ weight.T
-        # Prepare operands: a = x (M,K), b = weight in native layout (N, K) where K is the fastest-changing dim
-        a = x
-        # Use weight in its native (out_features, in_features) layout so K (in_features) is contiguous.
-        w = self.gemm.weight.contiguous()
+        # Ensure result is fp16 (autocast should produce fp16, but be robust)
+        if x.dtype != torch.float16:
+            x = x.to(torch.float16)
 
-        # fuse linear bias and extra bias into a single vector passed to the kernel
-        fused_bias = (self.gemm.bias + self.bias).contiguous()
+        # Prepare external bias and GroupNorm affine params (fp32) on the same device
+        bias = self.bias
+        weight = self.groupnorm.weight
+        bias_gn = self.groupnorm.bias
+        if bias.device != x.device:
+            bias = bias.to(x.device)
+        if weight.device != x.device:
+            weight = weight.to(x.device)
+        if bias_gn.device != x.device:
+            bias_gn = bias_gn.to(x.device)
 
-        # Compute matmul on GPU; the Triton kernel will also add fused_bias and apply Hardtanh clamping
-        out = triton_gemm(a, w, fused_bias)  # shape (batch, out_features)
+        # Contiguous and launch fused Triton kernel; kernel writes in-place
+        x = x.contiguous()
+        _fused_hardtanh_mish_groupnorm_fp16(x, bias, weight, bias_gn, num_groups=self.groupnorm.num_groups, eps=self.groupnorm.eps, rows_per_program=32)
 
-        # Mish: x * tanh(softplus(x))
-        out = out * torch.tanh(F.softplus(out))
+        # Convert back to fp32 to match the original model behavior
+        if x.dtype != torch.float32:
+            x = x.to(torch.float32)
+        return x
 
-        # GroupNorm (uses module parameters)
-        out = self.groupnorm(out)
 
-        return out
+# Keep original constants for ease of use
+batch_size = 1024
+in_features = 8192
+out_features = 8192
+bias_shape = (out_features,)
+num_groups = 256
+
+
+def get_inputs():
+    # Return an fp32 CPU tensor (the harness can move it to GPU); we keep dtype fp32 as original,
+    # model will move and autocast it appropriately.
+    return [torch.rand(batch_size, in_features)]
+
+
+def get_init_inputs():
+    return [in_features, out_features, bias_shape, num_groups]

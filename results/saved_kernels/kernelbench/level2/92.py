@@ -3,217 +3,193 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
-# Enhanced autotune configs geared for NVIDIA A6000 (Ampere):
-# Prefer warp-aligned BLOCK sizes (multiples of 32) and larger TILE_W values
-# to improve throughput for the channel reduction on NHWC layout.
+# Autotune configurations to find the best BLOCK_C, BLOCK_HW and warps/stages for Ampere (A6000)
+# Prefer warp/vector aligned block sizes (multiples of 16/32) for better coalescing on Ampere.
 AUTOTUNE_CONFIGS = [
-    triton.Config({"BLOCK": 256, "TILE_W": 128}, num_warps=8, num_stages=4),
-    triton.Config({"BLOCK": 256, "TILE_W": 64},  num_warps=8, num_stages=4),
-    triton.Config({"BLOCK": 128, "TILE_W": 128}, num_warps=8, num_stages=4),
-    triton.Config({"BLOCK": 128, "TILE_W": 64},  num_warps=8, num_stages=3),
-    triton.Config({"BLOCK": 64,  "TILE_W": 64},  num_warps=8, num_stages=3),
-    # Fallback smaller tiles for narrow W shapes
-    triton.Config({"BLOCK": 64,  "TILE_W": 32},  num_warps=4, num_stages=2),
-    triton.Config({"BLOCK": 32,  "TILE_W": 32},  num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_C": 32,  "BLOCK_HW": 64},  num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_C": 64,  "BLOCK_HW": 128}, num_warps=4, num_stages=3),
+    triton.Config({"BLOCK_C": 128, "BLOCK_HW": 128}, num_warps=8, num_stages=3),
+    triton.Config({"BLOCK_C": 64,  "BLOCK_HW": 256}, num_warps=8, num_stages=3),
 ]
 
-
-@triton.autotune(configs=AUTOTUNE_CONFIGS, key=['C', 'W'])
+# Tune over both spatial-block (BLOCK_HW), channel-block (BLOCK_C) and groups G
+@triton.autotune(
+    configs=AUTOTUNE_CONFIGS,
+    key=["C", "H", "W", "G"],
+)
 @triton.jit
-def _fused_act_res_logsumexp_kernel(
-    x_conv_ptr,      # pointer to input x_conv (N, H, W, C) flattened (NHWC)
-    x_norm_ptr,      # pointer to input x_norm (N, H, W, C) flattened (NHWC)
-    out_ptr,         # pointer to output logsumexp (N, H, W), flattened
-    N, C, H, W,      # sizes
-    stride_n, stride_c, stride_h, stride_w,  # strides (in elements) for NHWC
-    use_fp16,        # runtime flag (0/1) to enable mixed-precision elementwise path
-    TILE_W: tl.constexpr,  # number of W positions handled by one program
-    BLOCK: tl.constexpr,   # block size in channels
+def _fused_logsumexp_hswish_kernel(
+    x_conv_ptr,    # pointer to conv output [N, C, H, W]
+    gamma_ptr,     # pointer to per-channel affine weight (gamma) [C]
+    beta_ptr,      # pointer to per-channel affine bias (beta) [C]
+    out_ptr,       # pointer to output [N, 1, H, W] flattened as N*HW
+    N, C, H, W, G, eps,
+    BLOCK_C: tl.constexpr, BLOCK_HW: tl.constexpr,
 ):
     """
-    Fused kernel (NHWC layout expected):
-      - computes tanh(x_norm) (optionally in fp16),
-      - computes hardswish(tanh),
-      - x_res = x_conv + hardswish,
-      - computes numerically-stable logsumexp over channels for each (n,h,w)
-    Each program handles one (n, h) and TILE_W contiguous w positions, iterating channels in chunks of BLOCK.
-    Note: memory layout must be NHWC and pointers/strides must match NHWC.
+    Spatial-blocked fused kernel with GroupNorm fused-in:
+      - Each program handles BLOCK_HW contiguous spatial positions for a single batch n.
+      - For each group (small number of channels), we:
+         1) do a small reduction across group's channels to compute mean and variance per spatial lane
+         2) re-iterate group's channels to normalize using the computed mean/var, apply per-channel
+            affine gamma/beta, tanh->hardswish, add residual (conv) and update the online log-sum-exp.
+      This avoids loading x_norm from memory and reduces global memory traffic.
     """
-    pid = tl.program_id(0)
+    HW = H * W
+    nblocks = (HW + BLOCK_HW - 1) // BLOCK_HW
 
-    # number of tiles along W
-    num_tiles_w = (W + TILE_W - 1) // TILE_W
-    hw_tiles = H * num_tiles_w
+    pid = tl.program_id(0)  # one program per (n, hw_block)
+    n = pid // nblocks
+    block_idx = pid % nblocks
+    hw_start = block_idx * BLOCK_HW
 
-    # decode program id into n, h, tile
-    n = pid // hw_tiles
-    rem = pid - n * hw_tiles
-    h = rem // num_tiles_w
-    tile = rem - h * num_tiles_w
+    ar_hw = tl.arange(0, BLOCK_HW)  # lane offsets within the spatial tile
+    hw = hw_start + ar_hw
+    mask_hw = hw < HW
 
-    w_start = tile * TILE_W
+    base_n = n * C * HW  # base pointer offset for this batch
 
-    # offsets for the TILE_W positions in W
-    offs_w = tl.arange(0, TILE_W)
-    w_idx = w_start + offs_w
-    mask_w = w_idx < W  # which of the TILE_W positions are valid
+    # very negative sentinel for masked lanes
+    NEG_INF = -1e20
 
-    # base pointer for n and h at w_start (channels will be added per chunk)
-    # NHWC flattened index: n*stride_n + h*stride_h + w*stride_w + c*stride_c
-    base = n * stride_n + h * stride_h + w_start * stride_w
+    # per-lane accumulators over the BLOCK_HW lanes for logsumexp
+    cur_max = tl.full((BLOCK_HW,), NEG_INF, dtype=tl.float32)
+    sumexp = tl.zeros((BLOCK_HW,), dtype=tl.float32)
 
-    offs_c = tl.arange(0, BLOCK)  # channel offsets within a chunk
+    # channels per group (GroupNorm guarantees divisibility)
+    Cg = C // G
 
-    # running values per output position (length TILE_W)
-    running_max = tl.full((TILE_W,), -1e30, dtype=tl.float32)
-    running_sum = tl.zeros((TILE_W,), dtype=tl.float32)
-    first = 1  # flag for initializing running values on first chunk
+    # iterate groups sequentially: compute per-group mean/var and immediately consume them
+    for g in range(G):
+        # small accumulators for the group's reduction (fp32)
+        sum_g = tl.zeros((BLOCK_HW,), dtype=tl.float32)
+        sumsq_g = tl.zeros((BLOCK_HW,), dtype=tl.float32)
 
-    inv6 = 1.0 / 6.0
-    neg_inf = -1e30
-    c = 0
-    # iterate over channels in chunks of BLOCK
-    while c < C:
-        c_idx = c + offs_c  # vector of channel indices within this chunk
-        mask_c = c_idx < C
+        # first pass: compute sum and sumsq for this group across channels
+        for k in range(Cg):
+            ch = g * Cg + k
+            # channel base offset and mask for spatial lanes
+            ch_off = base_n + ch * HW
+            mask = mask_hw  # group channels guaranteed in-range because Cg * G == C
 
-        # compute addresses for loads: shape (BLOCK, TILE_W)
-        # addrs = base + offs_w[None, :] * stride_w + c_idx[:, None] * stride_c
-        addrs = base + offs_w[None, :] * stride_w + c_idx[:, None] * stride_c
-        mask = mask_c[:, None] & mask_w[None, :]
+            conv_vec = tl.load(x_conv_ptr + ch_off + hw, mask=mask, other=0.0)
+            v = conv_vec  # inputs are float32 (we keep accumulations in fp32)
+            sum_g += v
+            sumsq_g += v * v
 
-        # Load x_conv and x_norm for this chunk. Supply safe other values so masked lanes
-        # do not contribute to max (x_res_masked uses neg_inf).
-        x_conv_vals = tl.load(x_conv_ptr + addrs, mask=mask, other=0.0)
-        x_norm_vals = tl.load(x_norm_ptr + addrs, mask=mask, other=0.0)
+        # compute mean and invstd for the group (per spatial lane)
+        mean = sum_g / Cg
+        var = sumsq_g / Cg - mean * mean
+        invstd = 1.0 / tl.sqrt(var + eps)
 
-        # Cast loaded inputs to fp32 for stable accumulation
-        x_conv_fp32 = tl.cast(x_conv_vals, tl.float32)
-        x_norm_fp32 = tl.cast(x_norm_vals, tl.float32)
+        # second pass: normalize each channel in the group, apply affine, activations, residual and logsumexp
+        for k in range(Cg):
+            ch = g * Cg + k
+            ch_off = base_n + ch * HW
+            mask = mask_hw
 
-        # Compute tanh. Optionally compute in fp16 to reduce compute bandwidth then cast back.
-        if use_fp16 != 0:
-            # clamp in fp16 to avoid overflow when exponentiating
-            x_norm_fp16 = tl.cast(x_norm_fp32, tl.float16)
-            xmax16 = tl.cast(20.0, tl.float16)
-            x_clamped16 = tl.where(x_norm_fp16 > xmax16, xmax16, tl.where(x_norm_fp16 < -xmax16, -xmax16, x_norm_fp16))
-            e2 = tl.exp(2.0 * x_clamped16)
-            tanh_fp16 = (e2 - 1.0) / (e2 + 1.0)
-            tanh_vals = tl.cast(tanh_fp16, tl.float32)
-        else:
-            xmax = 20.0
-            x_clamped = tl.where(x_norm_fp32 > xmax, xmax, tl.where(x_norm_fp32 < -xmax, -xmax, x_norm_fp32))
-            e2 = tl.exp(2.0 * x_clamped)
-            tanh_vals = (e2 - 1.0) / (e2 + 1.0)
+            # load conv again (we avoid loading x_norm by recomputing it)
+            conv_vec = tl.load(x_conv_ptr + ch_off + hw, mask=mask, other=NEG_INF)
+            v = conv_vec
 
-        # HardSwish on tanh_vals: hsw(x) = x * clamp(x + 3, 0, 6) / 6
-        shifted = tanh_vals + 3.0
-        shifted_clamped = tl.where(shifted < 0.0, 0.0, shifted)
-        shifted_clamped = tl.where(shifted_clamped > 6.0, 6.0, shifted_clamped)
-        hsw_vals = tanh_vals * (shifted_clamped * inv6)
+            # normalize using group's mean/invstd
+            normalized = (v - mean) * invstd
 
-        # x_res = x_conv + hsw (use fp32 conv)
-        x_res_vals = x_conv_fp32 + hsw_vals
+            # load per-channel affine parameters (scalars) and apply broadcasted affine
+            gamma_val = tl.load(gamma_ptr + ch)
+            beta_val = tl.load(beta_ptr + ch)
+            y = normalized * gamma_val + beta_val
 
-        # For invalid (out-of-range) channel positions, set to a large negative so they don't affect max/sum
-        x_res_masked = tl.where(mask, x_res_vals, neg_inf)
+            # tanh via exp trick
+            z = tl.exp(-2.0 * y)
+            tanh_vec = (1.0 - z) / (1.0 + z)
 
-        # compute chunk-wise max across the channel axis -> shape (TILE_W,)
-        chunk_max = tl.max(x_res_masked, axis=0)
+            # HardSwish: x * clamp(x + 3, 0, 6) / 6
+            tmp = tanh_vec + 3.0
+            tmp = tl.maximum(tmp, 0.0)
+            tmp = tl.minimum(tmp, 6.0)
+            hsw_vec = tanh_vec * (tmp / 6.0)
 
-        # compute exp(vals - chunk_max) and sum across channel axis -> shape (TILE_W,)
-        exp_vals = tl.exp(x_res_masked - chunk_max[None, :])
-        chunk_sum = tl.sum(exp_vals, axis=0)
+            x_res = conv_vec + hsw_vec  # residual addition uses original conv
 
-        if first == 1:
-            running_max = chunk_max
-            running_sum = chunk_sum
-            first = 0
-        else:
-            # Numerically stable merge of partial logsumexp results:
-            # new_max = max(running_max, chunk_max)
-            # running_sum = running_sum * exp(running_max - new_max) + chunk_sum * exp(chunk_max - new_max)
-            new_max = tl.maximum(running_max, chunk_max)
-            running_sum = running_sum * tl.exp(running_max - new_max) + chunk_sum * tl.exp(chunk_max - new_max)
-            running_max = new_max
+            # online stable log-sum-exp update per lane
+            new_max = tl.maximum(cur_max, x_res)
+            exp_term = tl.exp(x_res - new_max)
+            sumexp = sumexp * tl.exp(cur_max - new_max) + exp_term
+            cur_max = new_max
 
-        c += BLOCK
-
-    # final logsumexp per position: m + log(s)
-    out_vals = running_max + tl.log(running_sum + 1e-30)
-
-    # compute flattened (N,H,W) base index and store results for the TILE_W positions
-    pos_base = n * (H * W) + h * W
-    out_addrs = pos_base + w_idx
-    tl.store(out_ptr + out_addrs, out_vals, mask=mask_w)
+    out_val = cur_max + tl.log(sumexp)
+    out_off = n * HW + hw
+    tl.store(out_ptr + out_off, out_val, mask=mask_hw)
 
 
-def triton_fused_act_res_logsumexp(x_conv: torch.Tensor, x_norm: torch.Tensor):
+def triton_fused_logsumexp(x_conv: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor, groups: int, eps: float):
     """
-    Compute logsumexp over channel dimension after fusing tanh -> hardswish -> residual add:
-      x_res = x_conv + hardswish(tanh(x_norm))
-    Returns tensor of shape (N, H, W) containing logsumexp per spatial position.
+    Wrapper to launch the autotuned Triton kernel.
     Inputs:
-      x_conv : (N, C, H, W)
-      x_norm : (N, C, H, W)
+      - x_conv: CUDA float32 contiguous tensor of shape [N, C, H, W]
+      - gamma, beta: per-channel affine parameters (1D tensors of length C)
+      - groups: number of groups for GroupNorm (must divide C)
+      - eps: GroupNorm epsilon
+    Returns tensor of shape [N, 1, H, W].
     """
-    assert x_conv.is_cuda and x_norm.is_cuda, "Inputs must be on CUDA."
-    assert x_conv.dtype == torch.float32 and x_norm.dtype == torch.float32, "Only float32 supported"
-    # Ensure contiguous
-    x_conv = x_conv.contiguous()
-    x_norm = x_norm.contiguous()
+    assert x_conv.is_cuda and gamma.is_cuda and beta.is_cuda, "Inputs and affine params must be CUDA tensors"
+    assert x_conv.dtype == torch.float32 and gamma.dtype == torch.float32 and beta.dtype == torch.float32, "Only float32 supported for fused path"
     N, C, H, W = x_conv.shape
+    assert gamma.numel() == C and beta.numel() == C, "gamma/beta must have one value per channel"
+    assert C % groups == 0, "channels must be divisible by groups"
 
-    # prepare output (N, H, W)
-    out = torch.empty((N, H, W), device=x_conv.device, dtype=x_conv.dtype)
+    x_conv_c = x_conv.contiguous()
+    gamma_c = gamma.contiguous()
+    beta_c = beta.contiguous()
+    out = torch.empty((N, 1, H, W), device=x_conv_c.device, dtype=torch.float32)
 
-    # Flatten pointers for Triton
-    x_conv_ptr = x_conv.reshape(-1)
-    x_norm_ptr = x_norm.reshape(-1)
-    out_ptr = out.reshape(-1)
+    # flattened output pointer expects N*HW entries
+    out_flat = out.view(N * H * W)
 
-    # compute strides for contiguous layout (N, C, H, W)
-    stride_n = C * H * W
-    stride_c = H * W
-    stride_h = W
-    stride_w = 1
+    # grid uses number of hw-blocks per batch (autotuner will supply BLOCK_HW via meta)
+    grid = lambda meta: (N * ((H * W + meta['BLOCK_HW'] - 1) // meta['BLOCK_HW']),)
 
-    # grid: one program per (n, h, tile) where each tile covers TILE_W positions in W
-    grid = lambda meta: (N * H * ((W + meta['TILE_W'] - 1) // meta['TILE_W']),)
-
-    use_fp16 = 0  # inputs are fp32; keep fp32 elementwise computations for accuracy on this model
-    _fused_act_res_logsumexp_kernel[grid](
-        x_conv_ptr, x_norm_ptr, out_ptr,
-        N, C, H, W,
-        stride_n, stride_c, stride_h, stride_w,
-        use_fp16,
-    )
-
+    # Launch autotuned kernel; decorator supplies BLOCK_C and BLOCK_HW as constexpr
+    _fused_logsumexp_hswish_kernel[grid](x_conv_c, gamma_c, beta_c, out_flat, N, C, H, W, groups, eps)
     return out
 
 
 class ModelNew(nn.Module):
     """
-    Optimized model:
-      - Keep PyTorch Conv2d and GroupNorm for correctness and parameter handling.
-      - Fuse tanh -> hardswish -> residual addition and the channel-wise logsumexp reduction
-        into a single high-throughput Triton kernel to avoid materializing large intermediates.
+    Optimized Model that fuses Tanh, HardSwish, Residual Addition and LogSumExp reduction
+    into a single high-performance Triton kernel for the channel-wise reduction.
+    This keeps PyTorch's Conv2d and GroupNorm for correctness and uses Triton to
+    minimize memory traffic and computation during the nonlinear + reduction stage.
     """
     def __init__(self, in_channels, out_channels, kernel_size, groups, eps=1e-5):
         super(ModelNew, self).__init__()
         self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
         self.group_norm = nn.GroupNorm(groups, out_channels, eps=eps)
-        # Keep activation modules for API compatibility (not used on the fused path)
+        # keep PyTorch activations for API compatibility
         self.tanh = nn.Tanh()
         self.hard_swish = nn.Hardswish()
 
     def forward(self, x):
-        # Convolution
         x_conv = self.conv(x)
-        # Group Normalization
-        x_norm = self.group_norm(x_conv)
-        # Use fused Triton kernel to compute logsumexp across channels after computing activations on-the-fly
-        logsumexp = triton_fused_act_res_logsumexp(x_conv, x_norm)  # shape (N, H, W)
-        # keepdim to match original behavior (N, 1, H, W)
-        x_logsumexp = logsumexp.unsqueeze(1)
+        # Fuse GroupNorm inside Triton kernel: pass affine params and group metadata
+        gamma = self.group_norm.weight
+        beta = self.group_norm.bias
+        x_logsumexp = triton_fused_logsumexp(x_conv, gamma, beta, self.group_norm.num_groups, self.group_norm.eps)
         return x_logsumexp
+
+
+# Keep original interface information
+batch_size = 128
+in_channels = 8
+out_channels = 64
+height, width = 128, 128
+kernel_size = 3
+groups = 16
+
+def get_inputs():
+    # Provide CUDA float32 input for benchmarking/execution
+    return [torch.rand(batch_size, in_channels, height, width).cuda().to(torch.float32)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, groups]

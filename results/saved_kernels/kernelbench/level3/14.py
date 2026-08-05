@@ -1,295 +1,201 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-# Autotune configurations tuned for NVIDIA A6000 (Ampere).
-AUTOTUNE_COPY_3D = [
-    triton.Config({"BLOCK_C": 4,   "BLOCK_HW": 256}, num_warps=4, num_stages=2),
-    triton.Config({"BLOCK_C": 8,   "BLOCK_HW": 256}, num_warps=4, num_stages=2),
-    triton.Config({"BLOCK_C": 16,  "BLOCK_HW": 128}, num_warps=4, num_stages=2),
-    triton.Config({"BLOCK_C": 16,  "BLOCK_HW": 256}, num_warps=8, num_stages=2),
-    triton.Config({"BLOCK_C": 32,  "BLOCK_HW": 128}, num_warps=8, num_stages=2),
-    triton.Config({"BLOCK_C": 32,  "BLOCK_HW": 256}, num_warps=8, num_stages=3),
-    triton.Config({"BLOCK_C": 64,  "BLOCK_HW": 128}, num_warps=8, num_stages=3),
+# Autotune configurations for the tiled BN+ReLU kernel (BLOCK_S = spatial tile, BLOCK_C = channel tile)
+# Favor larger spatial tiles (multiples of common vector widths) to increase arithmetic intensity and reduce launches.
+AUTOTUNE_CONFIGS = [
+    triton.Config({"BLOCK_S": 512,   "BLOCK_C": 4},  num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_S": 1024,  "BLOCK_C": 4},  num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_S": 2048,  "BLOCK_C": 4},  num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_S": 2048,  "BLOCK_C": 8},  num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_S": 4096,  "BLOCK_C": 8},  num_warps=8, num_stages=2),
 ]
 
 
-@triton.autotune(configs=AUTOTUNE_COPY_3D, key=['B', 'C_src', 'HW', 'dst_C'])
+@triton.autotune(configs=AUTOTUNE_CONFIGS, key=['N','C','H','W'])
 @triton.jit
-def _copy_3d_kernel(
-    src_ptr,               # pointer to src flattened
-    dst_ptr,               # pointer to dst flattened
-    B,                     # batch size
-    C_src,                 # channels in source
-    HW,                    # H * W (spatial)
-    dst_C,                 # channels in destination (full output channels)
-    dst_batch_stride,      # dst_C * HW
-    dst_channel_offset_elems,  # destination channel offset in elements (channels * HW)
-    BLOCK_C: tl.constexpr,
-    BLOCK_HW: tl.constexpr,
+def _bn_relu_kernel(
+    x_ptr,           # pointer to input tensor (fp32)
+    gamma_ptr,       # pointer to gamma (C,)
+    beta_ptr,        # pointer to beta (C,)
+    mean_ptr,        # pointer to running_mean (C,)
+    var_ptr,         # pointer to running_var (C,)
+    out_ptr,         # pointer to output tensor (fp32)
+    N, C, H, W,      # tensor shapes (ints)
+    eps,             # float eps
+    BLOCK_S: tl.constexpr,  # spatial tile size (number of spatial positions per channel)
+    BLOCK_C: tl.constexpr   # channel tile size
 ):
+    # 2D tiling: program_id(0) -> channel block index, program_id(1) -> spatial block index
+    c_block = tl.program_id(0)
+    s_block = tl.program_id(1)
+
+    hw = H * W
+    n_spatial = N * hw
+
+    c_start = c_block * BLOCK_C
+    s_start = s_block * BLOCK_S
+
+    offs_c = c_start + tl.arange(0, BLOCK_C)                   # shape [BLOCK_C]
+    offs_s = s_start + tl.arange(0, BLOCK_S)                   # shape [BLOCK_S]
+
+    mask_c = offs_c < C
+    mask_s = offs_s < n_spatial
+
+    # Load per-channel parameters once for this channel tile
+    gamma = tl.load(gamma_ptr + offs_c, mask=mask_c, other=1.0)   # [BLOCK_C]
+    beta = tl.load(beta_ptr + offs_c, mask=mask_c, other=0.0)     # [BLOCK_C]
+    mean = tl.load(mean_ptr + offs_c, mask=mask_c, other=0.0)     # [BLOCK_C]
+    var = tl.load(var_ptr + offs_c, mask=mask_c, other=1.0)       # [BLOCK_C]
+
+    # Use rsqrt and pre-multiply by gamma for slightly cheaper compute
+    inv = gamma * tl.rsqrt(var + eps)                              # [BLOCK_C]
+
+    # compute n (batch index) and s_local (within-HW) for spatial positions
+    n_idx = offs_s // hw                 # [BLOCK_S]
+    s_local = offs_s % hw               # [BLOCK_S]
+
+    # base for each spatial position: n * (C*HW)
+    base_n = n_idx * (C * hw)           # [BLOCK_S]
+    c_base = offs_c * hw                # [BLOCK_C]
+
+    # broadcast to form offsets matrix of shape [BLOCK_C, BLOCK_S]
+    # offs_matrix[c, s] = c_base[c] + base_n[s] + s_local[s]
+    offs_matrix = c_base[:, None] + base_n[None, :] + s_local[None, :]
+
+    # combined mask for tile
+    mask_tile = mask_c[:, None] & mask_s[None, :]
+
+    # Load input tile (BLOCK_C x BLOCK_S)
+    x_tile = tl.load(x_ptr + offs_matrix, mask=mask_tile, other=0.0)
+
+    # Apply per-channel affine transform broadcast across spatial
+    out_tile = (x_tile - mean[:, None]) * inv[:, None] + beta[:, None]
+
+    # ReLU using tl.where (robust and avoids relying on specific tl.max overloads)
+    out_tile = tl.where(out_tile > 0.0, out_tile, 0.0)
+
+    # Store results
+    tl.store(out_ptr + offs_matrix, out_tile, mask=mask_tile)
+
+
+def triton_bn_relu(x: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor,
+                   running_mean: torch.Tensor, running_var: torch.Tensor, eps: float):
     """
-    3D-tiled copy:
-      program_id(0) -> batch idx [0..B)
-      program_id(1) -> channel tile idx for source [0..ceil(C_src/BLOCK_C))
-      program_id(2) -> spatial tile idx [0..ceil(HW/BLOCK_HW))
-
-    Each program copies a BLOCK_C x BLOCK_HW tile of elements for a single batch.
+    Apply BatchNorm (using running statistics) followed by ReLU using Triton tiled kernel.
+    Expects x to be a CUDA float32 tensor in NCHW layout.
+    gamma, beta, running_mean, running_var should be 1D tensors on the same device as x.
+    NOTE: To avoid per-forward device transfers, ensure model.to(device) has been called so BN params
+    and running stats live on the same device as the input.
     """
-    batch = tl.program_id(0)
-    tile_c = tl.program_id(1)
-    tile_hw = tl.program_id(2)
+    assert x.is_cuda, "Triton BN+ReLU expects CUDA tensors."
 
-    # Channel indices within the global tensor for this tile: shape [BLOCK_C]
-    c_base = tile_c * BLOCK_C
-    cs = c_base + tl.arange(0, BLOCK_C)  # shape [BLOCK_C]
+    # Avoid unnecessary copies: only make contiguous if required
+    if not x.is_contiguous():
+        x = x.contiguous()
 
-    # Spatial indices within H*W for this tile: shape [BLOCK_HW]
-    hw_base = tile_hw * BLOCK_HW
-    hws = hw_base + tl.arange(0, BLOCK_HW)  # shape [BLOCK_HW]
+    N, C, H, W = x.shape
+    n_spatial = N * H * W
 
-    # Masks for valid channels and spatial positions
-    mask_c = cs < C_src            # [BLOCK_C]
-    mask_hw = hws < HW             # [BLOCK_HW]
+    device = x.device
+    dtype = torch.float32
 
-    # For improved coalescing, do per-channel contiguous loads/stores:
-    # For each channel c in the channel tile we load a contiguous spatial block (hws),
-    # i.e. base + hws, so the compiler can generate vectorized/coalesced memory ops.
-    # This follows the pattern:
-    #   base = src_batch_base + c * HW
-    #   vals = tl.load(src_ptr + base + hws, mask=mask_hw, other=0.0)
-    #   tl.store(dst_ptr + dst_batch_base + c * HW + hws, vals, mask=mask_hw)
-    src_batch_base = batch * (C_src * HW)
-    dst_batch_base = batch * dst_batch_stride + dst_channel_offset_elems
+    # Provide defaults if affine parameters are missing
+    if gamma is None:
+        gamma = torch.ones(C, device=device, dtype=dtype)
+    else:
+        # Require parameters to be on the same device to avoid per-forward .to(...) overhead.
+        assert gamma.device == device, "gamma must be on the same device as input. Call model.to(device) before forward."
 
-    # Iterate over channels in the channel tile, performing a contiguous spatial load/store
-    # for each channel. Using a small loop over BLOCK_C keeps per-thread-vector sizes large
-    # and memory accesses coalesced across the spatial dimension.
-    for i in range(BLOCK_C):
-        c = c_base + i
-        mask_c_i = c < C_src
-        base_src = src_batch_base + c * HW
-        base_dst = dst_batch_base + c * HW
-        # load contiguous spatial block for channel c (hws is [BLOCK_HW])
-        vals = tl.load(src_ptr + base_src + hws, mask=mask_hw & mask_c_i, other=0.0)
-        tl.store(dst_ptr + base_dst + hws, vals, mask=mask_hw & mask_c_i)
+    if beta is None:
+        beta = torch.zeros(C, device=device, dtype=dtype)
+    else:
+        assert beta.device == device, "beta must be on the same device as input. Call model.to(device) before forward."
 
+    assert running_mean.device == device and running_var.device == device, "running_mean/var must be on same device as input. Call model.to(device) before forward."
 
-def triton_copy_per_batch_3d(src: torch.Tensor, dst: torch.Tensor, dst_channel_offset: int):
-    """
-    Copy src (B, C_src, H, W) into dst (B, C_dst, H, W) at channel offset dst_channel_offset.
-    Uses a 3D-tiled Triton kernel that tiles over channels and flattened spatial dim (H*W).
-    """
-    assert src.is_cuda and dst.is_cuda, "Tensors must be on CUDA."
-    assert src.dtype == dst.dtype == torch.float32, "Only fp32 is supported by this optimized path."
+    # Ensure contiguous parameter tensors for efficient device loads (no copy if already contiguous)
+    gamma = gamma.contiguous()
+    beta = beta.contiguous()
+    running_mean = running_mean.contiguous()
+    running_var = running_var.contiguous()
 
-    B, C_src, H, W = src.shape
-    _, C_dst, Hd, Wd = dst.shape
-    assert H == Hd and W == Wd, "Spatial dimensions must match."
+    out = torch.empty_like(x)
 
-    HW = H * W
-    dst_batch_stride = C_dst * HW
-    dst_channel_offset_elems = dst_channel_offset * HW
-
-    src_flat = src.contiguous().view(-1)
-    dst_flat = dst.contiguous().view(-1)
-
+    # 2D grid: (num_channel_blocks, num_spatial_blocks)
     grid = lambda meta: (
-        B,
-        (C_src + meta["BLOCK_C"] - 1) // meta["BLOCK_C"],
-        (HW + meta["BLOCK_HW"] - 1) // meta["BLOCK_HW"],
+        (C + meta["BLOCK_C"] - 1) // meta["BLOCK_C"],
+        (n_spatial + meta["BLOCK_S"] - 1) // meta["BLOCK_S"],
     )
 
-    _copy_3d_kernel[grid](
-        src_flat,
-        dst_flat,
-        B,
-        C_src,
-        HW,
-        C_dst,
-        dst_batch_stride,
-        dst_channel_offset_elems,
+    # Launch the autotuned tiled kernel; autotuner will set BLOCK_S and BLOCK_C as constexpr
+    _bn_relu_kernel[grid](
+        x, gamma, beta, running_mean, running_var, out,
+        N, C, H, W, float(eps)
     )
+    return out
 
 
 class ModelNew(nn.Module):
-    """
-    Optimized Dense-block-like architecture.
-
-    This implementation focuses on removing costly torch.cat operations and reducing
-    CPU-GPU kernel-launch overheads for copies by:
-      - Preallocating the final output buffer `out` that will contain the initial
-        input and all subsequent per-layer feature maps.
-      - Copying the initial input into `out` using a high-throughput Triton 3D-tiled copy.
-      - For each layer, reading from a view into `out` (no copy), computing the layer's
-        output using the original PyTorch modules (BatchNorm->ReLU->Conv), and then
-        placing the result directly into a slice of `out` using an in-place device-to-device
-        copy (out_slice.copy_) which leverages efficient CUDA memcpy for contiguous blocks.
-    """
     def __init__(self, num_layers: int, num_input_features: int, growth_rate: int):
+        """
+        Optimized DenseBlock-like module:
+        - Replaces BatchNorm2d + ReLU (in eval mode) with a fused Triton kernel (per-channel affine + ReLU).
+        - Keeps convolution layers as native torch.nn.Conv2d (optimized highly in cuDNN/CUDA).
+        """
         super(ModelNew, self).__init__()
-        self.num_layers = int(num_layers)
-        self.num_input_features = int(num_input_features)
-        self.growth_rate = int(growth_rate)
+        self.num_layers = num_layers
+        self.growth_rate = growth_rate
 
-        layers = []
-        for i in range(self.num_layers):
-            in_features = self.num_input_features + i * self.growth_rate
-            layers.append(self._make_layer(in_features, self.growth_rate))
-        self.layers = nn.ModuleList(layers)
-        # Placeholders for fused Conv weights/biases for eval-time BN fusion.
-        # These are computed when switching to evaluation mode to avoid repeated work
-        # during every forward pass.
-        self._fused = False
-        self._fused_weights = [None] * self.num_layers
-        self._fused_biases = [None] * self.num_layers
-
-    def _compute_fused(self):
-        # Compute and cache fused conv weights and biases for all layers.
-        fused_w = [None] * self.num_layers
-        fused_b = [None] * self.num_layers
-        for idx, layer in enumerate(self.layers):
-            bn = layer[0]
-            conv = layer[2]
-            # number of input channels to this layer
-            in_ch = conv.weight.shape[1]
-            device = conv.weight.device
-            dtype = conv.weight.dtype
-
-            if hasattr(bn, "weight") and bn.weight is not None:
-                gamma = bn.weight.detach().to(device=device, dtype=dtype)
-                beta = bn.bias.detach().to(device=device, dtype=dtype)
-            else:
-                gamma = torch.ones(in_ch, device=device, dtype=dtype)
-                beta = torch.zeros(in_ch, device=device, dtype=dtype)
-
-            running_mean = bn.running_mean.to(device=device, dtype=dtype)
-            running_var = bn.running_var.to(device=device, dtype=dtype)
-            eps = bn.eps
-
-            a = gamma / torch.sqrt(running_var + eps)
-            b = beta - a * running_mean
-
-            W = conv.weight.detach()
-            W_fused = W * a[None, :, None, None]
-            bias_fused = (W * b[None, :, None, None]).sum(dim=(1, 2, 3))
-
-            fused_w[idx] = W_fused
-            fused_b[idx] = bias_fused
-
-        self._fused_weights = fused_w
-        self._fused_biases = fused_b
-        self._fused = True
-
-    def eval(self):
-        # When switching to eval mode, compute fused weights once.
-        super(ModelNew, self).eval()
-        self._compute_fused()
-        return self
-
-    def train(self, mode: bool = True):
-        # Clear fused cache when switching back to training mode.
-        if mode:
-            self._fused = False
-            self._fused_weights = [None] * self.num_layers
-            self._fused_biases = [None] * self.num_layers
-        return super(ModelNew, self).train(mode)
-
-    def _make_layer(self, in_features: int, growth_rate: int):
-        # Keep per-layer composition identical for correctness (BatchNorm + ReLU + Conv)
-        return nn.Sequential(
-            nn.BatchNorm2d(in_features),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(in_features, growth_rate, kernel_size=3, padding=1, bias=False),
-            nn.Dropout(0.0)
-        )
+        self.layers_bn = nn.ModuleList()
+        self.layers_conv = nn.ModuleList()
+        for i in range(num_layers):
+            in_features = num_input_features + i * growth_rate
+            bn = nn.BatchNorm2d(in_features)
+            conv = nn.Conv2d(in_features, growth_rate, kernel_size=3, padding=1, bias=False)
+            self.layers_bn.append(bn)
+            self.layers_conv.append(conv)
+        # Dropout was 0.0 in the original model; omitted.
 
     def forward(self, x):
-        """
-        Forward computes each layer sequentially but avoids repeated concatenation allocations
-        by writing each new feature map directly into a preallocated output tensor `out`.
-        Using the Triton 3D copy for the initial input and efficient in-place device-to-device
-        copies for per-layer outputs minimizes overall runtime and kernel launch overhead.
-        """
-        # Ensure CUDA path for Triton kernels
-        if not x.is_cuda:
-            # Fallback to original behavior on CPU for correctness (no Triton)
-            features = [x]
-            for layer in self.layers:
-                new_feature = layer(x)
-                features.append(new_feature)
-                x = torch.cat(features, 1)
-            return x
-
-        B, C_in, H, W = x.shape
-        total_channels = self.num_input_features + self.num_layers * self.growth_rate
-
-        # Preallocate output buffer that will hold the concatenation of features
-        out = x.new_empty((B, total_channels, H, W))
-
-        # Copy initial input channels into out using fast device-to-device memcpy
-        out[:, :C_in].copy_(x)
-
-        # We'll keep a view into out to avoid repeated attribute lookups and allocations
-        # and perform per-layer writes directly into out at the correct channel offsets.
-        for i, layer in enumerate(self.layers):
-            current_in_channels = self.num_input_features + i * self.growth_rate
-            dst_offset = current_in_channels  # channel offset in out where new feature goes
-
-            # Slice into out for the current input (this is a contiguous channel prefix)
-            cur_input = out[:, :current_in_channels]
-
-            # Destination slice in out for this layer's outputs
-            # (pre-create to avoid reallocating it twice)
-            # We'll write into this slice with an in-place copy or write conv output directly.
-            # Note: when in eval/inference mode we can fuse BatchNorm into Conv to avoid extra allocation.
-            if not self.training:
-                bn = layer[0]
-                relu = layer[1]
-                conv = layer[2]
-
-                # Ensure fused parameters are available and computed on model device/dtype.
-                if not self._fused:
-                    # Compute fused weights/biases once and cache them on the model.
-                    self._compute_fused()
-                W_fused = self._fused_weights[i]
-                bias_fused = self._fused_biases[i]
-
-                conv_out = F.conv2d(cur_input, W_fused, bias=bias_fused,
-                                    stride=conv.stride, padding=conv.padding,
-                                    dilation=conv.dilation, groups=conv.groups)
-
-                # Apply ReLU before copying and then memcpy into preallocated output slice
-                F.relu(conv_out, inplace=True)
-                out_slice = out.narrow(1, dst_offset, conv_out.shape[1])
-                out_slice.copy_(conv_out)
+        features = [x]
+        # We'll maintain "x" as the concatenated feature map across iterations, matching original behavior
+        for i in range(self.num_layers):
+            bn = self.layers_bn[i]
+            # Use the Triton fused kernel only when BatchNorm is in eval mode (uses running stats)
+            if not bn.training and x.is_cuda:
+                # Use BN params directly; ensure model.to(device) has been called once so params are on the correct device.
+                weight = bn.weight if bn.affine else None
+                bias = bn.bias if bn.affine else None
+                running_mean = bn.running_mean
+                running_var = bn.running_var
+                x_bn = triton_bn_relu(x, weight, bias, running_mean, running_var, bn.eps)
             else:
-                # Training mode: keep original per-layer modules to preserve BN behavior
-                # View into out for the current input to this layer (no copy)
-                new_feature = layer(cur_input)
-                out_slice = out.narrow(1, dst_offset, new_feature.shape[1])
-                # Ensure contiguous for efficient device copy
-                if not new_feature.is_contiguous():
-                    new_feature = new_feature.contiguous()
-                out_slice.copy_(new_feature)
+                # Fallback to PyTorch implementation (supports training mode)
+                x_bn = F.batch_norm(x, bn.running_mean, bn.running_var,
+                                    bn.weight, bn.bias, training=bn.training,
+                                    momentum=bn.momentum, eps=bn.eps)
+                x_bn = F.relu(x_bn, inplace=False)
 
-        return out
+            new_feature = self.layers_conv[i](x_bn)
+            features.append(new_feature)
+            # Concatenate along channel dimension
+            x = torch.cat(features, dim=1)
+        return x
 
 
-# Keep the same helper functions for input generation as in the provided model,
-# but ensure tensors are created on CUDA for the optimized path.
+# Same input-generation helpers as original to remain compatible with evaluation harnesses
 batch_size = 10
 num_layers = 6
 num_input_features = 32
 growth_rate = 32
 height, width = 224, 224
 
-
 def get_inputs():
-    # Return CUDA tensor as Triton kernels require GPU tensors.
-    return [torch.rand(batch_size, num_input_features, height, width).cuda()]
-
+    return [torch.rand(batch_size, num_input_features, height, width)]
 
 def get_init_inputs():
     return [num_layers, num_input_features, growth_rate]

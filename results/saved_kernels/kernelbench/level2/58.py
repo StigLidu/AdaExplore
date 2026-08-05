@@ -3,156 +3,110 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
-# Triton kernel that:
-#  - expects input laid out as (N*D*H*W, C) contiguous, channels-last per-row
-#  - computes logsumexp over the C dimension for each row
-#  - applies hard-swish: y = lse * sigmoid(lse + 3) / 6
-#  - subtracts a scalar bias and clamps to [-1, 1]
-# Writes one float per row to out_ptr (shape N*D*H*W,)
-@triton.jit
-def _fused_lse_hswish_kernel(
-    x_ptr,           # base pointer to input tensor (N, C, D, H, W)
-    out_ptr,         # pointer to output floats (one per row)
-    rows,            # number of rows = N*D*H*W
-    C,               # number of channels
-    N, D, H, W,      # dims (needed to compute coordinates)
-    stride_n, stride_c, stride_d, stride_h, stride_w,  # strides in elements for each dim
-    bias,            # scalar bias (float)
-    BLOCK_ROWS: tl.constexpr,  # constexpr number of rows handled per program
-    BLOCK_C: tl.constexpr,     # constexpr block size for channels
+# Triton kernel: fused logsumexp over channel dim + "HardSwish-like" op (x * sigmoid(x+3)/6) + subtract bias + clamp
+# Kernel expects input arranged as (C, total) contiguous, where total = B * D * H * W
+@triton.jit()
+def fused_lse_hs_kernel(
+    x_ptr,          # pointer to input tensor shaped (B, C, D, H, W) flattened as 1D (we index via channel stride)
+    out_ptr,        # pointer to output tensor shaped (total,)
+    total,          # total = B * D * H * W
+    bias,           # scalar bias (float)
+    channel_stride, # stride (in elements) between channels in the input tensor (x.stride()[1])
+    BLOCK: tl.constexpr,
+    CHANNELS: tl.constexpr,
 ):
     pid = tl.program_id(0)
-    row_start = pid * BLOCK_ROWS
-    # vector of row indices this program will handle
-    row_idxs = row_start + tl.arange(0, BLOCK_ROWS)
-    mask_rows = row_idxs < rows
+    block_start = pid * BLOCK
+    offs = block_start + tl.arange(0, BLOCK)
+    mask = offs < total
 
-    # channel offsets
-    offs_c = tl.arange(0, BLOCK_C)
-    mask_c = offs_c < C
+    # acc_max initialized to very small number for numeric stability
+    acc_max = tl.full((BLOCK,), -1e20, dtype=tl.float32)
 
-    # compute (n, d, h, w) for each row index
-    HW = H * W
-    DHW = D * HW
+    # First pass: compute max across channels
+    for k in range(CHANNELS):
+        # address for channel k using channel stride passed from host
+        addrs = k * channel_stride + offs
+        vals = tl.load(x_ptr + addrs, mask=mask, other=-1e20)
+        acc_max = tl.maximum(acc_max, vals)
 
-    n = row_idxs // DHW
-    rem = row_idxs % DHW
-    d = rem // HW
-    rem2 = rem % HW
-    h = rem2 // W
-    w = rem2 % W
+    # Second pass: compute sum exp(x - max)
+    sumexp = tl.zeros((BLOCK,), dtype=tl.float32)
+    for k in range(CHANNELS):
+        addrs = k * channel_stride + offs
+        vals = tl.load(x_ptr + addrs, mask=mask, other=0.0)
+        # compute delta and clamp to <= 0.0 to avoid exp overflow on masked/invalid lanes
+        delta = vals - acc_max
+        delta = tl.minimum(delta, 0.0)
+        sumexp = sumexp + tl.exp(delta)
 
-    # base offset (in elements) for each row: n*stride_n + d*stride_d + h*stride_h + w*stride_w
-    base_offsets = n * stride_n + d * stride_d + h * stride_h + w * stride_w  # shape [BLOCK_ROWS]
+    # logsumexp
+    lse = acc_max + tl.log(sumexp)
 
-    # column offsets (channel offsets) in elements
-    col_offsets = offs_c * stride_c  # shape [BLOCK_C]
-
-    # build pointer matrix of shape [BLOCK_ROWS, BLOCK_C]
-    ptrs = x_ptr + base_offsets[:, None] + col_offsets[None, :]
-
-    # load values with masking for both rows and channels
-    vals = tl.load(ptrs, mask=(mask_rows[:, None] & mask_c[None, :]), other=-1e30)
-
-    # compute max per row
-    max_val = tl.max(vals, axis=1)  # shape [BLOCK_ROWS]
-
-    # compute sum of exp(vals - max)
-    exps = tl.exp(vals - max_val[:, None])
-    exps = exps * mask_c[None, :].to(tl.float32)  # mask invalid channels
-    sumexp = tl.sum(exps, axis=1)
-
-    # log-sum-exp per row
-    lse = max_val + tl.log(sumexp)
-
-    # hard-swish: lse * sigmoid(lse + 3) / 6
-    sig = 1.0 / (1.0 + tl.exp(-(lse + 3.0)))
+    # Hard-swish like: x * sigmoid(x + 3) / 6  (sigmoid implemented as 1/(1+exp(-z)))
+    z = lse + 3.0
+    sig = 1.0 / (1.0 + tl.exp(-z))
     out = lse * sig / 6.0
 
-    # subtract bias and clamp
+    # subtract bias (broadcasted) and clamp to [-1, 1]
     out = out - bias
     out = tl.maximum(out, -1.0)
     out = tl.minimum(out, 1.0)
 
-    # write results for active rows
-    tl.store(out_ptr + row_idxs, out, mask=mask_rows)
+    # store result
+    tl.store(out_ptr + offs, out, mask=mask)
 
 
-def fused_logsumexp_hardswish(x: torch.Tensor, bias: float):
+def triton_fused_logsumexp_hs(x: torch.Tensor, bias_scalar: float):
     """
-    x: tensor of shape (N, C, D, H, W)
-    bias: scalar float to subtract
-    returns tensor of shape (N, 1, D, H, W) (same device and dtype as x)
+    x: Tensor of shape (B, C, D, H, W) on CUDA, dtype float32
+    returns: Tensor of shape (B, 1, D, H, W) on same device/dtype
     """
-    assert x.is_cuda, "Input must be on CUDA."
-    assert x.dim() == 5, "Expected input of shape (N, C, D, H, W)."
+    assert x.is_cuda, "Input must be on CUDA"
+    B, C, D, H, W = x.shape
+    total = B * D * H * W
+    # Use the input tensor's channel stride to index channels without a costly permute/contiguous
+    channel_stride = x.stride()[1]
 
-    N, C, D, H, W = x.shape
+    # Prepare output flat tensor
+    out_flat = torch.empty((total,), device=x.device, dtype=x.dtype)
 
-    rows = N * D * H * W
+    # Kernel launch parameters (tuning knobs)
+    BLOCK = 1024
+    grid = ( (total + BLOCK - 1) // BLOCK, )
 
-    # Prepare output flat
-    out_flat = torch.empty((rows,), dtype=x.dtype, device=x.device)
+    # Launch Triton kernel. Pass channel_stride and tune num_warps at launch time.
+    fused_lse_hs_kernel[grid](x, out_flat, total, float(bias_scalar), channel_stride, BLOCK=BLOCK, CHANNELS=C, num_warps=4)
 
-    # get strides (in elements) of the tensor; we use these to compute element addresses inside the kernel
-    sN, sC, sD, sH, sW = x.stride()
-
-    # Choose tiling parameters: BLOCK_ROWS and BLOCK_C
-    # Increase BLOCK_ROWS to improve coalescing; set BLOCK_C exactly to C when small to avoid padding
-    BLOCK_ROWS = 64
-    # set BLOCK_C to C for small channel counts (<=32) to avoid unnecessary padding.
-    if C <= 32:
-        BLOCK_C = C
-    else:
-        # round up to nearest multiple of 32 for larger C to satisfy vectorization widths
-        BLOCK_C = ((C + 31) // 32) * 32
-
-    # number of program instances required
-    grid = ((rows + BLOCK_ROWS - 1) // BLOCK_ROWS,)
-
-    # Launch kernel; pass the tensor (Triton will use its pointer) and strides
-    _fused_lse_hswish_kernel[grid](
-        x, out_flat, rows, C, N, D, H, W,
-        sN, sC, sD, sH, sW,
-        float(bias),
-        BLOCK_ROWS=BLOCK_ROWS, BLOCK_C=BLOCK_C
-    )
-
-    # Reshape back to (N, 1, D, H, W)
-    out = out_flat.view(N, D, H, W).unsqueeze(1)  # (N,1,D,H,W)
-
+    # reshape to (B, 1, D, H, W)
+    out = out_flat.view(B, 1, D, H, W).contiguous()
     return out
 
 
 class ModelNew(nn.Module):
     """
-    Optimized model:
-      - Uses the original ConvTranspose3d for the heavy convolution transpose.
-      - Replaces the subsequent channel-wise logsumexp, hard-swish, subtraction, and clamp
-        with a fused Triton kernel for improved throughput.
+    Optimized model: keeps the ConvTranspose3d in PyTorch, but fuses the following sequence:
+    logsumexp over channels -> x * sigmoid(x + 3) / 6 -> subtract bias -> clamp into a single Triton kernel.
     """
     def __init__(self, in_channels, out_channels, kernel_size, stride, padding, bias_shape):
         super(ModelNew, self).__init__()
+        # Use the same ConvTranspose3d as original for correctness and performance (cuDNN/ATen)
         self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding)
-        # keep bias as a parameter to match original model; the fused kernel accepts a scalar bias value
-        # Note: Triton kernel currently is not autograd-tracked, so gradients through this fused op
-        # will not flow back. This implementation targets inference performance.
+        # bias kept as a parameter (shape compatible for broadcasting)
         self.bias = nn.Parameter(torch.randn(*bias_shape))
 
     def forward(self, x):
-        # x: (N, in_channels, D, H, W)
-        # conv_transpose -> (N, out_channels, D', H', W')
-        x = self.conv_transpose(x)
-
-        # fused logsumexp over channels + hard-swish + subtract bias + clamp
-        # bias is broadcastable; we take its scalar value for subtraction
-        bias_scalar = float(self.bias.reshape(-1)[0].item())
-
-        out = fused_logsumexp_hardswish(x, bias_scalar)
+        # x: (B, in_channels, D, H, W)
+        x = self.conv_transpose(x)  # -> (B, out_channels, D', H', W')
+        # Fused post-processing via Triton kernel
+        # Ensure bias is a scalar for our fused kernel; original bias shape is broadcastable
+        # Use the first element as the scalar bias to subtract
+        bias_scalar = float(self.bias.view(-1)[0])
+        out = triton_fused_logsumexp_hs(x, bias_scalar)
         return out
 
 
-# Keep get_inputs and get_init_inputs similar to the original specification
+# Re-create helper functions similar to the original module to ease integration.
 batch_size = 128
 in_channels = 3
 out_channels = 16
@@ -162,8 +116,10 @@ stride = 2
 padding = 1
 bias_shape = (1, 1, 1, 1)
 
+
 def get_inputs():
-    return [torch.rand(batch_size, in_channels, depth, height, width).cuda().float()]
+    return [torch.rand(batch_size, in_channels, depth, height, width).cuda()]
+
 
 def get_init_inputs():
     return [in_channels, out_channels, kernel_size, stride, padding, bias_shape]

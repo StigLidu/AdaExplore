@@ -4,286 +4,163 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-# Autotune configs tuned to prefer warp-friendly tile sizes (multiples of 32 for M/N) and tensor-core-friendly K (32).
+# Autotune configurations for the Triton kernels
 AUTOTUNE_CONFIGS = [
-    triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32},  num_warps=8,  num_stages=2),
-    triton.Config({"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 32},  num_warps=16, num_stages=3),
-    triton.Config({"BLOCK_M": 128, "BLOCK_N": 64,  "BLOCK_K": 32},  num_warps=8,  num_stages=2),
-    triton.Config({"BLOCK_M": 64,  "BLOCK_N": 128, "BLOCK_K": 32},  num_warps=8,  num_stages=2),
-    triton.Config({"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 32},  num_warps=16, num_stages=3),
-    triton.Config({"BLOCK_M": 64,  "BLOCK_N": 64,  "BLOCK_K": 32},  num_warps=8,  num_stages=2),
+    triton.Config({"BLOCK": 128},  num_warps=2, num_stages=2),
+    triton.Config({"BLOCK": 256},  num_warps=4, num_stages=2),
+    triton.Config({"BLOCK": 512},  num_warps=8, num_stages=2),
+    triton.Config({"BLOCK": 1024}, num_warps=8, num_stages=3),
 ]
 
-@triton.autotune(configs=AUTOTUNE_CONFIGS, key=['M', 'N', 'K'])
+@triton.autotune(configs=AUTOTUNE_CONFIGS, key=['n_elems'])
 @triton.jit
-def _linear_kernel_packed(
-    A_ptr,               # pointer to A (M, K)
-    B_ptr,               # pointer to packed B (K, N)  <-- NOTE: packed as transpose of original weight (may be padded)
-    C_ptr,               # pointer to output C (M, N_true)  <-- output buffer sized to original N
-    bias_ptr,            # pointer to bias (N_padded,) or integer 0 when no bias
-    M, N, K,             # dimensions: N here is the padded N used for internal tiling
-    stride_am, stride_ak,# strides for A: (stride over M, stride over K)
-    stride_bk, stride_bn,# strides for B (K, N): stride when moving along K and N
-    stride_cm, stride_cn,# strides for C
-    RELU: tl.constexpr,   # whether to apply ReLU
-    HAS_BIAS: tl.constexpr,# whether bias_ptr is valid
-    N_true,              # original (true) N before padding (used for masking writes & bias loads)
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr
+def _relu_maxpool2d_kernel(
+    inp_ptr,         # input pointer (N, C, H, W) flattened
+    out_ptr,         # output pointer (N, C, Hout, Wout) flattened
+    N, C, H, W,      # input sizes
+    Hout, Wout,      # output sizes
+    k_h, k_w,        # kernel height/width (e.g., 2,2)
+    s_h, s_w,        # stride height/width (e.g., 2,2)
+    n_elems,         # total number of output elements (N*C*Hout*Wout)
+    BLOCK: tl.constexpr,
 ):
     """
-    Tiled GEMM where B is provided in packed (possibly padded) form (K, N).
-    Computes: C = A @ B + bias  where A: (M, K), B: (K, N_padded)
-    Fuses optional bias addition and ReLU.
-    Uses k-major blocking loading B tiles of shape (BLOCK_K, BLOCK_N) and A tiles (BLOCK_M, BLOCK_K),
-    then performs a small inner K-loop to drive FMAs (avoids materializing a large broadcasted temporary).
-    Loads are cast to float32 for accumulation (mixed precision safe).
+    Triton kernel that fuses ReLU followed by 2D max-pooling (kernel k_h x k_w, stride s_h x s_w).
+    Each program processes BLOCK output elements (flattened).
     """
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    block_start = tl.program_id(0) * BLOCK
+    offs = block_start + tl.arange(0, BLOCK)
+    mask = offs < n_elems
 
-    m_start = pid_m * BLOCK_M
-    n_start = pid_n * BLOCK_N
+    # compute output coordinates from flattened offsets:
+    # offs -> n, c, h_out, w_out
+    w_out = offs % Wout
+    tmp = offs // Wout
+    h_out = tmp % Hout
+    tmp = tmp // Hout
+    c = tmp % C
+    n = tmp // C
 
-    offs_m = m_start + tl.arange(0, BLOCK_M)   # (BLOCK_M,)
-    offs_n = n_start + tl.arange(0, BLOCK_N)   # (BLOCK_N,)
+    # compute top-left input coordinates for the pooling window
+    h_in = h_out * s_h
+    w_in = w_out * s_w
 
-    # accumulator for the tile (in FP32)
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    # Compute flattened input indices for the k_h x k_w block.
+    # For a 2x2 window:
+    # idx0 = ((n*C + c)*H + (h_in + 0))*W + (w_in + 0)
+    # idx1 = idx0 + 1
+    # idx2 = idx0 + W
+    # idx3 = idx2 + 1
+    # Generalize using k_h,k_w loops but unrolled for common 2x2 case for efficiency.
 
-    # iterate over K dimension in tiles
-    for k_start in range(0, K, BLOCK_K):
-        offs_k = k_start + tl.arange(0, BLOCK_K)  # (BLOCK_K,)
+    # Make sure all intermediate computations are tl tensors
+    base = ((n * C + c) * H + h_in) * W + w_in  # shape: [BLOCK]
+    # masks for each element in the pooling window
+    # For general safety, check bounds for each position
+    # position (0,0)
+    mask0 = mask & (h_in < H) & (w_in < W)
+    v0 = tl.load(inp_ptr + base, mask=mask0, other=-1e9)
+    # position (0,1)
+    mask1 = mask & (h_in < H) & (w_in + 1 < W)
+    v1 = tl.load(inp_ptr + base + 1, mask=mask1, other=-1e9)
+    # position (1,0)
+    mask2 = mask & (h_in + 1 < H) & (w_in < W)
+    v2 = tl.load(inp_ptr + base + W, mask=mask2, other=-1e9)
+    # position (1,1)
+    mask3 = mask & (h_in + 1 < H) & (w_in + 1 < W)
+    v3 = tl.load(inp_ptr + base + W + 1, mask=mask3, other=-1e9)
 
-        # Load A tile: shape (BLOCK_M, BLOCK_K)
-        a_ptrs = A_ptr + (offs_m[:, None] * stride_am) + (offs_k[None, :] * stride_ak)
-        mask_a = (offs_m[:, None] < M) & (offs_k[None, :] < K)
-        a_tile_raw = tl.load(a_ptrs, mask=mask_a, other=0.0)  # (BLOCK_M, BLOCK_K)
-        # cast to FP32 for accumulation (safe whether input is fp16 or fp32)
-        a_tile = tl.cast(a_tile_raw, tl.float32)
+    # Apply ReLU to each loaded value
+    zero = tl.zeros_like(v0)
+    v0r = tl.where(v0 > 0.0, v0, zero)
+    v1r = tl.where(v1 > 0.0, v1, zero)
+    v2r = tl.where(v2 > 0.0, v2, zero)
+    v3r = tl.where(v3 > 0.0, v3, zero)
 
-        # Load B tile from packed B (K, N_padded): shape (BLOCK_K, BLOCK_N)
-        b_ptrs = B_ptr + (offs_k[:, None] * stride_bk) + (offs_n[None, :] * stride_bn)
-        mask_b = (offs_k[:, None] < K) & (offs_n[None, :] < N)
-        b_tile_raw = tl.load(b_ptrs, mask=mask_b, other=0.0)  # (BLOCK_K, BLOCK_N)
-        b_tile = tl.cast(b_tile_raw, tl.float32)
+    # pairwise maximums to compute max over the 2x2 window
+    m01 = tl.where(v0r > v1r, v0r, v1r)
+    m23 = tl.where(v2r > v3r, v2r, v3r)
+    mout = tl.where(m01 > m23, m01, m23)
 
-        # Vectorized block matmul over K to update the tile at once (avoids Python loop)
-        # Use Triton's dot for (BLOCK_M, BLOCK_K) x (BLOCK_K, BLOCK_N) -> (BLOCK_M, BLOCK_N)
-        acc += tl.dot(a_tile, b_tile)
-
-    # bias handling (load only the true original bias positions)
-    offs_n_mask_true = offs_n < N_true
-    if HAS_BIAS:
-        bias_vals_raw = tl.load(bias_ptr + offs_n, mask=offs_n_mask_true, other=0.0)  # (BLOCK_N,)
-        bias_vals = tl.cast(bias_vals_raw, tl.float32)
-    else:
-        bias_vals = tl.zeros((BLOCK_N,), dtype=tl.float32)
-    out = acc + bias_vals[None, :]
-
-    # fused ReLU
-    if RELU:
-        zero = tl.zeros((), dtype=tl.float32)
-        out = tl.maximum(out, zero)
-
-    # store result with mask (only write the true N columns)
-    c_ptrs = C_ptr + (offs_m[:, None] * stride_cm) + (offs_n[None, :] * stride_cn)
-    mask_c = (offs_m[:, None] < M) & (offs_n[None, :] < N_true)
-    tl.store(c_ptrs, out, mask=mask_c)
+    # store flattened output
+    tl.store(out_ptr + offs, mout, mask=mask)
 
 
-def triton_linear_packed(input_: torch.Tensor, B_packed: torch.Tensor, bias: torch.Tensor = None, relu: bool = False):
+def triton_relu_maxpool2d(x: torch.Tensor, kernel_size=2, stride=2):
     """
-    Wrapper around the Triton GEMM kernel that expects B_packed to be shape (K, N_padded).
-    Computes: output = input_ @ B_packed[:, :N_true] + bias  (input_: M x K, B_packed: K x N_padded)
-    Supports fp32 and fp16 packed weights/inputs; kernel will cast loaded values to fp32 for accumulation.
-    The wrapper will pad the bias if needed so kernel loads are safe and will pass the true N (N_true)
-    so stores only write actual columns.
+    Wrapper that calls the Triton kernel to perform ReLU followed by max-pooling.
+    Assumes 4D tensor in (N, C, H, W), dtype float32, CUDA device.
     """
-    assert input_.is_cuda and B_packed.is_cuda, "Tensors must be on CUDA."
-    if bias is not None:
-        assert bias.is_cuda, "Bias must be on CUDA."
+    assert x.is_cuda and x.dtype == torch.float32, "triton_relu_maxpool2d expects CUDA float32 tensor"
+    x = x.contiguous()
+    N, C, H, W = x.shape
+    k_h = k_w = kernel_size
+    s_h = s_w = stride
+    # compute output dimensions (standard floor behavior)
+    Hout = (H - k_h) // s_h + 1
+    Wout = (W - k_w) // s_w + 1
+    out = torch.empty((N, C, Hout, Wout), device=x.device, dtype=x.dtype)
 
-    assert input_.dtype in (torch.float32, torch.float16)
-    assert B_packed.dtype in (torch.float32, torch.float16)
+    n_elems = N * C * Hout * Wout
 
-    A = input_.contiguous()
-    B = B_packed.contiguous()
-    bias_t = bias.contiguous() if bias is not None else None
+    # grid based on BLOCK meta
+    grid = lambda meta: ((n_elems + meta["BLOCK"] - 1) // meta["BLOCK"],)
 
-    M, K = A.shape
-    # B is packed as (K, N_padded)
-    Kb, N_padded = B.shape
-    assert Kb == K, f"Packed weight K dim {Kb} does not match input K {K}"
-
-    # infer the true/original N from bias if provided; otherwise assume no padding
-    N_true = bias_t.shape[0] if bias_t is not None else N_padded
-    # output buffer is sized to the true N (we will only write the true columns)
-    out = A.new_empty((M, N_true))
-
-    # strides in elements
-    stride_am = A.stride(0)
-    stride_ak = A.stride(1)
-    stride_bk = B.stride(0)  # stride moving along K in packed (K,N) layout
-    stride_bn = B.stride(1)  # stride moving along N in packed layout (likely 1)
-    stride_cm = out.stride(0)
-    stride_cn = out.stride(1)
-
-    # compute grid using conservative small block sizes (autotune will override meta parameters)
-    BLOCK_M_DEFAULT = 64
-    BLOCK_N_DEFAULT = 64
-    blocks_m = (M + BLOCK_M_DEFAULT - 1) // BLOCK_M_DEFAULT
-    blocks_n = (N_padded + BLOCK_N_DEFAULT - 1) // BLOCK_N_DEFAULT
-    grid = (blocks_m, blocks_n)
-
-    # prepare bias argument: if bias exists but is smaller than N_padded, pad it so kernel can safely load
-    if bias_t is None:
-        bias_arg = 0
-        has_bias_flag = 0
-    else:
-        if bias_t.shape[0] != N_padded:
-            bias_padded = bias_t.new_zeros((N_padded,))
-            bias_padded[:N_true] = bias_t
-            bias_arg = bias_padded
-        else:
-            bias_arg = bias_t
-        has_bias_flag = 1
-
-    # Launch kernel: pass N_padded as N and also pass N_true so kernel masks stores/loads properly.
-    _linear_kernel_packed[grid](
-        A, B, out, bias_arg,
-        M, N_padded, K,
-        stride_am, stride_ak,
-        stride_bk, stride_bn,
-        stride_cm, stride_cn,
-        int(relu),
-        int(has_bias_flag),
-        N_true
+    # launch kernel
+    _relu_maxpool2d_kernel[grid](
+        x, out,
+        N, C, H, W,
+        Hout, Wout,
+        k_h, k_w,
+        s_h, s_w,
+        n_elems,
     )
     return out
 
 
 class ModelNew(nn.Module):
-    """
-    LeNet-5 optimized for large-batch inference on A6000.
-
-    Optimizations applied:
-      - Keep convolutional layers on PyTorch/cuDNN (these are small layers and well-optimized).
-      - Replace fully-connected (dense) layers with a Triton-accelerated GEMM kernel that:
-          * Expects weights packed as (K, N) (transpose + contiguous) to improve memory access/coalescing.
-          * Fuses bias addition and ReLU where applicable.
-          * Is autotuned across a set of tile sizes for best performance on the device.
-      - Pack (transpose+contiguous) each Linear.weight once and cache it as a buffer; repack only if the weight storage changes.
-    """
     def __init__(self, num_classes):
+        """
+        Optimized LeNet-5 using Triton kernels to fuse ReLU + MaxPool operations.
+        """
         super(ModelNew, self).__init__()
-        # Convolutional layers (leave to PyTorch/cuDNN)
+
+        # Convolutional layers remain as PyTorch implementations
         self.conv1 = nn.Conv2d(in_channels=1, out_channels=6, kernel_size=5, stride=1)
         self.conv2 = nn.Conv2d(in_channels=6, out_channels=16, kernel_size=5, stride=1)
 
-        # Fully connected layers: keep nn.Linear modules for parameter management
-        self.fc1 = nn.Linear(in_features=16*5*5, out_features=120)
+        # Fully connected layers (left as standard PyTorch)
+        self.fc1 = nn.Linear(in_features=16 * 5 * 5, out_features=120)
         self.fc2 = nn.Linear(in_features=120, out_features=84)
         self.fc3 = nn.Linear(in_features=84, out_features=num_classes)
 
-        # Reserve buffers for packed weights (packed as weight.t().contiguous() -> shape (K, N))
-        # Initialize to None; they will be populated on first forward (or when weight storage changes).
-        self.register_buffer('_packed_fc1', None)
-        self.register_buffer('_packed_fc2', None)
-        self.register_buffer('_packed_fc3', None)
-        # Track original storage pointer to detect parameter updates (e.g., during training)
-        self._packed_ptr_fc1 = None
-        self._packed_ptr_fc2 = None
-        self._packed_ptr_fc3 = None
-
-    def _maybe_pack(self, linear_module: nn.Linear, buf_name: str):
-        """
-        Ensure that a packed (transposed, contiguous) copy of linear_module.weight exists in the named buffer.
-        When packing:
-          - transpose and make contiguous
-          - cast to fp16 (to enable mixed-precision/tensor-core paths)
-          - pad the N dimension (columns) to a small multiple (8) for better memory alignment/coalescing
-        If the underlying weight storage changed (e.g., due to reinitialization or training), repack.
-        Returns the packed tensor (K, N_padded) on the correct device.
-        """
-        w = linear_module.weight
-        ptr = w.data_ptr()
-        PAD_N = 8  # pad N to a small multiple friendly to tensor cores
-
-        # Determine which buffer and ptr to use
-        if buf_name == 'fc1':
-            if self._packed_ptr_fc1 != ptr or getattr(self, '_packed_fc1') is None:
-                packed = w.t().contiguous()
-                # cast to fp16 for mixed precision (kernel will cast to fp32 for accumulation)
-                packed = packed.to(dtype=torch.float16)
-                K, N = packed.shape
-                Npad = ((N + PAD_N - 1) // PAD_N) * PAD_N
-                if Npad != N:
-                    packed_padded = torch.zeros((K, Npad), dtype=packed.dtype, device=packed.device)
-                    packed_padded[:, :N] = packed
-                    packed = packed_padded
-                # store packed tensor as buffer
-                object.__setattr__(self, '_packed_fc1', packed)
-                self._packed_ptr_fc1 = ptr
-            return getattr(self, '_packed_fc1')
-        elif buf_name == 'fc2':
-            if self._packed_ptr_fc2 != ptr or getattr(self, '_packed_fc2') is None:
-                packed = w.t().contiguous()
-                packed = packed.to(dtype=torch.float16)
-                K, N = packed.shape
-                Npad = ((N + PAD_N - 1) // PAD_N) * PAD_N
-                if Npad != N:
-                    packed_padded = torch.zeros((K, Npad), dtype=packed.dtype, device=packed.device)
-                    packed_padded[:, :N] = packed
-                    packed = packed_padded
-                object.__setattr__(self, '_packed_fc2', packed)
-                self._packed_ptr_fc2 = ptr
-            return getattr(self, '_packed_fc2')
-        elif buf_name == 'fc3':
-            if self._packed_ptr_fc3 != ptr or getattr(self, '_packed_fc3') is None:
-                packed = w.t().contiguous()
-                packed = packed.to(dtype=torch.float16)
-                K, N = packed.shape
-                Npad = ((N + PAD_N - 1) // PAD_N) * PAD_N
-                if Npad != N:
-                    packed_padded = torch.zeros((K, Npad), dtype=packed.dtype, device=packed.device)
-                    packed_padded[:, :N] = packed
-                    packed = packed_padded
-                object.__setattr__(self, '_packed_fc3', packed)
-                self._packed_ptr_fc3 = ptr
-            return getattr(self, '_packed_fc3')
-        else:
-            # generic fallback (should not happen)
-            packed = w.t().contiguous()
-            packed = packed.to(dtype=torch.float16)
-            K, N = packed.shape
-            Npad = ((N + PAD_N - 1) // PAD_N) * PAD_N
-            if Npad != N:
-                packed_padded = torch.zeros((K, Npad), dtype=packed.dtype, device=packed.device)
-                packed_padded[:, :N] = packed
-                packed = packed_padded
-            return packed
-
     def forward(self, x):
-        # Convolutional feature extraction (use PyTorch/cuDNN)
-        x = F.relu(self.conv1(x))
-        x = F.max_pool2d(x, kernel_size=2, stride=2)
+        # conv1 -> fused ReLU + 2x2 maxpool
+        x = self.conv1(x)
+        x = triton_relu_maxpool2d(x, kernel_size=2, stride=2)
 
-        x = F.relu(self.conv2(x))
-        x = F.max_pool2d(x, kernel_size=2, stride=2)
+        # conv2 -> fused ReLU + 2x2 maxpool
+        x = self.conv2(x)
+        x = triton_relu_maxpool2d(x, kernel_size=2, stride=2)
 
-        # Flatten to (batch_size, 16*5*5)
-        x = x.view(-1, 16*5*5)  # shape (batch_size, 400)
+        # Flatten for fully connected layers
+        x = x.view(-1, 16 * 5 * 5)
 
-        # fc1: use Triton GEMM with packed weight, fuse ReLU
-        packed_w1 = self._maybe_pack(self.fc1, 'fc1')
-        x = triton_linear_packed(x, packed_w1, self.fc1.bias, relu=True)
-
-        # fc2: pack if needed and run
-        packed_w2 = self._maybe_pack(self.fc2, 'fc2')
-        x = triton_linear_packed(x, packed_w2, self.fc2.bias, relu=True)
-
-        # fc3: final linear (no ReLU)
-        packed_w3 = self._maybe_pack(self.fc3, 'fc3')
-        x = triton_linear_packed(x, packed_w3, self.fc3.bias, relu=False)
-
+        # Fully connected layers with ReLU between them (use PyTorch ops)
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = self.fc3(x)
         return x
+
+
+# Helper functions to match original module interface (kept minimal)
+batch_size = 4096
+num_classes = 20
+
+def get_inputs():
+    # Return a sample input tensor (on CUDA if available)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    return [torch.rand(batch_size, 1, 32, 32, device=device, dtype=torch.float32)]
+
+def get_init_inputs():
+    return [num_classes]

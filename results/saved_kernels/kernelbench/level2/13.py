@@ -3,133 +3,197 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
+# Autotune configs tuned for A6000 (autotune over channel-block and spatial-block)
+AUTOTUNE_CONFIGS = [
+    triton.Config({"BLOCK_C": 64,  "BLOCK_SPATIAL": 64},  num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_C": 128, "BLOCK_SPATIAL": 64},  num_warps=4, num_stages=3),
+    triton.Config({"BLOCK_C": 128, "BLOCK_SPATIAL": 128}, num_warps=8, num_stages=3),
+]
+
+@triton.autotune(
+    configs=AUTOTUNE_CONFIGS,
+    key=['C', 'D']
+)
 @triton.jit
-def _channel_softmax_bias_tanh_scale_kernel(
-    x_ptr,           # pointer to input (B, C, 1, H, W) flattened
-    bias_ptr,        # pointer to bias (C,)
-    out_ptr,         # pointer to output (B, C, 1, H, W) flattened
-    B,               # batch
-    C,               # channels
-    H,               # height
-    W,               # width
-    HW,              # H * W (precomputed)
-    CHW,             # C * H * W (precomputed)
-    scaling,         # scaling factor (float)
-    BLOCK_C: tl.constexpr,  # number of channels processed per program (constexpr)
-    BLOCK_HW: tl.constexpr, # number of spatial positions (linear HW) per program (constexpr)
+def fused_mean_softmax_tanh_kernel(
+    x_ptr,          # pointer to input (B, C, D, H, W) flattened
+    bias_ptr,       # pointer to bias (C,)
+    out_ptr,        # pointer to output (B, C, H, W) flattened
+    B, C, D, H, W,  # dims
+    scaling,
+    BLOCK_C: tl.constexpr,
+    BLOCK_SPATIAL: tl.constexpr,
 ):
-    # Each program handles one (b, hw_block) where hw_block covers BLOCK_HW contiguous spatial elements
-    pid = tl.program_id(0)
-    nblocks = (HW + BLOCK_HW - 1) // BLOCK_HW
-    b = pid // nblocks
-    block_id = pid % nblocks
-    hw_start = block_id * BLOCK_HW
-
-    # Offsets
-    offs_c = tl.arange(0, BLOCK_C)                       # (BLOCK_C,)
-    offs_hw = tl.arange(0, BLOCK_HW)                     # (BLOCK_HW,)
-
-    # Actual hw indices this program will handle (linearized h*W + w)
-    hw_idxs = hw_start + offs_hw                          # (BLOCK_HW,)
-
-    # Base address per channel for this batch: b * CHW + c * HW
-    base_c = b * CHW + offs_c * HW                       # (BLOCK_C,)
-
-    # Build 2D index matrix into flattened tensor: idx[c, hw] = base_c[c] + hw_idxs[hw]
-    idx = base_c[:, None] + hw_idxs[None, :]              # (BLOCK_C, BLOCK_HW)
-
-    # Validity mask for tails
-    mask = (offs_c[:, None] < C) & (hw_idxs[None, :] < HW)  # (BLOCK_C, BLOCK_HW)
-
-    # Load values with a large negative for masked spots (so they don't affect max/exp)
-    neg_inf = -1e20
-    vals = tl.load(x_ptr + idx, mask=mask, other=neg_inf)           # fp32, (BLOCK_C, BLOCK_HW)
-
-    # Load bias per channel and broadcast-add
-    bias_vals = tl.load(bias_ptr + offs_c, mask=offs_c < C, other=0.0)  # (BLOCK_C,)
-    vals = vals + bias_vals[:, None]
-
-    # Cast to fp16 for numerically-stable and fast reductions/exponentials
-    vals_fp16 = vals.to(tl.float16)              # (BLOCK_C, BLOCK_HW)
-    mask_fp16 = mask.to(tl.float16)
-
-    # Compute max across channels (axis=0) in fp16 for numerical stability
-    m = tl.max(vals_fp16, axis=0)                # (BLOCK_HW,)
-    exps = tl.exp(vals_fp16 - m)                 # (BLOCK_C, BLOCK_HW)
-    # Zero out masked positions
-    exps = exps * mask_fp16
-    sum_exp = tl.sum(exps, axis=0)               # (BLOCK_HW,)
-    # Avoid divide-by-zero
-    sum_exp = sum_exp + (sum_exp == 0.0).to(tl.float16)
-
-    soft = exps / sum_exp                        # (BLOCK_C, BLOCK_HW)
-
-    # Compute tanh using fp16 identity: tanh(x) = (e^{2x}-1)/(e^{2x}+1)
-    doubled = soft * 2.0
-    e2 = tl.exp(doubled)
-    tanh_fp16 = (e2 - 1.0) / (e2 + 1.0)
-
-    # Cast back to fp32, apply scaling and store
-    out_fp32 = tanh_fp16.to(tl.float32) * scaling
-    tl.store(out_ptr + idx, out_fp32, mask=mask)
-
-
-def triton_channel_softmax_bias_tanh_scale(x: torch.Tensor, bias: torch.Tensor, scaling: float):
     """
-    x: tensor of shape (B, C, 1, H, W) on CUDA, dtype float32
-    bias: tensor of shape (1, C, 1, 1, 1) or (C,) on CUDA, dtype float32
+    Triton kernel that:
+      - Processes a block of channels (BLOCK_C) and a block of spatial positions (BLOCK_SPATIAL)
+      - Computes mean over depth D (vectorized in small unrolled steps)
+      - Adds per-channel bias
+      - Performs numerically-stable softmax across channels (per spatial position)
+      - Applies tanh (via exp trick) and scaling
+    Writes output in shape (B, C, H, W).
+    Grid layout:
+      program_id(0) -> channel block
+      program_id(1) -> combined (batch, spatial-block)
     """
-    assert x.is_cuda and bias.is_cuda, "Inputs must be on CUDA."
-    assert x.dtype == torch.float32 and bias.dtype == torch.float32, "Only float32 supported."
-
-    B, C, D, H, W = x.shape
-    assert D == 1, "This kernel expects depth == 1 (mean-pooled input)."
-
-    x_ = x.contiguous()
-    out = torch.empty_like(x_)
-    bias_flat = bias.reshape(-1).contiguous()
+    pid_c = tl.program_id(0)   # channel block index
+    pid_sp = tl.program_id(1)  # combined batch * spatial-block index
 
     HW = H * W
-    CHW = C * HW
+    num_sp_blocks = (HW + BLOCK_SPATIAL - 1) // BLOCK_SPATIAL
+    b = pid_sp // num_sp_blocks
+    sp_block = pid_sp - b * num_sp_blocks
 
-    # Tuned tile sizes for Ampere (A6000):
-    # larger spatial tile to reduce kernel launches and increase memory locality,
-    # keep channel tile equal to a multiple of common vector widths.
-    BLOCK_C = 64
-    BLOCK_HW = 32
+    # spatial offsets handled in a vector inside each program
+    sp_start = sp_block * BLOCK_SPATIAL
+    offs_sp = sp_start + tl.arange(0, BLOCK_SPATIAL)              # (BLOCK_SPATIAL,)
+    mask_sp = offs_sp < HW
 
-    nblocks = (HW + BLOCK_HW - 1) // BLOCK_HW
-    grid = lambda meta: (B * nblocks,)
+    h = offs_sp // W
+    w = offs_sp - h * W
+    # base per-spatial offset (within a batch)
+    base_sp = h * W + w  # equals h*stride_H_in + w*stride_W_in
 
-    _channel_softmax_bias_tanh_scale_kernel[grid](
-        x_, bias_flat, out,
-        B, C, H, W, HW, CHW, float(scaling),
-        BLOCK_C=BLOCK_C, BLOCK_HW=BLOCK_HW
+    # strides for input (B, C, D, H, W)
+    stride_B_in = C * D * H * W
+    stride_C_in = D * H * W
+    stride_D_in = H * W
+    # strides for output (B, C, H, W)
+    stride_B_out = C * HW
+    stride_C_out = HW
+
+    # channel offsets within block
+    offs_c = tl.arange(0, BLOCK_C)  # (BLOCK_C,)
+    c_start = pid_c * BLOCK_C
+    abs_c = c_start + offs_c       # (BLOCK_C,)
+    mask_c = abs_c < C             # (BLOCK_C,)
+
+    # prepare 2D masks and offsets with broadcasting: (BLOCK_C, BLOCK_SPATIAL)
+    mask2d = mask_c[:, None] & mask_sp[None, :]
+
+    # base address components
+    base_B = b * stride_B_in
+    base_in = base_B + base_sp[None, :]                # (1, BLOCK_SPATIAL) broadcast later
+    offs_in = base_in + (abs_c[:, None] * stride_C_in) # (BLOCK_C, BLOCK_SPATIAL)
+
+    # accumulator: sum over depths for each (channel, spatial)
+    vals = tl.zeros((BLOCK_C, BLOCK_SPATIAL), dtype=tl.float32)
+
+    # Vectorized depth reduction: unroll 4 depths per iteration to reduce loop overhead
+    d = 0
+    while d < D:
+        # unroll up to 4 depths per iteration
+        # depth 0
+        idx = d
+        if idx < D:
+            ptrs = offs_in + idx * stride_D_in    # (BLOCK_C, BLOCK_SPATIAL)
+            cur = tl.load(x_ptr + ptrs, mask=mask2d, other=0.0)
+            vals += cur
+        # depth 1
+        idx = d + 1
+        if idx < D:
+            ptrs = offs_in + idx * stride_D_in
+            cur = tl.load(x_ptr + ptrs, mask=mask2d, other=0.0)
+            vals += cur
+        # depth 2
+        idx = d + 2
+        if idx < D:
+            ptrs = offs_in + idx * stride_D_in
+            cur = tl.load(x_ptr + ptrs, mask=mask2d, other=0.0)
+            vals += cur
+        # depth 3
+        idx = d + 3
+        if idx < D:
+            ptrs = offs_in + idx * stride_D_in
+            cur = tl.load(x_ptr + ptrs, mask=mask2d, other=0.0)
+            vals += cur
+        d += 4
+
+    # compute mean over depth
+    inv_D = 1.0 / D
+    vals = vals * inv_D  # (BLOCK_C, BLOCK_SPATIAL)
+
+    # load bias per channel and broadcast across spatial
+    bias_vals = tl.load(bias_ptr + abs_c, mask=mask_c, other=0.0)  # (BLOCK_C,)
+    vals = vals + bias_vals[:, None]
+
+    # For numerical stability, set masked positions very negative before max
+    neg_inf = tl.full((BLOCK_C, BLOCK_SPATIAL), -1e20, dtype=tl.float32)
+    vals_for_max = tl.where(mask2d, vals, neg_inf)
+
+    # softmax across channel axis (axis=0)
+    max_v = tl.max(vals_for_max, axis=0)                # (BLOCK_SPATIAL,)
+    exps = tl.exp(vals - max_v[None, :])
+    exps = tl.where(mask2d, exps, 0.0)
+    sum_v = tl.sum(exps, axis=0) + 1e-6                # (BLOCK_SPATIAL,)
+    soft = exps / sum_v[None, :]
+
+    # tanh via exp trick and scaling
+    e_pos = tl.exp(soft)
+    e_neg = tl.exp(-soft)
+    tanh_vals = (e_pos - e_neg) / (e_pos + e_neg)
+    out_vals = tanh_vals * scaling                      # (BLOCK_C, BLOCK_SPATIAL)
+
+    # store results to output (B, C, H, W)
+    base_out = b * stride_B_out + base_sp[None, :]      # (1, BLOCK_SPATIAL)
+    offs_out = base_out + abs_c[:, None] * stride_C_out # (BLOCK_C, BLOCK_SPATIAL)
+    tl.store(out_ptr + offs_out, out_vals, mask=mask2d)
+
+
+def fused_mean_softmax_tanh(x: torch.Tensor, bias: torch.Tensor, scaling: float):
+    """
+    x: (B, C, D, H, W) contiguous cuda tensor (float32)
+    bias: (C,) contiguous cuda tensor
+    returns: (B, C, H, W) cuda tensor after softmax (over channels), tanh and scaling
+    (All fused inside Triton kernel for performance.)
+    """
+    assert x.is_cuda and bias.is_cuda, "Tensors must be on CUDA."
+    x = x.contiguous()
+    bias = bias.contiguous()
+
+    B, C, D, H, W = x.shape
+    out = torch.empty((B, C, H, W), device=x.device, dtype=x.dtype)
+
+    num_sp = H * W
+    # Default block choices; autotune will override via configs
+    BLOCK_C_DEF = 128
+    BLOCK_SPATIAL_DEF = 64
+
+    num_c_blocks = (C + BLOCK_C_DEF - 1) // BLOCK_C_DEF
+    num_sp_blocks = (num_sp + BLOCK_SPATIAL_DEF - 1) // BLOCK_SPATIAL_DEF
+    # grid: (channel_blocks, batch * spatial_blocks)
+    grid = lambda meta: (
+        (C + meta["BLOCK_C"] - 1) // meta["BLOCK_C"],
+        B * ((num_sp + meta["BLOCK_SPATIAL"] - 1) // meta["BLOCK_SPATIAL"]),
     )
+
+    # Launch fused kernel (autotune will supply BLOCK_C and BLOCK_SPATIAL)
+    fused_mean_softmax_tanh_kernel[grid](x, bias, out, B, C, D, H, W, float(scaling))
     return out
 
 
 class ModelNew(nn.Module):
     """
-    Optimized model:
-      - keep ConvTranspose3d implemented with PyTorch (highly-optimized)
-      - fuse bias add (per-channel), channel-wise softmax, tanh, and scaling into a single Triton kernel
-      - use fp16 for exp/reduction-heavy parts for speed while preserving fp32 inputs/outputs
+    Optimized Model that:
+      - Keeps PyTorch ConvTranspose3d for the heavy convolution transpose.
+      - Uses a Triton kernel that fuses:
+          mean over depth D, bias add, softmax over channels, tanh, and scaling,
+        avoiding intermediate allocation for the depth-reduced tensor.
     """
     def __init__(self, in_channels, out_channels, kernel_size, stride, padding, scaling_factor):
         super(ModelNew, self).__init__()
         self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding)
-        # bias kept broadcastable as original
+        # keep bias shape (1, C, 1, 1, 1) as original
         self.bias = nn.Parameter(torch.randn(1, out_channels, 1, 1, 1))
         self.scaling_factor = scaling_factor
 
     def forward(self, x):
-        # 1) ConvTranspose3d (PyTorch)
-        x = self.conv_transpose(x)  # (B, C, D, H, W)
-
-        # 2) Mean pool over depth (PyTorch): reduces D -> 1
-        x = x.mean(dim=2, keepdim=True)  # (B, C, 1, H, W)
-
-        # 3..6) bias add, softmax over channels, tanh, scaling (fused in Triton)
-        x = triton_channel_softmax_bias_tanh_scale(x, self.bias, self.scaling_factor)
-        return x
+        # x: (B, in_channels, D, H, W)
+        x = self.conv_transpose(x)                 # (B, C, D, H, W)
+        # prepare bias as (C,)
+        bias_vec = self.bias.view(self.bias.size(1)).contiguous()
+        # fused kernel computes mean over D internally and returns (B, C, H, W)
+        out_squeezed = fused_mean_softmax_tanh(x, bias_vec, self.scaling_factor)
+        # restore depth dimension to match original expected output shape (B, C, 1, H, W)
+        out = out_squeezed.unsqueeze(2)
+        return out

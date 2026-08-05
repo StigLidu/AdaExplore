@@ -1,150 +1,139 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-# Autotune configurations tuned for NVIDIA A6000 (Ampere).
-# These BLOCK sizes aim to maximize memory throughput for wide reductions (N=8192).
+# Autotune configs for varying block sizes of the reduction over the output dimension.
+# Expanded configs to give Triton more choices (tuned for Ampere A6000).
 AUTOTUNE_CONFIGS = [
-    triton.Config({"BLOCK": 128},  num_warps=4,  num_stages=2),
-    triton.Config({"BLOCK": 256},  num_warps=8,  num_stages=2),
-    triton.Config({"BLOCK": 512},  num_warps=8,  num_stages=3),
-    triton.Config({"BLOCK": 1024}, num_warps=8,  num_stages=3),
+    triton.Config({"BLOCK_N": 128},  num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_N": 256},  num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_N": 512},  num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_N": 1024}, num_warps=8, num_stages=3),
+    triton.Config({"BLOCK_N": 2048}, num_warps=8, num_stages=3),
 ]
 
-@triton.autotune(configs=AUTOTUNE_CONFIGS, key=['M', 'N'])
+@triton.autotune(configs=AUTOTUNE_CONFIGS, key=['N'])
 @triton.jit
-def _logsumexp_act_kernel(
-    x_ptr,            # pointer to input flattened tensor (fp16), shape M x N
-    out_ptr,          # pointer to output flattened tensor (fp32), shape M x 1
-    M,                # number of rows (batch)
-    N,                # number of columns (out_features)
-    BLOCK: tl.constexpr
-):
+def _logsumexp_rowwise_kernel(x_ptr,           # input matrix (M, N)
+                              out_ptr,         # output vector (M,)
+                              M, N,
+                              BLOCK_N: tl.constexpr):
     """
-    For each row (program_id(0) indexes rows) compute:
-      L = logsumexp(x[row, :]) with fp32 accumulation (x is fp16 in memory)
-      out[row] = GELU(GELU(LeakyReLU(LeakyReLU(L))))
-    The kernel streams the row across columns in tiles of size BLOCK.
+    Each Triton program handles one row (row). Single-pass, block-wise numerically-stable
+    logsumexp using an online update per block:
+      - maintain running max m_val and running sum s
+      - for each block: load vals, compute block_max, block_sum = sum(exp(vals - new_m))
+      - update s <- s * exp(m_val - new_m) + block_sum, m_val <- new_m
+    This reads each element once and is numerically stable.
     """
-    row = tl.program_id(0)
+    row = tl.program_id(0)  # row index
     if row >= M:
         return
 
-    # pointer to start of this row (in elements)
-    row_ptr = x_ptr + row * N
+    neg_inf = -1e20
+    neg_inf_fp16 = tl.cast(neg_inf, tl.float16)
+    m_val = neg_inf
+    s = 0.0
 
-    offs = tl.arange(0, BLOCK)
-    neg_inf = -1e30
+    n = 0
+    # Process blocks of columns
+    while n < N:
+        offs = n + tl.arange(0, BLOCK_N)
+        mask = offs < N
+        ptrs = x_ptr + row * N + offs
+        # Load as fp16 (the GEMM output will be fp16) and cast to fp32 for accumulation.
+        vals_fp16 = tl.load(ptrs, mask=mask, other=neg_inf_fp16)  # OOB lanes -> neg_inf_fp16 -> exp(neg_inf)=0
+        vals = tl.cast(vals_fp16, tl.float32)
 
-    # First pass: compute max for numerical stability
-    row_max = neg_inf
-    col = 0
-    while col < N:
-        cols = col + offs
-        mask = cols < N
-        ptrs = row_ptr + cols
-        vals_fp16 = tl.load(ptrs, mask=mask, other=0.0)
-        vals = vals_fp16.to(tl.float32)
-        # ensure masked lanes don't affect max
-        vals = tl.where(mask, vals, neg_inf)
-        # reduce max over lanes
-        block_max = tl.max(vals, axis=0)
-        row_max = tl.maximum(row_max, block_max)
-        col += BLOCK
+        # block statistics
+        block_max = tl.max(vals)
+        new_m = tl.maximum(m_val, block_max)
 
-    # Second pass: compute sum(exp(x - row_max))
-    acc = 0.0
-    col = 0
-    while col < N:
-        cols = col + offs
-        mask = cols < N
-        ptrs = row_ptr + cols
-        vals_fp16 = tl.load(ptrs, mask=mask, other=0.0)
-        vals = vals_fp16.to(tl.float32)
-        vals = vals - row_max
-        vals = tl.exp(vals)
-        # zero out masked lanes so they don't contribute to the sum
-        vals = tl.where(mask, vals, 0.0)
-        block_sum = tl.sum(vals, axis=0)
-        acc = acc + block_sum
-        col += BLOCK
+        # sum over exp(vals - new_m). OOB lanes contribute 0 due to other=neg_inf.
+        ex = tl.exp(vals - new_m)
+        block_sum = tl.sum(ex)
 
-    # finalize logsumexp in fp32
-    logsumexp = row_max + tl.log(acc)
+        # update running sum and max
+        s = s * tl.exp(m_val - new_m) + block_sum
+        m_val = new_m
 
-    # Apply activations: LeakyReLU (neg_slope=0.01) twice, then GELU twice.
-    a = tl.where(logsumexp > 0.0, logsumexp, logsumexp * 0.01)
-    a = tl.where(a > 0.0, a, a * 0.01)
+        n += BLOCK_N
 
-    # GELU approximation: x * sigmoid(1.702 * x)
-    z = 1.702 * a
-    s = 1.0 / (1.0 + tl.exp(-z))
-    a = a * s
-
-    z = 1.702 * a
-    s = 1.0 / (1.0 + tl.exp(-z))
-    a = a * s
-
-    # store the single fp32 result for this row
-    tl.store(out_ptr + row, a)
+    # final logsumexp
+    out = m_val + tl.log(s + 1e-45)
+    tl.store(out_ptr + row, out)
 
 
-def triton_logsumexp_activation(x: torch.Tensor) -> torch.Tensor:
+def triton_logsumexp_rowwise(x: torch.Tensor):
     """
-    Compute row-wise logsumexp on fp16 input and apply the fused activation chain.
+    Compute row-wise logsumexp across dimension 1 (columns) using Triton kernel.
     Input:
-      - x: (M, N) CUDA tensor with dtype torch.float16
+      x: (M, N) float32 CUDA tensor
     Output:
-      - out: (M, 1) CUDA tensor with dtype torch.float32
+      y: (M, 1) float32 CUDA tensor where y[i,0] = logsumexp(x[i, :])
     """
-    assert x.is_cuda, "Input must be on CUDA"
-    assert x.dtype == torch.float16, "Input must be fp16 (we expect mixed-precision linear output)"
+    assert x.is_cuda and x.ndim == 2 and x.dtype in (torch.float32, torch.float16), "Input must be a 2D CUDA tensor with dtype float16 or float32"
     x = x.contiguous()
     M, N = x.shape
-    out = torch.empty((M, 1), device=x.device, dtype=torch.float32)
+    # Kernel computes and stores fp32 outputs (accumulation in fp32), so allocate fp32 output.
+    out = torch.empty((M,), dtype=torch.float32, device=x.device)
 
     grid = lambda meta: (M,)
 
-    _logsumexp_act_kernel[grid](x, out, M, N)
-    return out
+    _logsumexp_rowwise_kernel[grid](x, out, M, N)
+    return out.unsqueeze(1)
 
 
 class ModelNew(nn.Module):
     """
-    Optimized model that:
-      - Stores Linear parameters in fp16 so GEMM runs natively in fp16 (Tensor Cores).
-      - Runs the linear in fp16 (by casting input to half), avoiding autocast overhead.
-      - Fuses the row-wise LogSumExp reduction and the tiny activation chain into a single Triton kernel
-        that reads the fp16 linear outputs, computes logsumexp in fp32 accumulators, applies activations,
-        and writes a single fp32 result per row.
+    Optimized model:
+      - Uses mixed-precision for the large GEMM: cast inputs and weights to float16 to
+        leverage Tensor Cores for the linear layer (big win on Ampere).
+      - Converts the block outputs back to float32 and computes a Triton-based
+        row-wise LogSumExp (streaming reduction) to avoid materializing the full
+        fp32 output of the linear layer.
+      - Applies the subsequent small activations in fp32.
     """
     def __init__(self, in_features, out_features, bias=True):
         super(ModelNew, self).__init__()
         self.linear = nn.Linear(in_features, out_features, bias=bias)
-        # convert parameters to half to enable fast native fp16 GEMM
+        # Persist an fp16 copy of parameters for inference to avoid per-forward casts/allocations.
         self.linear.weight.data = self.linear.weight.data.half()
-        if bias and self.linear.bias is not None:
+        if self.linear.bias is not None:
             self.linear.bias.data = self.linear.bias.data.half()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Cast input to fp16 to match weight dtype and run fast fp16 GEMM on GPU
-        x_half = x.half()
-        x_lin = self.linear(x_half)  # shape: (batch_size, out_features) in fp16
+    def forward(self, x):
+        # x: (batch, in_features), dtype float32
+        # 1) Mixed precision GEMM: compute linear in float16 to use Tensor Cores.
+        #    We cast the input to float16; parameters are already stored in float16.
+        x_fp16 = x.half()
+        # parameters already in fp16 to avoid per-call casts
+        out_fp16 = F.linear(x_fp16, self.linear.weight, self.linear.bias)  # (batch, out_features) in fp16
 
-        # Compute row-wise LogSumExp and fused activations using Triton over fp16 buffer
-        out = triton_logsumexp_activation(x_lin)  # (batch_size, 1) fp32
-        return out
+        # 2) Triton-based row-wise LogSumExp directly on fp16 output (kernel will cast lanes to fp32)
+        x_reduced = triton_logsumexp_rowwise(out_fp16)  # (batch,1) fp32
+
+        # 4) Activations on the small (batch,1) tensor in fp32
+        # Two LeakyReLU calls (as in original)
+        x_reduced = F.leaky_relu(x_reduced, negative_slope=0.01)
+        x_reduced = F.leaky_relu(x_reduced, negative_slope=0.01)
+        # Two GELU calls
+        x_reduced = F.gelu(x_reduced)
+        x_reduced = F.gelu(x_reduced)
+
+        return x_reduced
 
 
-# Keep the same input configuration helpers as the original module
+# Keep the helper functions/values consistent with the original file.
 batch_size = 1024
 in_features = 8192
 out_features = 8192
 
 def get_inputs():
-    # Inputs on CUDA, fp32 (we cast internally to fp16 for fast GEMM)
-    return [torch.rand(batch_size, in_features, device='cuda', dtype=torch.float32)]
+    # ensure inputs are on CUDA and float32
+    return [torch.rand(batch_size, in_features, dtype=torch.float32).cuda()]
 
 def get_init_inputs():
     return [in_features, out_features]

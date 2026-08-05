@@ -3,110 +3,86 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
-# Triton elementwise kernel that applies Mish twice: out = mish(mish(x))
-# Mish(x) = x * tanh(softplus(x)), softplus(x) = max(0,x) + log(1 + exp(-abs(x)))
+# Autotune configurations for different block sizes / warps
+AUTOTUNE_CONFIGS = [
+    triton.Config({"BLOCK": 256},  num_warps=2, num_stages=2),
+    triton.Config({"BLOCK": 512},  num_warps=4, num_stages=2),
+    triton.Config({"BLOCK": 1024}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK": 2048}, num_warps=8, num_stages=3),
+]
+
+@triton.autotune(
+    configs=AUTOTUNE_CONFIGS,
+    key=["n_elements"],
+)
 @triton.jit
-def _mish_twice_kernel(
-    x_ptr,        # pointer to input (expected to point to fp16 memory)
-    out_ptr,      # pointer to output (points to fp16 memory)
-    n_elements,   # total number of elements
-    BLOCK: tl.constexpr,  # block size (constexpr)
-):
+def mish_double_kernel(x_ptr, out_ptr, n_elements, BLOCK: tl.constexpr):
+    """
+    Applies Mish activation twice elementwise: y = Mish(Mish(x))
+    Operates on flattened 1D memory region of length n_elements.
+    BLOCK is a compile-time block size.
+    """
     pid = tl.program_id(0)
     start = pid * BLOCK
     offs = start + tl.arange(0, BLOCK)
     mask = offs < n_elements
 
-    # Load input (fp16 in memory), cast to fp32 for stable math
+    # Load input (use other=0.0 for masked lanes)
     x = tl.load(x_ptr + offs, mask=mask, other=0.0)
-    x = tl.cast(x, tl.float32)
+    y = x
 
-    # First Mish (computed in fp32)
-    # softplus(x) = max(0, x) + log(1 + exp(-abs(x)))
-    abs_x = tl.abs(x)
-    neg_abs = -abs_x
-    softplus = tl.maximum(x, 0.0) + tl.log(1.0 + tl.exp(neg_abs))
-    # tanh(softplus) via stable expression
-    exp_neg2sp = tl.exp(-2.0 * softplus)
-    tanh_sp = 2.0 / (1.0 + exp_neg2sp) - 1.0
-    m = x * tanh_sp
+    # Apply Mish twice
+    for _ in range(2):
+        # softplus: stable branch using tl.log and tl.exp (avoid log1p)
+        pos_mask = y > 0.0
+        exp_neg = tl.exp(-y)
+        exp_pos = tl.exp(y)
+        sp_pos = y + tl.log(1.0 + exp_neg)   # for y > 0
+        sp_neg = tl.log(1.0 + exp_pos)       # for y <= 0
+        sp = tl.where(pos_mask, sp_pos, sp_neg)
 
-    # Second Mish on m (also fp32)
-    abs_m = tl.abs(m)
-    neg_abs_m = -abs_m
-    softplus2 = tl.maximum(m, 0.0) + tl.log(1.0 + tl.exp(neg_abs_m))
-    exp_neg2sp2 = tl.exp(-2.0 * softplus2)
-    tanh_sp2 = 2.0 / (1.0 + exp_neg2sp2) - 1.0
-    out_fp32 = m * tanh_sp2
+        # tanh(sp) computed via sigmoid trick: tanh(z) = 2*sigmoid(2z) - 1
+        denom = 1.0 + tl.exp(-2.0 * sp)
+        tanh_sp = 2.0 / denom - 1.0
 
-    # Downcast to fp16 for storage to reduce memory traffic
-    out_fp16 = tl.cast(out_fp32, tl.float16)
-    tl.store(out_ptr + offs, out_fp16, mask=mask)
+        # Mish: x * tanh(softplus(x))
+        y = y * tanh_sp
 
+    # Store output
+    tl.store(out_ptr + offs, y, mask=mask)
 
-def triton_mish_twice(x: torch.Tensor, BLOCK: int = 1024):
+def triton_mish_double(x: torch.Tensor):
     """
-    Applies Mish twice elementwise using the Triton kernel in mixed precision.
-
-    Notes:
-    - Prefer to accept fp16 activations (e.g., produced by torch.cuda.amp.autocast)
-      so callers can avoid an explicit half() copy. If the input is float32 we
-      fall back to converting to fp16 (robustness).
-    - The kernel performs math in fp32 (by casting inside the kernel) but reads
-      and writes fp16 memory to reduce memory traffic.
-    - We reuse the fp16 buffer for output (in-place) to avoid an extra allocation.
-    - Default BLOCK reduced to 1024 which often improves occupancy on Ampere GPUs.
+    Wrapper to apply the Triton kernel to tensor x (any shape).
+    Returns a new tensor with Mish applied twice elementwise.
     """
-    assert x.is_cuda, "Input must be on CUDA"
+    assert x.is_cuda, "Input must be on CUDA."
+    x_contig = x.contiguous()
+    out = torch.empty_like(x_contig)
+    n_elements = x_contig.numel()
 
-    # Accept fp16 directly when available to avoid an extra conversion/copy.
-    if x.dtype == torch.float16:
-        x_h = x.contiguous()
-    else:
-        # Fallback: convert to fp16 if caller provided float32.
-        x_h = x.contiguous().half()
+    # grid: number of program instances based on block selected by autotuner
+    grid = lambda meta: ( (n_elements + meta["BLOCK"] - 1) // meta["BLOCK"], )
 
-    # Reuse the same fp16 buffer for output to avoid extra allocations.
-    out_h = x_h
-
-    n_elements = x_h.numel()
-    grid = ((n_elements + BLOCK - 1) // BLOCK,)
-
-    # Launch kernel (pass BLOCK as constexpr). Kernel does fp32 math internally.
-    _mish_twice_kernel[grid](x_h, out_h, n_elements, BLOCK=BLOCK)
-
-    # Upcast to float32 for compatibility with original API (if needed).
-    return out_h.to(torch.float32)
-
+    mish_double_kernel[grid](x_contig, out, n_elements)
+    return out
 
 class ModelNew(nn.Module):
     """
-    Optimized model: uses standard Conv2d but replaces the two Mish calls
-    with a fused Triton kernel that applies Mish twice in one pass.
+    Optimized model: uses PyTorch Conv2d for convolution and a fused Triton kernel
+    to apply Mish activation twice in a single elementwise GPU kernel.
     """
     def __init__(self, in_channels, out_channels, kernel_size):
         super(ModelNew, self).__init__()
         self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
 
     def forward(self, x):
-        # Perform convolution using PyTorch's highly-optimized conv.
-        # Use autocast on CUDA so the conv produces fp16 activations directly,
-        # avoiding an explicit .half() copy before the Triton kernel.
-        if x.is_cuda:
-            with torch.cuda.amp.autocast():
-                x = self.conv(x)
-            # Ensure contiguous before passing to Triton and call the triton wrapper.
-            x = x.contiguous()
-            return triton_mish_twice(x)
-        else:
-            # CPU fallback: apply conv and Mish twice in fp32
-            x = self.conv(x)
-            x = torch.nn.functional.mish(x)
-            x = torch.nn.functional.mish(x)
-            return x
+        x = self.conv(x)
+        # Fuse the two Mish calls into one Triton kernel pass
+        x = triton_mish_double(x)
+        return x
 
-
-# Keep helper functions to match original module API
+# Keep helper functions to match expected interface for input generation
 batch_size   = 64
 in_channels  = 64
 out_channels = 128

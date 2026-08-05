@@ -3,119 +3,106 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
-# Autotune configurations for the Triton kernel
-# Keep balanced BLOCK_SIZE candidates (multiples of warp size) and reasonable
-# warp counts/stages for Ampere (A6000).
+# Autotune configs for different block sizes
 AUTOTUNE_CONFIGS = [
-    triton.Config({"BLOCK_SIZE": 128}, num_warps=4, num_stages=2),
-    triton.Config({"BLOCK_SIZE": 256}, num_warps=4, num_stages=2),
-    triton.Config({"BLOCK_SIZE": 512}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_SIZE": 128},  num_warps=1, num_stages=2),
+    triton.Config({"BLOCK_SIZE": 256},  num_warps=2, num_stages=2),
+    triton.Config({"BLOCK_SIZE": 512},  num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_SIZE": 1024}, num_warps=8, num_stages=2),
 ]
 
 @triton.autotune(configs=AUTOTUNE_CONFIGS, key=['n_elements'])
 @triton.jit
-def _mish_add_hardtanh_scale_kernel(
-    x_ptr,          # pointer to input (fp32)
-    out_ptr,        # pointer to output (fp32)
-    n_elements,     # total number of elements
-    add_value,      # scalar to add (fp32)
-    min_val,        # hardtanh min (fp32)
-    max_val,        # hardtanh max (fp32)
-    scale,          # scalar to scale (fp32)
-    BLOCK_SIZE: tl.constexpr,
+def _fused_mish_add_clamp_scale_kernel(
+    x_ptr,        # input pointer
+    out_ptr,      # output pointer
+    n_elements,   # total number of elements
+    add_value,    # scalar to add
+    min_val,      # clamp min
+    max_val,      # clamp max
+    scale,        # scale factor
+    BLOCK_SIZE: tl.constexpr
 ):
-    # Compute the block this program will handle
-    block_start = tl.program_id(0) * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    """
+    Each program handles a contiguous block of BLOCK_SIZE elements.
+    Performs: out = clamp(mish(x) + add_value, min_val, max_val) * scale
+    where mish(x) = x * tanh(softplus(x)) and softplus(x) = log(1 + exp(x))
+    """
+    pid = tl.program_id(0)
+    start = pid * BLOCK_SIZE
+    offsets = start + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
 
-    # Load input as FP32
-    x_fp32 = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
 
-    # Piecewise handling to avoid unnecessary exp/log work:
-    # For large positive x (> +20): softplus(x) ≈ x => tanh(softplus) ≈ 1 => mish ≈ x
-    # For large negative x (< -20): softplus(x) ≈ exp(x) (very small) => mish ≈ x * exp(x) (tiny)
-    # Compute transcendental functions in FP32 to avoid invalid FP16 transcendental calls.
-    large_mask = x_fp32 > 20.0
-    small_mask = x_fp32 < -20.0
+    # softplus: log(1 + exp(x))
+    # Use tl.exp and tl.log
+    # For stability, compute softplus in a numerically stable way:
+    # softplus(x) = where(x > 20, x, log(1 + exp(x))) to avoid overflow
+    # 20 is a safe threshold for float32
+    large_mask = x > 20.0
+    exp_x = tl.exp(x)
+    softplus = tl.where(large_mask, x, tl.log(1.0 + exp_x))
 
-    # Compute mid-range path in FP32
-    exp_x = tl.exp(x_fp32)
-    sp_mid = tl.log(1.0 + exp_x)           # softplus in FP32
-    neg2sp = -2.0 * sp_mid
-    exp_neg2sp = tl.exp(neg2sp)
-    tanh_sp = (1.0 - exp_neg2sp) / (1.0 + exp_neg2sp)
-    mish_mid = x_fp32 * tanh_sp
+    # tanh(softplus) computed via tanh identity: (e^{2s}-1)/(e^{2s}+1)
+    two_s = 2.0 * softplus
+    e2s = tl.exp(two_s)
+    tanh_s = (e2s - 1.0) / (e2s + 1.0)
 
-    # Large positive approximation: mish ≈ x
-    mish_large = x_fp32
+    mish = x * tanh_s
 
-    # Large negative approximation: softplus ≈ exp(x), mish ≈ x * exp(x)
-    mish_small = x_fp32 * exp_x
+    y = mish + add_value
 
-    # Select piecewise result in FP32
-    mish_fp32 = tl.where(large_mask, mish_large, tl.where(small_mask, mish_small, mish_mid))
+    # clamp (Hardtanh): clamp y between min_val and max_val
+    y = tl.where(y < min_val, min_val, y)
+    y = tl.where(y > max_val, max_val, y)
 
-    # Add the scalar value
-    val = mish_fp32 + add_value
+    out = y * scale
 
-    # Hardtanh clamp (FP32)
-    val = tl.maximum(val, min_val)
-    val = tl.minimum(val, max_val)
+    tl.store(out_ptr + offsets, out, mask=mask)
 
-    # Scale
-    val = val * scale
 
-    # Store result
-    tl.store(out_ptr + offsets, val, mask=mask)
-
-def triton_mish_add_hardtanh_scale(x: torch.Tensor, add_value: float, min_val: float, max_val: float, scale: float):
+def triton_mish_add_clamp_scale(x: torch.Tensor, add_value: float, min_val: float, max_val: float, scale: float):
     """
-    Apply fused Mish -> add -> Hardtanh -> scale using Triton kernel.
-    Falls back to PyTorch if tensor is not on CUDA or not float32.
+    Wrapper to launch the Triton kernel.
     """
-    if not x.is_cuda or x.dtype != torch.float32:
-        # Fallback to PyTorch implementation on CPU or non-fp32 tensors
-        y = torch.nn.functional.mish(x)
-        y = y + add_value
-        y = torch.nn.functional.hardtanh(y, min_val=min_val, max_val=max_val)
-        y = y * scale
-        return y
-
-    # Ensure contiguous
+    assert x.is_cuda, "Input must be a CUDA tensor"
+    # Ensure contiguous layout for simple addressing inside Triton kernel
     x_contig = x.contiguous()
     out = torch.empty_like(x_contig)
 
     n_elements = x_contig.numel()
-    if n_elements == 0:
-        return out
 
-    # Grid based on BLOCK_SIZE chosen by autotune
+    # grid based on selected BLOCK_SIZE from autotune
     grid = lambda meta: ((n_elements + meta["BLOCK_SIZE"] - 1) // meta["BLOCK_SIZE"],)
 
-    # Launch Triton kernel
-    _mish_add_hardtanh_scale_kernel[grid](
+    # Launch kernel
+    _fused_mish_add_clamp_scale_kernel[grid](
         x_contig, out, n_elements,
         float(add_value), float(min_val), float(max_val), float(scale)
     )
     return out
 
+
 class ModelNew(nn.Module):
     """
-    Optimized model: keep ConvTranspose2d (Cuda-optimized in PyTorch), fuse Mish + add + Hardtanh + scale into a single Triton kernel.
+    Optimized model that keeps the ConvTranspose2d layer in PyTorch
+    but fuses Mish activation, addition, Hardtanh clamp, and scaling
+    into a single Triton kernel for improved performance.
     """
     def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, add_value, scale):
         super(ModelNew, self).__init__()
         self.conv_transpose = nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride, padding, output_padding)
-        # store the scalar parameters
+        # store scalar params for fused op
         self.add_value = float(add_value)
         self.scale = float(scale)
-        # hardtanh bounds are fixed as in the original model
-        self.hardtanh_min = -1.0
-        self.hardtanh_max = 1.0
+        # Hardtanh bounds
+        self.min_val = -1.0
+        self.max_val = 1.0
 
     def forward(self, x):
+        # Perform transposed convolution using PyTorch (leverages cuDNN/cuBLAS)
         x = self.conv_transpose(x)
-        # Fuse Mish + add + Hardtanh + scale with Triton kernel when possible
-        y = triton_mish_add_hardtanh_scale(x, self.add_value, self.hardtanh_min, self.hardtanh_max, self.scale)
-        return y
+        # Fuse Mish, add, clamp (Hardtanh), and scale in Triton kernel
+        x = triton_mish_add_clamp_scale(x, self.add_value, self.min_val, self.max_val, self.scale)
+        return x

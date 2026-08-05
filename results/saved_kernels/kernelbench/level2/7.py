@@ -3,117 +3,128 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
-# Triton kernel: fuse ReLU -> GELU(approx) -> Sigmoid -> add bias
-# GELU is approximated as x * sigmoid(1.702 * x) for efficiency and to avoid tanh/erf.
+# Autotune configurations for different block sizes / warps
+AUTOTUNE_CONFIGS = [
+    triton.Config({"BLOCK_SIZE": 256}, num_warps=2, num_stages=2),
+    triton.Config({"BLOCK_SIZE": 512}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_SIZE": 1024}, num_warps=8, num_stages=3),
+]
+
+@triton.autotune(configs=AUTOTUNE_CONFIGS, key=['numel', 'C', 'S_channel'])
 @triton.jit
-def _fused_acts_bias_kernel(
-    x_ptr,        # pointer to input/output tensor (flattened)
-    bias_ptr,     # pointer to bias values (length C)
-    out_ptr,      # pointer to output tensor (flattened)
-    n_elements,   # total number of elements
-    C,            # number of channels
-    plane,        # spatial plane size = D * H * W
-    BLOCK: tl.constexpr,  # block size (constexpr)
+def fused_activations_kernel(
+    x_ptr,            # pointer to input tensor (flattened)
+    bias_ptr,         # pointer to bias of shape (C,)
+    out_ptr,          # pointer to output tensor (flattened)
+    numel,            # total number of elements
+    C,                # number of channels
+    S_channel,        # stride (length) per channel block = D*H*W
+    NEG_SLOPE: tl.constexpr,  # leaky relu negative slope (constexpr)
+    BLOCK_SIZE: tl.constexpr,
 ):
-    # 3D grid: (plane_blocks, C, N)
-    pid_plane = tl.program_id(0)  # which block along the spatial plane
-    pid_c = tl.program_id(1)      # channel index
-    pid_n = tl.program_id(2)      # batch index
+    # each program handles a contiguous block of BLOCK_SIZE elements
+    pid = tl.program_id(0)
+    block_start = pid * BLOCK_SIZE
+    offs = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offs < numel
 
-    # start offset within the spatial plane for this block
-    block_start_in_plane = pid_plane * BLOCK
-    offs = tl.arange(0, BLOCK)
-    # mask lanes that go beyond the plane size in the last block
-    remain = plane - block_start_in_plane
-    mask = offs < remain
+    # Load input values (fp32)
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0)
 
-    # base global offset for (n, c, plane_block)
-    # layout flatten: ((n * C + c) * plane) + offset_in_plane
-    base = (pid_n * C + pid_c) * plane + block_start_in_plane
-    global_offs = base + offs
+    # Compute channel index for each element:
+    # block_index = offs // S_channel  (which enumerates across N*C blocks)
+    # channel = block_index % C
+    # Use integer arithmetic
+    block_idx = offs // S_channel
+    channel = block_idx % C
 
-    # load contiguous spatial elements for this (n, c) pair
-    x = tl.load(x_ptr + global_offs, mask=mask, other=0.0)
+    # Load corresponding bias per channel
+    bias = tl.load(bias_ptr + channel, mask=mask, other=0.0)
 
-    # load scalar bias for this channel (safe because grid second dim is C)
-    b = tl.load(bias_ptr + pid_c, mask=pid_c < C, other=0.0)
+    # 1) ReLU
+    zero = tl.zeros((), dtype=tl.float32)
+    x_relu = tl.where(x > zero, x, zero)
 
-    # ReLU
-    x = tl.where(x > 0.0, x, 0.0)
+    # 2) LeakyReLU with negative slope (after ReLU this is a no-op for negatives,
+    #    but we keep it to preserve semantics if inputs are changed)
+    x_leaky = tl.where(x_relu > zero, x_relu, x_relu * NEG_SLOPE)
 
-    # GELU approximation: x * sigmoid(1.702 * x)
-    a = 1.702 * x
-    sig_a = 1.0 / (1.0 + tl.exp(-a))
-    gel = x * sig_a
+    # 3) GELU approximation: use x * sigmoid(1.702 * x) approximation
+    #    sigmoid implemented as 1 / (1 + exp(-z))
+    a = 1.702
+    z = x_leaky * a
+    exp_neg = tl.exp(-z)
+    sigmoid_approx = 1.0 / (1.0 + exp_neg)
+    gelu_approx = x_leaky * sigmoid_approx
 
-    # Final sigmoid: sigmoid(gel)
-    out = 1.0 / (1.0 + tl.exp(-gel))
+    # 4) Sigmoid on the GELU output
+    exp_neg_g = tl.exp(-gelu_approx)
+    sigmoid_out = 1.0 / (1.0 + exp_neg_g)
 
-    # Add scalar bias (broadcasted across the block)
-    out = out + b
+    # 5) Add bias (broadcasted per-channel)
+    out = sigmoid_out + bias
 
-    # Store result (contiguous stores across the spatial plane)
-    tl.store(out_ptr + global_offs, out, mask=mask)
+    # Store result
+    tl.store(out_ptr + offs, out, mask=mask)
 
-
-def triton_fused_acts_bias(x: torch.Tensor, bias: torch.Tensor):
+def fused_activations(x: torch.Tensor, bias: torch.Tensor, neg_slope: float = 0.01):
     """
-    Wrapper to launch the Triton fused kernel.
-    x: tensor of shape [N, C, D, H, W], cuda, contiguous
-    bias: tensor of shape [C] or [C,1,1,1], cuda, contiguous
+    Applies fused: ReLU -> LeakyReLU -> approx-GELU -> Sigmoid -> bias-add
+    x: tensor of shape (N, C, D, H, W) contiguous on CUDA
+    bias: tensor of shape (C, 1, 1, 1) or (C,) on CUDA
     """
     assert x.is_cuda and bias.is_cuda, "Inputs must be on CUDA"
+    # Ensure contiguous
     x = x.contiguous()
-    # Ensure bias is 1D contiguous vector of length C
+    # Flatten input for kernel (view as 1D)
+    x_flat = x.view(-1)
+    numel = x_flat.numel()
+
+    # Prepare bias as (C,)
     if bias.dim() != 1:
-        bias_vec = bias.view(-1).contiguous()
+        bias_flat = bias.view(bias.shape[0]).contiguous()
     else:
-        bias_vec = bias.contiguous()
+        bias_flat = bias.contiguous()
 
-    out = torch.empty_like(x)
-    N, C, D, H, W = x.shape
-    plane = D * H * W
-    n_elements = x.numel()
+    C = x.shape[1]
+    # compute S_channel = D*H*W (number of elements per channel per batch)
+    D = x.shape[2]
+    H = x.shape[3]
+    W = x.shape[4]
+    S_channel = D * H * W
 
-    # Tuned block size for Ampere: smaller than 1024 to reduce register/shared pressure
-    BLOCK = 256
+    out = torch.empty_like(x_flat)
 
-    # Number of blocks along the spatial plane
-    plane_blocks = (plane + BLOCK - 1) // BLOCK
+    # grid and launch
+    def grid(meta):
+        return ((numel + meta['BLOCK_SIZE'] - 1) // meta['BLOCK_SIZE'],)
 
-    # 3D grid: (plane_blocks, C, N) so each program handles a contiguous block of the plane for a single (n,c)
-    grid = lambda meta: (plane_blocks, C, N)
-
-    # Launch kernel: pass tensors directly; provide BLOCK as constexpr
-    _fused_acts_bias_kernel[grid](
-        x,
-        bias_vec,
+    fused_activations_kernel[grid](
+        x_flat,
+        bias_flat,
         out,
-        n_elements,
+        numel,
         C,
-        plane,
-        BLOCK=BLOCK,
+        S_channel,
+        0.01,  # NEG_SLOPE constexpr
     )
 
-    return out
-
+    return out.view_as(x)
 
 class ModelNew(nn.Module):
     """
-    Optimized model that uses the same Conv3d layer but fuses the subsequent
-    activations and bias addition into a single Triton kernel for better throughput.
+    Optimized Model that uses the original Conv3d but fuses the sequence of
+    activations and the bias add into a single Triton kernel for improved throughput.
     """
     def __init__(self, in_channels, out_channels, kernel_size, bias_shape):
         super(ModelNew, self).__init__()
-        # Keep the convolution as PyTorch native (highly optimized)
+        # Keep the original conv (leveraging highly-optimized cuDNN)
         self.conv = nn.Conv3d(in_channels, out_channels, kernel_size)
-        # Additional bias parameter as in the original model (shape: [C,1,1,1])
+        # bias kept as parameter with original shape; fusion kernel will view it as (C,)
         self.bias = nn.Parameter(torch.randn(bias_shape))
 
     def forward(self, x):
-        # Run convolution using PyTorch
+        # Run conv (kept in PyTorch / cuDNN)
         x = self.conv(x)
         # Apply fused activations + bias via Triton kernel
-        # Ensure bias is proper shape/contiguity on the same device
-        bias_vec = self.bias.to(x.device)
-        return triton_fused_acts_bias(x, bias_vec)
+        return fused_activations(x, self.bias)

@@ -3,164 +3,173 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
-# Fused Triton kernel that tiles both batch and channels (multiple groups per program).
-# Each program processes BLOCK_B rows and BLOCK_G groups (each group has BLOCK_CH channels).
-# BLOCK_B, BLOCK_G, BLOCK_CH must be provided as constexpr kernel launch parameters.
+# Autotune configurations tuned for Ampere (NVIDIA A6000). We tune BLOCK_B (batch tile)
+# and try different num_warps / num_stages to find the best setting at runtime.
+AUTOTUNE_CONFIGS = [
+    triton.Config({"BLOCK_B": 8},  num_warps=2, num_stages=2),
+    triton.Config({"BLOCK_B": 8},  num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_B": 8},  num_warps=8, num_stages=3),
+    triton.Config({"BLOCK_B": 16}, num_warps=2, num_stages=2),
+    triton.Config({"BLOCK_B": 16}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_B": 16}, num_warps=8, num_stages=3),
+    triton.Config({"BLOCK_B": 32}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_B": 32}, num_warps=8, num_stages=3),
+    triton.Config({"BLOCK_B": 64}, num_warps=8, num_stages=3),
+]
+
+@triton.autotune(
+    configs=AUTOTUNE_CONFIGS,
+    key=["B", "C", "G", "NBLOCK_B"],
+)
 @triton.jit
-def _gn_lrelu_add_kernel(
-    x_ptr,        # input pointer (B, C) row-major
-    gamma_ptr,    # scale (C,)
-    beta_ptr,     # bias (C,)
-    out_ptr,      # output pointer (B, C)
-    B,            # batch size (python int)
-    C,            # num channels (python int)
-    num_groups,   # number of groups (python int)
-    eps,          # float eps for numerical stability
-    negative_slope,  # float for LeakyReLU
-    BLOCK_B: tl.constexpr,   # rows per program
-    BLOCK_G: tl.constexpr,   # groups per program
-    BLOCK_CH: tl.constexpr,  # channels per group (channels_per_group)
+def _gn_lrelu_kernel(
+    inp_ptr,            # input pointer (B, C)
+    out_ptr,            # output pointer (B, C)
+    gamma_ptr,          # gamma pointer (C,)
+    beta_ptr,           # beta pointer (C,)
+    B,                  # batch size
+    C,                  # num channels
+    G,                  # num groups
+    NBLOCK_B,           # number of blocks along batch dim (ceildiv(B, BLOCK_B))
+    eps,                # eps for groupnorm
+    neg_slope,          # leaky relu negative slope
+    BLOCK_C: tl.constexpr,  # group size (constexpr)
+    BLOCK_B: tl.constexpr   # batch tile size (constexpr)
 ):
-    pid_c = tl.program_id(0)  # group-block index (each program handles BLOCK_G groups)
-    pid_b = tl.program_id(1)  # batch-block index (each program handles BLOCK_B rows)
-
-    # batch rows handled by this program
-    row_base = pid_b * BLOCK_B
-    offs_b = tl.arange(0, BLOCK_B)                       # constexpr
-    rows = row_base + offs_b
-    mask_b = rows < B                                    # shape [BLOCK_B]
-
-    # for each group handled by this program
-    group_base = pid_c * BLOCK_G
-    offs_ch = tl.arange(0, BLOCK_CH)                     # channels per group (constexpr)
-    # Precompute row_offsets to linearize indexing: rows[:, None] * C
-    row_offsets = rows[:, None] * C                      # shape [BLOCK_B, 1]
-
-    # Loop over the groups handled by this program (BLOCK_G is constexpr so this loop is unrolled)
-    for gi in range(0, BLOCK_G):
-        group_id = group_base + gi
-        # Guard: only process valid groups
-        if group_id < num_groups:
-            ch_base = group_id * BLOCK_CH
-            ch_idx = ch_base + offs_ch                     # shape [BLOCK_CH]
-            mask_ch = ch_idx < C                            # shape [BLOCK_CH]
-
-            # linearized column offsets broadcasted across rows
-            col_offsets = ch_idx[None, :]                   # shape [1, BLOCK_CH]
-            idx = row_offsets + col_offsets                 # shape [BLOCK_B, BLOCK_CH]
-
-            # combined mask for loads/stores
-            mask = mask_b[:, None] & mask_ch[None, :]       # shape [BLOCK_B, BLOCK_CH]
-
-            # load x tile (masked)
-            x_tile = tl.load(x_ptr + idx, mask=mask, other=0.0)  # shape [BLOCK_B, BLOCK_CH]
-
-            # compute number of valid channels in this group (scalar)
-            count_ch = tl.sum(tl.where(mask_ch, 1.0, 0.0))  # scalar
-            # inv_count per row (zero for fully-padded rows)
-            inv_count = tl.where(mask_b, 1.0 / tl.where(count_ch > 0.0, count_ch, 1.0), 0.0)  # [BLOCK_B]
-
-            # compute sums and sums-of-squares using masked load (invalid lanes already zero)
-            sum_x = tl.sum(x_tile, 1)                    # [BLOCK_B]
-            sum_x2 = tl.sum(x_tile * x_tile, 1)          # [BLOCK_B]
-
-            # mean and variance per row
-            mean = sum_x * inv_count                     # [BLOCK_B]
-            var = sum_x2 * inv_count - mean * mean      # [BLOCK_B]
-            invstd = tl.rsqrt(var + eps)                 # [BLOCK_B]
-
-            # normalize: (x - mean) * invstd
-            normalized = (x_tile - mean[:, None]) * invstd[:, None]  # [BLOCK_B, BLOCK_CH]
-
-            # load affine params for this group's channels and broadcast to rows
-            g_vals = tl.load(gamma_ptr + ch_idx, mask=mask_ch, other=1.0)  # [BLOCK_CH]
-            b_vals = tl.load(beta_ptr + ch_idx, mask=mask_ch, other=0.0)   # [BLOCK_CH]
-
-            g_vals = g_vals[None, :]  # [1, BLOCK_CH]
-            b_vals = b_vals[None, :]  # [1, BLOCK_CH]
-
-            # affine transform
-            out_vals = normalized * g_vals + b_vals
-
-            # LeakyReLU
-            out_vals = tl.where(out_vals >= 0.0, out_vals, out_vals * negative_slope)
-
-            # final elementwise add x + x => multiply by 2
-            out_vals = out_vals * 2.0
-
-            # store result (masked)
-            tl.store(out_ptr + idx, out_vals, mask=mask)
-
-
-def triton_groupnorm_lrelu_add(x: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor, num_groups: int, eps: float, negative_slope: float):
     """
-    Wrapper to launch the Triton kernel that fuses GroupNorm, LeakyReLU, and doubling (x + x).
-    x: (B, C)
-    gamma, beta: (C,)
-    num_groups: number of groups for GroupNorm (must divide C)
+    Each Triton program handles one (group_idx, batch_block) tile:
+      - group_idx selects which group of channels is processed (size BLOCK_C)
+      - batch_block selects a contiguous block of batch rows (size BLOCK_B)
+
+    The kernel computes mean+var across the BLOCK_C channels for each sample in the batch block,
+    applies scale/shift (fused), LeakyReLU, and writes result. The final doubling (x+x) is
+    pre-folded into gamma and beta on host side to avoid an extra per-element op.
     """
-    assert x.is_cuda and gamma.is_cuda and beta.is_cuda, "All tensors must be on CUDA."
+
+    pid = tl.program_id(0)
+    # decode (group_idx, block_b)
+    group_idx = pid // NBLOCK_B
+    block_b = pid - group_idx * NBLOCK_B
+    b_start = block_b * BLOCK_B
+
+    c_start = group_idx * BLOCK_C
+    offs_c = c_start + tl.arange(0, BLOCK_C)
+    mask_c = offs_c < C
+
+    # Load gamma and beta for this group (masked)
+    gamma = tl.load(gamma_ptr + offs_c, mask=mask_c, other=1.0)
+    beta = tl.load(beta_ptr + offs_c, mask=mask_c, other=0.0)
+
+    # Process a BLOCK_B x BLOCK_C tile in one shot (vectorized over the batch-tile)
+    # Build row and channel offsets for the 2D tile
+    offs_b = b_start + tl.arange(0, BLOCK_B)                # (BLOCK_B,)
+    mask_b = offs_b < B                                     # (BLOCK_B,)
+    inp_offs_b = offs_b[:, None] * C                        # (BLOCK_B, 1)
+    inp_offs_c = offs_c[None, :]                            # (1, BLOCK_C)
+    inp_offsets = inp_offs_b + inp_offs_c                   # (BLOCK_B, BLOCK_C)
+    mask2 = mask_b[:, None] & mask_c[None, :]               # (BLOCK_B, BLOCK_C)
+
+    # load tile (BLOCK_B, BLOCK_C)
+    x = tl.load(inp_ptr + inp_offsets, mask=mask2, other=0.0)
+
+    # per-row mean and variance (reduce over channels -> axis=1)
+    s = tl.sum(x, axis=1)                                   # (BLOCK_B,)
+    mean = s / BLOCK_C                                      # (BLOCK_B,)
+
+    x_centered = x - mean[:, None]                          # broadcast to (BLOCK_B, BLOCK_C)
+    sq = x_centered * x_centered
+    var = tl.sum(sq, axis=1) / BLOCK_C                      # (BLOCK_B,)
+
+    invstd = 1.0 / tl.sqrt(var + eps)                       # (BLOCK_B,)
+
+    # fuse scale and shift with proper broadcasting across rows
+    scale = invstd[:, None] * gamma[None, :]                # (BLOCK_B, BLOCK_C)
+    shift = beta[None, :] - mean[:, None] * scale           # (BLOCK_B, BLOCK_C)
+    out = x * scale + shift
+
+    # LeakyReLU (broadcasting works across the tile)
+    out = tl.where(out > 0.0, out, out * neg_slope)
+
+    # store the whole tile
+    out_offsets = inp_offsets
+    tl.store(out_ptr + out_offsets, out, mask=mask2)
+
+
+def triton_groupnorm_leaky_relu_double(x: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor,
+                                       num_groups: int, eps: float, negative_slope: float):
+    """
+    Host wrapper that:
+      - ensures contiguity,
+      - folds the final doubling (x + x) into gamma and beta,
+      - launches the autotuned Triton kernel.
+    """
+    assert x.is_cuda and gamma.is_cuda and beta.is_cuda, "Tensors must be on CUDA."
     assert x.dtype == torch.float32 and gamma.dtype == torch.float32 and beta.dtype == torch.float32, "Only fp32 supported."
 
-    x = x.contiguous()
-    gamma = gamma.contiguous()
-    beta = beta.contiguous()
-
     B, C = x.shape
-    assert C % num_groups == 0, "num_groups must divide channels"
-    channels_per_group = C // num_groups
+    G = num_groups
+    assert C % G == 0, "num_channels must be divisible by num_groups"
+    group_size = C // G
 
-    # Tiling parameters chosen to increase work per program and reduce kernel-launch overhead.
-    # BLOCK_B: rows per program; BLOCK_G: groups per program; BLOCK_CH: channels per group (constexpr)
-    BLOCK_B = 16
-    BLOCK_G = 4
-    BLOCK_CH = channels_per_group
+    # make contiguous and prepare output
+    x_contig = x.contiguous()
+    out = torch.empty_like(x_contig)
 
-    # Grid: number of group-blocks, number of batch-blocks
-    grid = ( (num_groups + BLOCK_G - 1) // BLOCK_G, (B + BLOCK_B - 1) // BLOCK_B )
+    # fold doubling into gamma and beta to avoid extra per-element arithmetic in kernel
+    gamma_contig = (gamma.contiguous() * 2.0)
+    beta_contig = (beta.contiguous() * 2.0)
 
-    out = torch.empty_like(x)
-    # Launch kernel. Provide constexpr args BLOCK_B, BLOCK_G, BLOCK_CH.
-    _gn_lrelu_add_kernel[grid](
-        x, gamma, beta, out,
-        B, C, num_groups, float(eps), float(negative_slope),
-        BLOCK_B=BLOCK_B, BLOCK_G=BLOCK_G, BLOCK_CH=BLOCK_CH
+    # compute NBLOCK_B given the BLOCK_B chosen by autotuner (we don't know it here, but
+    # grid size uses NBLOCK_B computed with the chosen BLOCK_B during kernel launch).
+    # For grid we supply G * NBLOCK_B where NBLOCK_B = ceildiv(B, BLOCK_B)
+    # We pass BLOCK_C=group_size and BLOCK_B as constexpr via autotuned configs.
+    # To compute NBLOCK_B generically we set it to ceildiv(B, smallest possible BLOCK_B)=B/64 ceil max,
+    # but the autoscheduler uses the key and will provide proper mapping. To be safe, compute for BLOCK_B=1 and
+    # pass actual NBLOCK_B; Triton will accept a NBLOCK_B value larger than needed (unused programs masked).
+    # Simpler: choose NBLOCK_B = ceildiv(B, 1) = B (safe upper bound). However, that would create too large grid.
+    # Correct approach: compute NBLOCK_B for a typical BLOCK_B value (we'll compute using 1 and let unreachable pids mask).
+    # Instead, we compute NBLOCK_B using the minimum BLOCK_B in the configs (8) to keep grid reasonable.
+    min_block_b = 8
+    NBLOCK_B = (B + min_block_b - 1) // min_block_b
+
+    # Grid: one program per (group, batch-block) with NBLOCK_B based on min BLOCK_B.
+    # Triton's autotuner will pick an actual BLOCK_B from configs; extra program ids (if any) will be masked inside kernel.
+    grid = (G * NBLOCK_B,)
+
+    # Launch kernel with BLOCK_C set to group_size (constexpr)
+    _gn_lrelu_kernel[grid](
+        x_contig, out, gamma_contig, beta_contig,
+        B, C, G, NBLOCK_B, eps, negative_slope,
+        BLOCK_C=group_size
     )
+
     return out
 
 
 class ModelNew(nn.Module):
     """
-    Optimized model that uses a fused Triton kernel to perform GroupNorm, LeakyReLU, and the final elementwise add.
-    The linear layer (fc) is left as a standard PyTorch nn.Linear (uses cuBLAS), while the subsequent ops are fused.
+    Optimized Model that uses PyTorch's fast Linear (cuBLAS/cuDNN) for the matmul + bias,
+    and a Triton fused kernel for GroupNorm + LeakyReLU + final doubling (x + x folded into params).
     """
     def __init__(self, input_size, hidden_size, num_groups, eps=1e-5, negative_slope=0.01):
         super(ModelNew, self).__init__()
         self.fc = nn.Linear(input_size, hidden_size)
-        self.num_groups = num_groups
-        self.eps = eps
-        self.negative_slope = negative_slope
-
-        # GroupNorm affine parameters (per-channel)
-        self.weight = nn.Parameter(torch.ones(hidden_size, dtype=torch.float32))
-        self.bias = nn.Parameter(torch.zeros(hidden_size, dtype=torch.float32))
+        # keep GroupNorm module only to hold learnable parameters (weight, bias) and metadata
+        self.gn = nn.GroupNorm(num_groups=num_groups, num_channels=hidden_size, eps=eps)
+        self._eps = eps
+        self._negative_slope = negative_slope
 
     def forward(self, x):
-        # x: (B, input_size)
-        x = self.fc(x)  # (B, hidden_size)
-        # fused groupnorm + leakyrelu + add
-        x = triton_groupnorm_lrelu_add(x, self.weight, self.bias, self.num_groups, self.eps, self.negative_slope)
-        return x
+        # 1) linear layer: use optimized PyTorch implementation (cuBLAS/cuDNN)
+        x = self.fc(x)
 
-
-# Keep the same helper functions for input generation as the original script
-batch_size = 1024
-input_size = 8192
-hidden_size = 8192
-num_groups = 512
-
-def get_inputs():
-    return [torch.rand(batch_size, input_size).cuda().float()]
-
-def get_init_inputs():
-    return [input_size, hidden_size, num_groups]
+        # 2) fused GroupNorm + LeakyReLU + doubling via Triton
+        out = triton_groupnorm_leaky_relu_double(
+            x,
+            self.gn.weight,
+            self.gn.bias,
+            num_groups=self.gn.num_groups,
+            eps=self._eps,
+            negative_slope=self._negative_slope,
+        )
+        return out

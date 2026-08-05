@@ -2,137 +2,165 @@ import torch
 import torch.nn as nn
 import triton
 import triton.language as tl
-import math
-
-# Autotune configurations for the Triton kernel
-AUTOTUNE_CONFIGS = [
-    triton.Config({"BLOCK": 64}, num_warps=4, num_stages=2),
-    triton.Config({"BLOCK": 128}, num_warps=4, num_stages=2),
-    triton.Config({"BLOCK": 256}, num_warps=8, num_stages=2),
-]
 
 
-@triton.autotune(
-    configs=AUTOTUNE_CONFIGS,
-    key=['N', 'C', 'D_out', 'H_out', 'W_out'],
-)
 @triton.jit
-def fused_avgpool3d_kernel(
-    inp_ptr,           # pointer to input tensor (N, C, D, H, W)
-    out_ptr,           # pointer to output tensor (N, C, D_out, H_out, W_out)
-    N, C, D, H, W,     # input dims
-    D_out, H_out, W_out,  # output dims (expected D_out = D // 4, etc.)
+def _bn_double_avgpool_kernel(
+    x_ptr,           # input tensor pointer (N, C, D_in, H_in, W_in)
+    out_ptr,         # output tensor pointer (N, C, D_out, H_out, W_out)
+    N, C,
+    D_in, H_in, W_in,
+    D_out, H_out, W_out,
+    scale_ptr,       # per-channel scale (C,)
+    shift_ptr,       # per-channel shift (C,)
+    total_elems,     # total number of output elements
     BLOCK: tl.constexpr
 ):
-    """
-    This kernel computes the effect of two successive AvgPool3d(kernel_size=2, stride=2)
-    operations by averaging over 4x4x4 blocks of the input tensor. Only full 4-blocks
-    are processed; this matches the behavior of two sequential non-overlapping kernel=2 pools
-    (i.e., final output dims are floor(D/4), floor(H/4), floor(W/4)).
-    Grid dimensions:
-      - program_id(0): iterates over (N * C * D_out * H_out)
-      - program_id(1): iterates over blocks covering W_out with BLOCK elements per program
-    """
-    pid0 = tl.program_id(0)
-    pid1 = tl.program_id(1)
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < total_elems
+    # compute multi-d indices from flattened output index
+    idx = offs
+    ow = idx % W_out
+    idx = idx // W_out
+    oh = idx % H_out
+    idx = idx // H_out
+    od = idx % D_out
+    idx = idx // D_out
+    c = idx % C
+    n = idx // C
 
-    # Decompose pid0 into n, c, dz_out, dy_out
-    # total per n = C * D_out * H_out
-    total_per_n = C * D_out * H_out
-    n = pid0 // total_per_n
-    rem0 = pid0 % total_per_n
-    c = rem0 // (D_out * H_out)
-    rem1 = rem0 % (D_out * H_out)
-    dz = rem1 // H_out
-    dy = rem1 % H_out
+    # base input indices (each final output corresponds to 4x4x4 block in input)
+    base_z = od * 4
+    base_y = oh * 4
+    base_x = ow * 4
 
-    # w positions handled by this program (vector)
-    w_idx = pid1 * BLOCK + tl.arange(0, BLOCK)
-    mask_w = w_idx < W_out
+    # initialize accumulator
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
 
-    # compute base coordinates in the input (start of the 4x4x4 block)
-    z_base = dz * 4
-    y_base = dy * 4
-    x_base = w_idx * 4  # vector of starting x indices for each output position handled
-
-    # Initialize accumulator
-    acc = tl.zeros((BLOCK,), dtype=tl.float32)
-
-    # Sum over 4x4x4 block
-    # Note: For valid outputs (w_idx < W_out, dy < H_out, dz < D_out) the full 4x4x4 block is inside input bounds
-    for dz_i in range(4):
-        z = z_base + dz_i  # scalar
-        for dy_i in range(4):
-            y = y_base + dy_i  # scalar
-            # For the x dimension we have a vector x_base + dx
-            for dx_i in range(4):
-                x = x_base + dx_i  # vector of x indices
-                # Compute flattened input offsets:
-                # offset = ((((n * C + c) * D + z) * H + y) * W) + x
-                offs = (((n * C + c) * D + z) * H + y) * W + x
-                vals = tl.load(inp_ptr + offs, mask=mask_w, other=0.0)
+    # Loop over 4x4x4 block
+    for dz in range(4):
+        iz = base_z + dz
+        mask_z = iz < D_in
+        for dy in range(4):
+            iy = base_y + dy
+            mask_y = iy < H_in
+            for dx in range(4):
+                ix = base_x + dx
+                mask_x = ix < W_in
+                # compute input flat index: (((n*C + c)*D_in + iz)*H_in + iy)*W_in + ix
+                inp_index = (((n * C + c) * D_in + iz) * H_in + iy) * W_in + ix
+                # load with mask
+                valid = mask & mask_z & mask_y & mask_x
+                vals = tl.load(x_ptr + inp_index, mask=valid, other=0.0)
                 acc += vals
 
-    # Average over 64 elements (4*4*4)
-    out_vals = acc * (1.0 / 64.0)
+    # divide by 64 (4*4*4)
+    out_vals = acc / 64.0
 
-    # Compute output flattened offsets: ((((n * C + c) * D_out + dz) * H_out + dy) * W_out) + w_idx
-    out_offs = (((n * C + c) * D_out + dz) * H_out + dy) * W_out + w_idx
-    tl.store(out_ptr + out_offs, out_vals, mask=mask_w)
+    # load per-channel scale and shift
+    scale = tl.load(scale_ptr + c, mask=mask, other=1.0)
+    shift = tl.load(shift_ptr + c, mask=mask, other=0.0)
+
+    out = out_vals * scale + shift
+
+    # compute output flat index to store
+    out_index = offs  # already the flattened index into output
+    tl.store(out_ptr + out_index, out, mask=mask)
 
 
-def triton_fused_avgpool3d(x: torch.Tensor):
+def triton_bn_double_avgpool(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor):
     """
-    Wrapper that runs the fused 2x sequential avg pooling (kernel=2, stride=2 twice)
-    as a single 4x4x4 avg pooling over complete blocks using a Triton kernel.
+    x: (N, C, D_in, H_in, W_in) CUDA float32 tensor
+    scale, shift: (C,) CUDA float32 tensors
+    Returns:
+      out: (N, C, D_out, H_out, W_out) CUDA float32 tensor
+    The function applies BatchNorm affine (using provided scale/shift) and two consecutive AvgPool3d(kernel_size=2) fused.
     """
-    assert x.is_cuda, "Input must be on CUDA"
-    assert x.dtype == torch.float32, "This fused kernel expects fp32 inputs"
-    x = x.contiguous()
-    N, C, D, H, W = x.shape
+    assert x.is_cuda and scale.is_cuda and shift.is_cuda, "Inputs must be CUDA tensors"
+    assert x.dtype == torch.float32 and scale.dtype == torch.float32 and shift.dtype == torch.float32
 
-    # Output dims: only full 4-blocks are considered (same behavior as two non-overlapping 2x pools)
-    D_out = D // 4
-    H_out = H // 4
-    W_out = W // 4
+    N, C, D_in, H_in, W_in = x.shape
 
-    if D_out == 0 or H_out == 0 or W_out == 0:
-        # Fallback to PyTorch (input too small for fused 4-block pooling)
-        x1 = nn.AvgPool3d(kernel_size=2)(x)
-        x2 = nn.AvgPool3d(kernel_size=2)(x1)
-        return x2
+    # compute sizes after two AvgPool3d(kernel_size=2, stride=2)
+    D1 = (D_in - 2) // 2 + 1
+    H1 = (H_in - 2) // 2 + 1
+    W1 = (W_in - 2) // 2 + 1
 
-    out = x.new_empty((N, C, D_out, H_out, W_out), dtype=torch.float32)
+    D_out = (D1 - 2) // 2 + 1
+    H_out = (H1 - 2) // 2 + 1
+    W_out = (W1 - 2) // 2 + 1
 
-    # Grid: (N * C * D_out * H_out, ceil_div(W_out, BLOCK))
-    def grid(meta):
-        return (N * C * D_out * H_out, (W_out + meta['BLOCK'] - 1) // meta['BLOCK'])
+    out = torch.empty((N, C, D_out, H_out, W_out), device=x.device, dtype=x.dtype)
 
-    fused_avgpool3d_kernel[grid](
+    total_elems = out.numel()
+    if total_elems == 0:
+        return out
+
+    BLOCK = 256
+    grid = ( (total_elems + BLOCK - 1) // BLOCK, )
+
+    _bn_double_avgpool_kernel[grid](
         x, out,
-        N, C, D, H, W,
-        D_out, H_out, W_out
+        N, C,
+        D_in, H_in, W_in,
+        D_out, H_out, W_out,
+        scale, shift,
+        total_elems,
+        BLOCK=BLOCK
     )
     return out
 
 
 class ModelNew(nn.Module):
     """
-    Optimized model that uses the original ConvTranspose3d and BatchNorm3d,
-    but replaces the two sequential AvgPool3d(kernel_size=2) calls with a
-    single fused Triton kernel that averages over 4x4x4 blocks where possible.
+    Optimized model: keep ConvTranspose3d, but fuse BatchNorm (eval-style affine using running stats)
+    with two AvgPool3d(kernel_size=2) operations into a single Triton kernel.
     """
     def __init__(self, in_channels, out_channels, kernel_size, stride, padding, bias_shape):
         super(ModelNew, self).__init__()
+        # keep conv transpose to leverage highly-optimized cuDNN implementation
         self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding)
+        # keep BatchNorm3d module to hold parameters/state
         self.batch_norm = nn.BatchNorm3d(out_channels)
-        # keep the original avg-pool modules for compatibility (not used in forward)
-        self.avg_pool1 = nn.AvgPool3d(kernel_size=2)
-        self.avg_pool2 = nn.AvgPool3d(kernel_size=2)
 
     def forward(self, x):
-        x = self.conv_transpose(x)
-        x = self.batch_norm(x)
-        # Use fused Triton kernel to replace two sequential avg pools
-        x = triton_fused_avgpool3d(x)
-        return x
+        # perform conv transpose using PyTorch (cuDNN)
+        x = self.conv_transpose(x)  # shape (N, C, D_in, H_in, W_in)
+
+        # prepare per-channel scale and shift using appropriate stats
+        # - In eval mode, use running_mean/running_var (as affine is deterministic)
+        # - In training mode, use batch statistics computed from the current activation x
+        bn = self.batch_norm
+        device = x.device
+        dtype = x.dtype
+        C = x.shape[1]
+
+        if bn.affine:
+            weight = bn.weight.detach().to(device=device, dtype=dtype)
+            bias = bn.bias.detach().to(device=device, dtype=dtype)
+        else:
+            weight = torch.ones(C, device=device, dtype=dtype)
+            bias = torch.zeros(C, device=device, dtype=dtype)
+
+        eps = bn.eps
+
+        if bn.training:
+            # compute batch statistics on the activation produced by conv_transpose
+            # BatchNorm3d computes mean/var over (N, D, H, W) for each channel
+            batch_mean = x.mean(dim=(0, 2, 3, 4))
+            batch_var = x.var(dim=(0, 2, 3, 4), unbiased=False)
+            stats_mean = batch_mean.to(device=device, dtype=dtype)
+            stats_var = batch_var.to(device=device, dtype=dtype)
+        else:
+            # eval mode: use running stats
+            stats_mean = bn.running_mean.detach().to(device=device, dtype=dtype)
+            stats_var = bn.running_var.detach().to(device=device, dtype=dtype)
+
+        # scale and shift such that y = scale * x + shift
+        scale = weight / torch.sqrt(stats_var + eps)
+        shift = bias - stats_mean * scale
+
+        # call fused Triton kernel (batch-norm affine + two avg pools)
+        out = triton_bn_double_avgpool(x, scale.contiguous(), shift.contiguous())
+        return out

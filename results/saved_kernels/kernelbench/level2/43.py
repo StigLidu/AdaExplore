@@ -3,174 +3,194 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
-# Autotune configurations for the max-pool kernel.
-# Use BLOCK sizes aligned to typical cache/coalescing boundaries and expose ROWS_PER_PROG
-# so the autotuner can pick how many rows each program handles. Added larger/wider
-# configurations for the A6000 memory-bound regime.
-AUTOTUNE_MAXPOOL = [
-    triton.Config({"BLOCK": 64,  "ROWS_PER_PROG": 8},  num_warps=4,  num_stages=2),
-    triton.Config({"BLOCK": 128, "ROWS_PER_PROG": 8},  num_warps=4,  num_stages=2),
-    triton.Config({"BLOCK": 256, "ROWS_PER_PROG": 4},  num_warps=8,  num_stages=2),
-    triton.Config({"BLOCK": 256, "ROWS_PER_PROG": 4},  num_warps=8,  num_stages=3),
-    triton.Config({"BLOCK": 512, "ROWS_PER_PROG": 2},  num_warps=16, num_stages=3),
-    triton.Config({"BLOCK": 512, "ROWS_PER_PROG": 4},  num_warps=16, num_stages=3),
-]
-
-@triton.autotune(
-    configs=AUTOTUNE_MAXPOOL,
-    key=["B", "C", "out_D", "out_H", "out_W"]
-)
+# Fused Triton kernel that performs 2x2x2 max-pooling (stride=2),
+# followed by channel-wise logsumexp and ReLU.
+# Input layout: (B, C, D, H, W) flattened
+# Output layout: (B, 1, Dp, Hp, Wp) flattened
 @triton.jit
-def _maxpool3d_kernel(
-    inp,              # input tensor pointer (N, C, D, H, W)
-    out,              # output tensor pointer (N, C, out_D, out_H, out_W)
-    B, C, D, H, W,    # input dims
-    out_D, out_H, out_W,  # output spatial dims
-    n_rows,           # = B * C * out_D * out_H
-    BLOCK: tl.constexpr,
-    ROWS_PER_PROG: tl.constexpr
+def _fused_pool_lse_relu_kernel(
+    inp_ptr,            # pointer to input tensor (B, C, D, H, W) flattened
+    out_ptr,            # pointer to output tensor (B, 1, Dp, Hp, Wp) flattened
+    B, C,               # batch, channels
+    D, H, W,            # input spatial dims (unpooled)
+    Dp, Hp, Wp,         # pooled spatial dims (Dp = D//2, ...)
+    stride_c,           # stride to move one channel: D*H*W
+    stride_n,           # stride to move one batch: C*D*H*W
+    NPOS,               # total number of pooled positions = B * Dp * Hp * Wp
+    NEG_INF,            # very negative constant for masked loads
+    BLOCK_POS: tl.constexpr,  # number of pooled positions per program (constexpr)
+    BLOCK_C: tl.constexpr,    # channel block size for inner reduction (constexpr)
 ):
-    # We tile the row dimension so each Triton program handles multiple (b, c, od, oh) rows.
-    pid0 = tl.program_id(0)
-    col_block = tl.program_id(1)
+    pid = tl.program_id(0)
+    tile_start = pid * BLOCK_POS
+    offs = tl.arange(0, BLOCK_POS)
+    pos = tile_start + offs
+    mask_pos = pos < NPOS  # active pooled positions
 
-    # Each program processes a contiguous block of output width positions
-    offs = col_block * BLOCK + tl.arange(0, BLOCK)
-    mask_w = offs < out_W
+    # pooled positions per channel
+    CH_SZ_POOLED = Dp * Hp * Wp
+    # compute batch index and pooled-position-in-batch
+    n = pos // CH_SZ_POOLED
+    pos_in_pooled = pos - n * CH_SZ_POOLED
 
-    # Iterate over multiple rows per program to amortize launch overhead.
-    for r in range(ROWS_PER_PROG):
-        row = pid0 * ROWS_PER_PROG + r
-        if row < n_rows:
-            # decode row -> (b, c, od, oh)
-            tmp = row
-            oh = tmp % out_H
-            tmp = tmp // out_H
-            od = tmp % out_D
-            tmp = tmp // out_D
-            c = tmp % C
-            b = tmp // C
+    # decompose pooled index into pd, ph, pw
+    plane = Hp * Wp
+    pd = pos_in_pooled // plane
+    rem = pos_in_pooled - pd * plane
+    ph = rem // Wp
+    pw = rem - ph * Wp
 
-            # input indices (top-left-front corner of the 2x2x2 pooling window)
-            iw = offs * 2  # stride = 2
-            ih = oh * 2
-            id0 = od * 2
+    # base coordinate in unpooled tensor (top-left-front corner of 2x2x2 window)
+    d_base = pd * 2
+    h_base = ph * 2
+    w_base = pw * 2
+    pos_un_base = d_base * (H * W) + h_base * W + w_base
 
-            # compute a base linear index for input at (b, c, id0, ih, 0)
-            # linear_input_base = ((((b * C + c) * D + id0) * H + ih) * W)
-            b_c = b * C + c
-            linear_input_base = (((b_c * D + id0) * H + ih) * W)
+    # base pointer for each pooled position (start of batch + pos_un_base)
+    base_ptr = n * stride_n + pos_un_base  # vector length BLOCK_POS
 
-            # Prepare masks for boundary checks and compute corner masks (vectorized).
-            # width checks: iw and iw+1 must be < W (vector)
-            mask_iw0 = iw < W
-            mask_iw1 = iw + 1 < W
+    # offsets for the 8 elements inside the 2x2x2 pooling window
+    off000 = 0
+    off001 = 1
+    off010 = W
+    off011 = W + 1
+    off100 = H * W
+    off101 = H * W + 1
+    off110 = H * W + W
+    off111 = H * W + W + 1
 
-            # height/depth scalar conditions (broadcasted)
-            has_h0 = (ih < H)
-            has_h1 = (ih + 1) < H
-            has_d0 = (id0 < D)
-            has_d1 = (id0 + 1) < D
+    # Initialize online LSE accumulators: m (max) and s (sum of exp(vals - m))
+    m = tl.full((BLOCK_POS,), NEG_INF, dtype=tl.float32)
+    s = tl.zeros((BLOCK_POS,), dtype=tl.float32)
 
-            # compute addresses for the 8 corners (vectorized over offs) in grouped form
-            base = linear_input_base + iw  # id0, ih0
-            H_stride = W
-            D_stride = H * W
+    # Iterate channels in blocks to control register pressure / occupancy
+    for c0 in range(0, C, BLOCK_C):
+        for c_inner in range(0, BLOCK_C):
+            ch = c0 + c_inner
+            ch_mask = ch < C  # scalar boolean
+            # pointer to beginning of this channel's window for each pooled position
+            ch_ptr = base_ptr + ch * stride_c
+            active = mask_pos & ch_mask  # lanes where this channel & pooled-pos are valid
 
-            # Grouped plane bases:
-            base_id0_ih0 = base                         # id0, ih0
-            base_id0_ih1 = base + H_stride              # id0, ih1
-            base_id1_ih0 = base + D_stride              # id1, ih0
-            base_id1_ih1 = base + D_stride + H_stride   # id1, ih1
+            # load 8 values of the 2x2x2 window and compute per-channel pooled max
+            v0 = tl.load(inp_ptr + ch_ptr + off000, mask=active, other=NEG_INF)
+            v1 = tl.load(inp_ptr + ch_ptr + off001, mask=active, other=NEG_INF)
+            v2 = tl.load(inp_ptr + ch_ptr + off010, mask=active, other=NEG_INF)
+            v3 = tl.load(inp_ptr + ch_ptr + off011, mask=active, other=NEG_INF)
+            v4 = tl.load(inp_ptr + ch_ptr + off100, mask=active, other=NEG_INF)
+            v5 = tl.load(inp_ptr + ch_ptr + off101, mask=active, other=NEG_INF)
+            v6 = tl.load(inp_ptr + ch_ptr + off110, mask=active, other=NEG_INF)
+            v7 = tl.load(inp_ptr + ch_ptr + off111, mask=active, other=NEG_INF)
 
-            # load each plane's two contiguous width elements (iw, iw+1) with masks computed once.
-            neg_inf = -1e9
+            vm = v0
+            vm = tl.maximum(vm, v1)
+            vm = tl.maximum(vm, v2)
+            vm = tl.maximum(vm, v3)
+            vm = tl.maximum(vm, v4)
+            vm = tl.maximum(vm, v5)
+            vm = tl.maximum(vm, v6)
+            vm = tl.maximum(vm, v7)
 
-            mask_row_id0_ih0 = mask_w & has_d0 & has_h0
-            v00 = tl.load(inp + base_id0_ih0,     mask=mask_row_id0_ih0 & mask_iw0, other=neg_inf)
-            v01 = tl.load(inp + base_id0_ih0 + 1, mask=mask_row_id0_ih0 & mask_iw1, other=neg_inf)
+            # To avoid invalid lanes interfering, set vm_eff = m for inactive lanes
+            vm_eff = tl.where(active, vm, m)
 
-            mask_row_id0_ih1 = mask_w & has_d0 & has_h1
-            v10 = tl.load(inp + base_id0_ih1,     mask=mask_row_id0_ih1 & mask_iw0, other=neg_inf)
-            v11 = tl.load(inp + base_id0_ih1 + 1, mask=mask_row_id0_ih1 & mask_iw1, other=neg_inf)
+            # Online numerically-stable update of log-sum-exp accumulators:
+            # If vm_eff > m: s_new = 1 + s * exp(m - vm_eff)
+            # else: s_new = s + exp(vm_eff - m)
+            greater = vm_eff > m
+            exp_m_vm = tl.exp(m - vm_eff)
+            exp_vm_m = tl.exp(vm_eff - m)
+            s_new = tl.where(greater, 1.0 + s * exp_m_vm, s + exp_vm_m)
 
-            mask_row_id1_ih0 = mask_w & has_d1 & has_h0
-            v20 = tl.load(inp + base_id1_ih0,     mask=mask_row_id1_ih0 & mask_iw0, other=neg_inf)
-            v21 = tl.load(inp + base_id1_ih0 + 1, mask=mask_row_id1_ih0 & mask_iw1, other=neg_inf)
+            # commit updates only on active lanes
+            s = tl.where(active, s_new, s)
+            m = tl.where(active, tl.maximum(m, vm), m)
 
-            mask_row_id1_ih1 = mask_w & has_d1 & has_h1
-            v30 = tl.load(inp + base_id1_ih1,     mask=mask_row_id1_ih1 & mask_iw0, other=neg_inf)
-            v31 = tl.load(inp + base_id1_ih1 + 1, mask=mask_row_id1_ih1 & mask_iw1, other=neg_inf)
+    # finalize logsumexp and apply ReLU
+    lse = m + tl.log(s)
+    zero = tl.zeros((BLOCK_POS,), dtype=tl.float32)
+    out_val = tl.maximum(lse, zero)
 
-            # map to canonical corner names
-            v000 = v00
-            v001 = v01
-            v010 = v10
-            v011 = v11
-            v100 = v20
-            v101 = v21
-            v110 = v30
-            v111 = v31
-
-            # compute max across the 8 values
-            m01 = tl.maximum(v000, v001)
-            m23 = tl.maximum(v010, v011)
-            m45 = tl.maximum(v100, v101)
-            m67 = tl.maximum(v110, v111)
-
-            m0123 = tl.maximum(m01, m23)
-            m4567 = tl.maximum(m45, m67)
-            m = tl.maximum(m0123, m4567)
-
-            # Write out to output tensor
-            out_base = (((b_c * out_D + od) * out_H + oh) * out_W)
-            out_addr = out + out_base + offs
-            tl.store(out_addr, m, mask=mask_w)
+    # compute output pointers and store (output layout: (B,1,Dp,Hp,Wp))
+    out_stride_n = CH_SZ_POOLED
+    out_ptrs = n * out_stride_n + pos_in_pooled
+    tl.store(out_ptr + out_ptrs, out_val, mask=mask_pos)
 
 
-def triton_maxpool3d(x: torch.Tensor, kernel_size=2, stride=2):
+def triton_fused_pool_lse_relu(x: torch.Tensor):
     """
-    Triton-based 3D max pool for kernel_size=2, stride=2.
-    Accepts x of shape (B, C, D, H, W) and returns pooled tensor of shape (B, C, D//2, H//2, W//2).
+    Wrapper for the Triton kernel that fuses 2x2x2 maxpool (stride=2) and channel logsumexp+ReLU.
+    Input: x: (B, C, D, H, W), cuda, float32
+    Output: (B, 1, Dp, Hp, Wp), cuda, float32
     """
     assert x.is_cuda, "Input must be on CUDA"
-    assert x.dtype == torch.float32, "Only float32 supported"
-    assert kernel_size == 2 and stride == 2, "This Triton kernel supports only kernel_size=2 and stride=2"
-
+    assert x.dtype == torch.float32, "Input must be float32"
     x = x.contiguous()
     B, C, D, H, W = x.shape
-    out_D = D // 2
-    out_H = H // 2
-    out_W = W // 2
 
-    out = torch.empty((B, C, out_D, out_H, out_W), device=x.device, dtype=x.dtype)
+    Dp = D // 2
+    Hp = H // 2
+    Wp = W // 2
 
-    n_rows = B * C * out_D * out_H
-    # grid: (rows_groups, num_w_tiles_along_W) -- we tile rows so each program handles multiple rows
-    grid = lambda meta: ((n_rows + meta["ROWS_PER_PROG"] - 1) // meta["ROWS_PER_PROG"], (out_W + meta["BLOCK"] - 1) // meta["BLOCK"])
+    out = torch.empty((B, 1, Dp, Hp, Wp), device=x.device, dtype=x.dtype)
 
-    _maxpool3d_kernel[grid](
-        x, out,
-        B, C, D, H, W,
-        out_D, out_H, out_W,
-        n_rows
+    NEG_INF = float(-1e20)
+
+    # Tunable parameters:
+    # Increase BLOCK_POS to improve coalesced loads and reduce launch overhead.
+    # Choose BLOCK_C to balance register pressure. For C=64, BLOCK_C=16 gives 4 iterations.
+    BLOCK_POS = 2048  # must be multiple of 32
+    BLOCK_C = 16
+
+    stride_c = D * H * W
+    stride_n = C * stride_c
+    NPOS = B * Dp * Hp * Wp
+
+    grid = ((NPOS + BLOCK_POS - 1) // BLOCK_POS,)
+
+    _fused_pool_lse_relu_kernel[grid](
+        x,
+        out,
+        B, C,
+        D, H, W,
+        Dp, Hp, Wp,
+        stride_c, stride_n, NPOS,
+        NEG_INF,
+        BLOCK_POS=BLOCK_POS,
+        BLOCK_C=BLOCK_C,
     )
     return out
 
 
 class ModelNew(nn.Module):
     """
-    Optimized model that uses a Triton-based 3D max-pool kernel for the MaxPool3d operation,
-    while keeping nn.Conv3d for the convolution and using PyTorch for logsumexp + ReLU.
+    Optimized model: use PyTorch Conv3d, and a fused Triton kernel that
+    performs 2x2x2 max-pool + channel logsumexp + ReLU in one pass.
     """
     def __init__(self, in_channels, out_channels, kernel_size, stride, padding):
         super(ModelNew, self).__init__()
+        # keep convolution in PyTorch (highly optimized)
         self.conv = nn.Conv3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding)
 
-    def forward(self, x):
-        # x: (B, in_channels, D, H, W)
-        x = self.conv(x)                       # (B, out_channels, D, H, W)
-        x = triton_maxpool3d(x, kernel_size=2, stride=2)  # (B, out_channels, D//2, H//2, W//2)
-        x = torch.logsumexp(x, dim=1, keepdim=True)      # (B, 1, D//2, H//2, W//2)
-        x = torch.relu(x)
+    def forward(self, x: torch.Tensor):
+        x = self.conv(x)
+        # fused pooling + reduction + activation
+        x = triton_fused_pool_lse_relu(x)
         return x
+
+
+# Keep helpers for compatibility
+batch_size = 4
+in_channels = 32
+out_channels = 64
+depth, height, width = 32, 128, 128
+kernel_size = 3
+stride = 1
+padding = 1
+
+def get_inputs():
+    # return a CUDA tensor ready for the Triton kernel
+    return [torch.rand(batch_size, in_channels, depth, height, width).cuda().float()]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, stride, padding]

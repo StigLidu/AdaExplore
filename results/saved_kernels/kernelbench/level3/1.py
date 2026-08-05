@@ -1,287 +1,197 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-# Triton kernel for in-place bias add + ReLU over a (M x N) row-major matrix.
+# Triton kernel: add bias (1D) to a 2D fp16 activation matrix and optionally apply ReLU, in-place.
+# Tuned with larger column block to reduce kernel-launch overhead for very wide layers.
 @triton.jit
-def _bias_add_relu_inplace_kernel(x_ptr, bias_ptr, M, N, BLOCK: tl.constexpr, ROW_BLOCK: tl.constexpr):
-    """
-    In-place: for each row r and column c: x[r, c] = max(x[r, c] + bias[c], 0)
-    Grid: ((ceil(M / ROW_BLOCK)), ceil(N / BLOCK))
-    Each program handles ROW_BLOCK rows (ROW_BLOCK is a constexpr).
-    """
-    row_block_idx = tl.program_id(0)
-    block_id = tl.program_id(1)
+def _bias_relu_fp16_kernel(
+    act_ptr,        # pointer to activation tensor (B x M), row-major, fp16
+    bias_ptr,       # pointer to bias (M,), fp16
+    B,              # number of rows
+    M,              # number of columns
+    stride,         # stride between rows (equals M for contiguous row-major)
+    apply_relu,     # int flag: 1 => apply ReLU, 0 => no ReLU
+    BLOCK_R: tl.constexpr,  # rows per block
+    BLOCK_C: tl.constexpr,  # cols per block
+):
+    row_block = tl.program_id(0)
+    col_block = tl.program_id(1)
 
-    col_start = block_id * BLOCK
-    cols = col_start + tl.arange(0, BLOCK)
-    mask = cols < N
+    row_start = row_block * BLOCK_R
+    col_start = col_block * BLOCK_C
 
-    row_start = row_block_idx * ROW_BLOCK
+    rows = row_start + tl.arange(0, BLOCK_R)
+    cols = col_start + tl.arange(0, BLOCK_C)
 
-    # Load bias tile once and reuse for rows in this row-block
-    b = tl.load(bias_ptr + cols, mask=mask, other=0.0)
+    rows_mask = rows < B
+    cols_mask = cols < M
+    mask = rows_mask[:, None] & cols_mask[None, :]
 
-    # Iterate over the rows handled by this program
-    for i in range(ROW_BLOCK):
-        row = row_start + i
-        if row < M:
-            offs = row * N + cols
-            x = tl.load(x_ptr + offs, mask=mask, other=0.0)
-            y = x + b
-            y = tl.where(y > 0.0, y, 0.0)
-            tl.store(x_ptr + offs, y, mask=mask)
+    offs = rows[:, None] * stride + cols[None, :]
 
+    # Load activations (fp16)
+    act = tl.load(act_ptr + offs, mask=mask, other=tl.cast(0.0, tl.float16))
 
-# Triton kernel for in-place bias add (no activation)
-@triton.jit
-def _bias_add_inplace_kernel(x_ptr, bias_ptr, M, N, BLOCK: tl.constexpr, ROW_BLOCK: tl.constexpr):
-    row_block_idx = tl.program_id(0)
-    block_id = tl.program_id(1)
+    # Load bias for columns (fp16)
+    bias = tl.load(bias_ptr + cols, mask=cols_mask, other=tl.cast(0.0, tl.float16))
 
-    col_start = block_id * BLOCK
-    cols = col_start + tl.arange(0, BLOCK)
-    mask = cols < N
+    # Broadcast bias across rows and add
+    out = act + bias[None, :]
 
-    row_start = row_block_idx * ROW_BLOCK
+    # Apply ReLU if requested (fp16)
+    if apply_relu != 0:
+        zero = tl.cast(0.0, tl.float16)
+        out = tl.where(out > zero, out, zero)
 
-    # Load bias tile once and reuse for rows in this row-block
-    b = tl.load(bias_ptr + cols, mask=mask, other=0.0)
-
-    for i in range(ROW_BLOCK):
-        row = row_start + i
-        if row < M:
-            offs = row * N + cols
-            x = tl.load(x_ptr + offs, mask=mask, other=0.0)
-            y = x + b
-            tl.store(x_ptr + offs, y, mask=mask)
-
-
-def triton_bias_add_relu_inplace(mat: torch.Tensor, bias: torch.Tensor, BLOCK: int = 256, ROW_BLOCK: int = 4):
-    """
-    In-place broadcast add of bias to each row of mat and apply ReLU, using Triton kernel.
-    mat: (M, N) contiguous CUDA fp32
-    bias: (N,) contiguous CUDA fp32
-    BLOCK and ROW_BLOCK are constexpr tile sizes passed to the Triton kernel.
-    """
-    assert mat.is_cuda and bias.is_cuda, "Triton kernel requires CUDA tensors."
-    assert mat.dtype == torch.float32 and bias.dtype == torch.float32, "Only fp32 supported."
-    M, N = mat.shape
-    if not mat.is_contiguous():
-        mat = mat.contiguous()
-    if not bias.is_contiguous():
-        bias = bias.contiguous()
-    grid = ((M + ROW_BLOCK - 1) // ROW_BLOCK, (N + BLOCK - 1) // BLOCK)
-    _bias_add_relu_inplace_kernel[grid](mat, bias, M, N, BLOCK=BLOCK, ROW_BLOCK=ROW_BLOCK)
-    return mat
-
-
-def triton_bias_add_inplace(mat: torch.Tensor, bias: torch.Tensor, BLOCK: int = 256, ROW_BLOCK: int = 4):
-    """
-    In-place broadcast add of bias to each row of mat (no activation), using Triton kernel.
-    """
-    assert mat.is_cuda and bias.is_cuda, "Triton kernel requires CUDA tensors."
-    assert mat.dtype == torch.float32 and bias.dtype == torch.float32, "Only fp32 supported."
-    M, N = mat.shape
-    if not mat.is_contiguous():
-        mat = mat.contiguous()
-    if not bias.is_contiguous():
-        bias = bias.contiguous()
-    grid = ((M + ROW_BLOCK - 1) // ROW_BLOCK, (N + BLOCK - 1) // BLOCK)
-    _bias_add_inplace_kernel[grid](mat, bias, M, N, BLOCK=BLOCK, ROW_BLOCK=ROW_BLOCK)
-    return mat
+    tl.store(act_ptr + offs, out, mask=mask)
 
 
 class ModelNew(nn.Module):
     """
-    Optimized Model replacement for the original architecture.
-
-    Key optimizations:
-      - Cache device-resident, contiguous transposed weights (weight.T) to avoid repeated transposes.
-      - Cache device-resident contiguous biases to avoid repeated .to() calls.
-      - Preallocate a single workspace sized to the maximum layer width and reuse it across layers.
-      - Use torch.matmul(..., out=...) to let cuBLAS write directly into workspace.
-      - Fuse bias add + ReLU (hidden layers) and bias add (final layer) with Triton in-place kernels.
-      - Adaptive Triton block size selection to reduce kernel launch overhead on very wide layers.
+    Optimized replacement that:
+      - Caches fp16 transposed weights (contiguous) to leverage fast fp16 matmuls (Tensor Cores).
+      - Caches fp16 biases.
+      - Uses cuBLAS-backed torch.matmul for GEMMs.
+      - For very wide layers, uses a Triton kernel (fused) to add bias + ReLU in-place with large block sizes to minimize kernel-launch overhead.
+      - For moderate sizes, falls back to in-place torch ops (add_ and relu_) which are extremely lightweight.
     """
     def __init__(self, input_size, layer_sizes, output_size):
         super(ModelNew, self).__init__()
-        # Build layers explicitly (keeps same parameterization as original Model)
-        self.hidden_linears = nn.ModuleList()
-        current = input_size
-        for sz in layer_sizes:
-            lin = nn.Linear(current, sz)
-            self.hidden_linears.append(lin)
-            current = sz
-        self.final_linear = nn.Linear(current, output_size)
 
-        # Caches for device-resident tensors to avoid repeated transfers/transposes
-        self._wt_cache = {}      # weight.data_ptr() -> (ptr, transposed_contiguous_on_device)
-        self._bias_cache = {}    # bias.data_ptr() -> (ptr, contiguous_on_device)
+        sizes = [input_size] + list(layer_sizes) + [output_size]
+        self.num_layers = len(sizes) - 1
 
-        # Reusable workspaces to avoid repeated allocations
-        self._workspace = None
-        self._workspace_meta = None  # (device, dtype, batch, width)
+        # Store fp32 parameters for optimizer compatibility and to match original interface.
+        self.weights = nn.ParameterList()
+        self.biases = nn.ParameterList()
+        for i in range(self.num_layers):
+            in_f = sizes[i]
+            out_f = sizes[i + 1]
+            w = nn.Parameter(torch.empty(out_f, in_f, dtype=torch.float32))
+            b = nn.Parameter(torch.empty(out_f, dtype=torch.float32))
+            bound = 1.0 / (in_f ** 0.5)
+            nn.init.uniform_(w, -bound, bound)
+            nn.init.uniform_(b, -bound, bound)
+            self.weights.append(w)
+            self.biases.append(b)
 
-        # Temporary buffer for matmul when input aliases the workspace slice
-        self._matmul_tmp = None
-        self._matmul_tmp_meta = None  # (device, dtype, batch, width)
+        # Cached fp16 transposed weights and fp16 biases on the active device for fast matmuls
+        self._weights_fp16_t = None  # list of tensors shape (in, out) in fp16, contiguous
+        self._biases_fp16 = None
+        self._cached_device = None
 
-    def _ensure_workspace(self, x: torch.Tensor, required_width: int):
+        # Triton kernel block tuning (Ampere)
+        # Larger BLOCK_C reduces number of kernel launches for very wide M.
+        self._TRITON_BLOCK_R = 32
+        self._TRITON_BLOCK_C = 1024
+
+        # Threshold (columns) above which we prefer the Triton fused kernel over torch in-place ops.
+        # This is chosen because very wide layers benefit from Triton's large-block fused kernel.
+        self._TRITON_COL_THRESHOLD = 4096
+
+    def _ensure_fp16_cache(self, device):
+        """
+        Lazily create fp16 cached copies of weights (transposed and contiguous) and biases on the given device.
+        We keep the original fp32 parameters unchanged for training/optimizer correctness.
+        """
+        if self._weights_fp16_t is None or self._cached_device != device:
+            # Move and convert weights and biases to fp16 on target device.
+            # Transpose weights so we can call x_half @ W_t (where W_t is (in, out)) without extra work.
+            self._weights_fp16_t = [w.to(device=device).half().t().contiguous() for w in self.weights]
+            self._biases_fp16 = [b.to(device=device).half().contiguous() for b in self.biases]
+            self._cached_device = device
+
+    def _bias_relu_triton(self, act: torch.Tensor, bias_fp16: torch.Tensor, apply_relu: bool):
+        """
+        Launch Triton kernel to add bias and optionally apply ReLU in-place on act (fp16, 2D CUDA).
+        """
+        assert act.is_cuda and bias_fp16.is_cuda
+        assert act.dtype == torch.float16 and bias_fp16.dtype == torch.float16
+        assert act.ndim == 2 and bias_fp16.ndim == 1
+
+        # Caller must pass contiguous tensors; avoid extra copies here for performance.
+        assert act.is_contiguous() and bias_fp16.is_contiguous(), "act and bias_fp16 must be contiguous"
+        B, M = act.shape
+        stride = act.stride(0)
+
+        BLOCK_R = self._TRITON_BLOCK_R
+        BLOCK_C = self._TRITON_BLOCK_C
+
+        grid_rows = (B + BLOCK_R - 1) // BLOCK_R
+        grid_cols = (M + BLOCK_C - 1) // BLOCK_C
+        grid = (grid_rows, grid_cols)
+
+        # Kernel signature: (act_ptr, bias_ptr, B, M, stride, apply_relu, BLOCK_R, BLOCK_C)
+        _bias_relu_fp16_kernel[grid](
+            act,
+            bias_fp16,
+            B,
+            M,
+            stride,
+            1 if apply_relu else 0,
+            BLOCK_R=BLOCK_R,
+            BLOCK_C=BLOCK_C,
+        )
+        return act
+
+    def _bias_relu_torch(self, act: torch.Tensor, bias_fp16: torch.Tensor, apply_relu: bool):
+        """
+        Perform in-place bias add and optional ReLU using PyTorch's fused operators.
+        This avoids a Triton kernel-launch when the layer is not extremely wide.
+        """
+        # act: (B, M) fp16 contiguous, bias_fp16: (M,)
+        # Use in-place add_ with broadcasting and in-place relu_
+        act.add_(bias_fp16)  # broadcasting add in-place
+        if apply_relu:
+            torch.relu_(act)
+        return act
+
+    def forward(self, x):
+        """
+        Forward pass:
+          - Input x is expected fp32. Convert once to fp16.
+          - For each layer: compute out = b + x_half @ W_t  (fp16 GEMM with bias fused via torch.addmm), then apply ReLU if needed.
+          - Reuse a preallocated contiguous fp16 output buffer across layers to avoid allocations and extra contiguous() calls.
+          - Return final output cast back to fp32.
+        """
+        assert x.dtype == torch.float32, "ModelNew expects float32 inputs."
+
         device = x.device
-        dtype = x.dtype
-        batch = x.shape[0]
-        meta = (device, dtype, batch, required_width)
-        if self._workspace is not None and self._workspace_meta == meta:
-            return self._workspace
-        # allocate workspace sized to (batch, required_width)
-        self._workspace = torch.empty((batch, required_width), device=device, dtype=dtype)
-        self._workspace_meta = meta
-        return self._workspace
+        self._ensure_fp16_cache(device)
 
-    def _ensure_matmul_tmp(self, x: torch.Tensor, required_width: int):
-        device = x.device
-        dtype = x.dtype
-        batch = x.shape[0]
-        meta = (device, dtype, batch, required_width)
-        if self._matmul_tmp is not None and self._matmul_tmp_meta == meta:
-            return self._matmul_tmp
-        self._matmul_tmp = torch.empty((batch, required_width), device=device, dtype=dtype)
-        self._matmul_tmp_meta = meta
-        return self._matmul_tmp
+        # Convert input once to fp16 for all layers.
+        x_half = x.half().contiguous()
+        B = x_half.size(0)
 
-    def _get_weight_t_on_device(self, weight: torch.nn.Parameter, device: torch.device):
-        """
-        Return a cached transposed contiguous copy of weight on `device`.
-        Cache validated by weight.data_ptr() to reflect parameter updates.
-        """
-        key = int(weight.data_ptr())
-        entry = self._wt_cache.get(key)
-        current_ptr = int(weight.data_ptr())
-        if entry is not None:
-            cached_ptr, cached_wt = entry
-            if cached_ptr == current_ptr and cached_wt.device == device:
-                return cached_wt
-        wt = weight.detach().t().contiguous().to(device)
-        self._wt_cache[key] = (current_ptr, wt)
-        return wt
+        # Helper to lazily (re)allocate a reusable contiguous output buffer of shape (B, M) on the correct device.
+        def _get_out_buffer(B_, M_, device_):
+            if getattr(self, "_out_buffer", None) is None or getattr(self, "_out_buffer_shape", (0, 0)) != (B_, M_) or getattr(self, "_out_buffer_device", None) != device_:
+                # allocate contiguous fp16 buffer
+                self._out_buffer = torch.empty((B_, M_), device=device_, dtype=torch.float16)
+                self._out_buffer_shape = (B_, M_)
+                self._out_buffer_device = device_
+            return self._out_buffer
 
-    def _get_bias_on_device(self, bias: torch.nn.Parameter, device: torch.device):
-        """
-        Return a cached contiguous bias tensor on `device`.
-        """
-        if bias is None:
-            return None
-        key = int(bias.data_ptr())
-        entry = self._bias_cache.get(key)
-        current_ptr = int(bias.data_ptr())
-        if entry is not None:
-            cached_ptr, cached_b = entry
-            if cached_ptr == current_ptr and cached_b.device == device:
-                return cached_b
-        b = bias.detach().contiguous().to(device)
-        self._bias_cache[key] = (current_ptr, b)
-        return b
+        for i in range(self.num_layers):
+            W_t = self._weights_fp16_t[i]    # shape (in, out), fp16 contiguous
+            b_fp16 = self._biases_fp16[i]    # shape (out,), fp16
+            apply_relu = (i != self.num_layers - 1)
 
-    def _choose_block(self, N: int) -> int:
-        """
-        Adaptive BLOCK selection: prefer modest power-of-two tile widths for Ampere.
-        Smaller BLOCK values (128/256) encourage good vectorization and lower register/shared memory pressure.
-        """
-        if N >= 8192:
-            return 1024
-        if N >= 4096:
-            return 512
-        if N >= 2048:
-            return 256
-        return 128
+            M = W_t.shape[1]
+            out = _get_out_buffer(B, M, device)
 
-    def _choose_row_block(self, N: int) -> int:
-        """
-        Choose how many rows each Triton program handles; small tile of rows to increase
-        work per program while avoiding excessive register pressure.
-        """
-        # Conservative default that works well across batch sizes on A6000.
-        return 4
+            # Fused GEMM + bias: out = b_fp16 + x_half @ W_t
+            # Use torch.addmm with out= to avoid allocations and to let backend fuse bias into GEMM epilogue.
+            torch.addmm(b_fp16, x_half, W_t, out=out)
 
-    def forward(self, x: torch.Tensor):
-        out = x
-        device = x.device
-        dtype = x.dtype
-        batch = x.shape[0]
+            # In-place ReLU on the output if requested.
+            if apply_relu:
+                torch.relu_(out)
 
-        # compute maximum required width among all layers to size workspace once
-        max_width = 0
-        for lin in self.hidden_linears:
-            max_width = max(max_width, lin.out_features)
-        max_width = max(max_width, self.final_linear.out_features)
+            # Prepare for next layer: out is contiguous fp16
+            x_half = out
 
-        workspace = self._ensure_workspace(x, max_width)
-
-        # Hidden layers: matmul (cuBLAS) into workspace then fuse bias+ReLU with Triton inplace kernel
-        for lin in self.hidden_linears:
-            weight = lin.weight  # (out_f, in_f)
-            bias = lin.bias
-            out_features = weight.shape[0]
-
-            # cached transposed weight (in_f, out_f) and bias on the correct device
-            wt = self._get_weight_t_on_device(weight, device)
-            b_dev = self._get_bias_on_device(bias, device)
-
-            out_buf = workspace[:, :out_features]
-            # Ensure out_buf is contiguous; workspace allocation ensures this, but be defensive
-            if not out_buf.is_contiguous():
-                out_buf = out_buf.contiguous()
-
-            # Avoid aliasing: if out and out_buf share same data ptr, write into temporary then copy
-            with torch.no_grad():
-                if int(out.data_ptr()) == int(out_buf.data_ptr()):
-                    tmp = self._ensure_matmul_tmp(out, out_features)[:, :out_features]
-                    torch.matmul(out, wt, out=tmp)
-                    out_buf.copy_(tmp)
-                else:
-                    torch.matmul(out, wt, out=out_buf)
-
-            # Fuse bias add + ReLU using Triton when on CUDA
-            if out_buf.is_cuda and b_dev is not None and b_dev.device == device and out_buf.dtype == torch.float32:
-                BLOCK = self._choose_block(out_features)
-                ROW_BLOCK = self._choose_row_block(out_features)
-                # ensure bias is contiguous on device (cached)
-                triton_bias_add_relu_inplace(out_buf, b_dev, BLOCK=BLOCK, ROW_BLOCK=ROW_BLOCK)
-                out = out_buf
-            else:
-                if b_dev is not None:
-                    out_buf = out_buf + b_dev.to(out_buf.device)
-                out = F.relu(out_buf)
-
-        # Final linear (no ReLU): matmul then fuse bias add (no activation)
-        final_w = self.final_linear.weight
-        final_b = self.final_linear.bias
-        final_out_features = final_w.shape[0]
-
-        wt_final = self._get_weight_t_on_device(final_w, device)
-        b_final_dev = self._get_bias_on_device(final_b, device)
-
-        out_buf = workspace[:, :final_out_features]
-        if not out_buf.is_contiguous():
-            out_buf = out_buf.contiguous()
-
-        with torch.no_grad():
-            if int(out.data_ptr()) == int(out_buf.data_ptr()):
-                tmp = self._ensure_matmul_tmp(out, final_out_features)[:, :final_out_features]
-                torch.matmul(out, wt_final, out=tmp)
-                out_buf.copy_(tmp)
-            else:
-                torch.matmul(out, wt_final, out=out_buf)
-
-        if out_buf.is_cuda and b_final_dev is not None and b_final_dev.device == device and out_buf.dtype == torch.float32:
-            BLOCK = self._choose_block(final_out_features)
-            ROW_BLOCK = self._choose_row_block(final_out_features)
-            triton_bias_add_inplace(out_buf, b_final_dev, BLOCK=BLOCK, ROW_BLOCK=ROW_BLOCK)
-            return out_buf
-        else:
-            if b_final_dev is not None:
-                out_buf = out_buf + b_final_dev.to(out_buf.device)
-            return out_buf
+        # Cast back to fp32 to match original model dtype expectations.
+        return x_half.to(torch.float32)

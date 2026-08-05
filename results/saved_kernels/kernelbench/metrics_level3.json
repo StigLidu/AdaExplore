@@ -1,0 +1,2512 @@
+{
+ "_note": "Historical evaluation results copied verbatim from the release run; these kernels were NOT re-measured when archived.",
+ "_correctness_gate": "torch.allclose(atol=5e-02, rtol=5e-02) \u2014 the gate in force when these runs were produced",
+ "_dtype": "fp32 (TF32 disabled)",
+ "_hardware": "NVIDIA RTX A6000",
+ "_source_run": "experiments/release/MCTS_0120_KB-l3_100",
+ "_checkpoint_step": 100,
+ "_recorded_baseline": "fast_p computed against results/timing/A6000/baseline_time_torch.json",
+ "_measured_baseline": "fast_p computed against a baseline re-timed in the same process",
+ "problems": {
+  "1": {
+   "source_run": "experiments/release/MCTS_0120_KB-l3_100",
+   "source_dir": "3_1",
+   "checkpoint_step": 100,
+   "source_kernel": "experiments/release/MCTS_0120_KB-l3_100/3_1/global_best_kernel_100.py",
+   "recorded_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 2.04,
+    "runtime_stats": {
+     "mean": 2.04,
+     "std": 0.00314,
+     "min": 2.03,
+     "max": 2.04,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 4.769607843137255,
+     "baseline_time": 9.73,
+     "baseline_type": "recorded"
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   },
+   "measured_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 2.05,
+    "runtime_stats": {
+     "mean": 2.05,
+     "std": 0.00409,
+     "min": 2.05,
+     "max": 2.06,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 4.590243902439025,
+     "baseline_type": "measured",
+     "baseline_time": 9.41
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   }
+  },
+  "2": {
+   "source_run": "experiments/release/MCTS_0120_KB-l3_100",
+   "source_dir": "3_2",
+   "checkpoint_step": 100,
+   "source_kernel": "experiments/release/MCTS_0120_KB-l3_100/3_2/global_best_kernel_100.py",
+   "recorded_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 6.49,
+    "runtime_stats": {
+     "mean": 6.49,
+     "std": 0.0129,
+     "min": 6.48,
+     "max": 6.56,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 5.177195685670262,
+     "baseline_time": 33.6,
+     "baseline_type": "recorded"
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   },
+   "measured_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 6.56,
+    "runtime_stats": {
+     "mean": 6.56,
+     "std": 0.0128,
+     "min": 6.55,
+     "max": 6.6,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 4.984756097560976,
+     "baseline_type": "measured",
+     "baseline_time": 32.7
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   }
+  },
+  "3": {
+   "source_run": "experiments/release/MCTS_0120_KB-l3_100",
+   "source_dir": "3_3",
+   "checkpoint_step": 100,
+   "source_kernel": "experiments/release/MCTS_0120_KB-l3_100/3_3/global_best_kernel_100.py",
+   "recorded_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 1.05,
+    "runtime_stats": {
+     "mean": 1.05,
+     "std": 0.0502,
+     "min": 1.02,
+     "max": 1.25,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "2",
+     "fast_p": 3.9904761904761905,
+     "baseline_time": 4.19,
+     "baseline_type": "recorded"
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "2",
+     "correctness_trials": "(5 / 5)"
+    }
+   },
+   "measured_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 1.06,
+    "runtime_stats": {
+     "mean": 1.06,
+     "std": 0.00131,
+     "min": 1.06,
+     "max": 1.06,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 3.839622641509434,
+     "baseline_type": "measured",
+     "baseline_time": 4.07
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   }
+  },
+  "4": {
+   "source_run": "experiments/release/MCTS_0120_KB-l3_100",
+   "source_dir": "3_4",
+   "checkpoint_step": 100,
+   "source_kernel": "experiments/release/MCTS_0120_KB-l3_100/3_4/global_best_kernel_100.py",
+   "recorded_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 1.59,
+    "runtime_stats": {
+     "mean": 1.59,
+     "std": 0.0098,
+     "min": 1.56,
+     "max": 1.6,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 1.2578616352201257,
+     "baseline_time": 2.0,
+     "baseline_type": "recorded"
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   },
+   "measured_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 1.6,
+    "runtime_stats": {
+     "mean": 1.6,
+     "std": 0.00901,
+     "min": 1.58,
+     "max": 1.61,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 1.2374999999999998,
+     "baseline_type": "measured",
+     "baseline_time": 1.98
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   }
+  },
+  "5": {
+   "source_run": "experiments/release/MCTS_0120_KB-l3_100",
+   "source_dir": "3_5",
+   "checkpoint_step": 100,
+   "source_kernel": "experiments/release/MCTS_0120_KB-l3_100/3_5/global_best_kernel_100.py",
+   "recorded_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 74.2,
+    "runtime_stats": {
+     "mean": 74.2,
+     "std": 0.185,
+     "min": 73.8,
+     "max": 74.5,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 1.082210242587601,
+     "baseline_time": 80.3,
+     "baseline_type": "recorded"
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   },
+   "measured_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 75.1,
+    "runtime_stats": {
+     "mean": 75.1,
+     "std": 0.22,
+     "min": 74.6,
+     "max": 75.5,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 1.0532623169107855,
+     "baseline_type": "measured",
+     "baseline_time": 79.1
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   }
+  },
+  "6": {
+   "source_run": "experiments/release/MCTS_0120_KB-l3_100",
+   "source_dir": "3_6",
+   "checkpoint_step": 100,
+   "source_kernel": "experiments/release/MCTS_0120_KB-l3_100/3_6/global_best_kernel_100.py",
+   "recorded_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 35.6,
+    "runtime_stats": {
+     "mean": 35.6,
+     "std": 0.112,
+     "min": 35.4,
+     "max": 35.9,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "0",
+     "fast_p": 1.1067415730337078,
+     "baseline_time": 39.4,
+     "baseline_type": "recorded"
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "0",
+     "correctness_trials": "(5 / 5)"
+    }
+   },
+   "measured_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 35.5,
+    "runtime_stats": {
+     "mean": 35.5,
+     "std": 0.112,
+     "min": 35.3,
+     "max": 35.7,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 1.0929577464788731,
+     "baseline_type": "measured",
+     "baseline_time": 38.8
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   }
+  },
+  "7": {
+   "source_run": "experiments/release/MCTS_0120_KB-l3_100",
+   "source_dir": "3_7",
+   "checkpoint_step": 100,
+   "source_kernel": "experiments/release/MCTS_0120_KB-l3_100/3_7/global_best_kernel_100.py",
+   "recorded_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 1.75,
+    "runtime_stats": {
+     "mean": 1.75,
+     "std": 0.0135,
+     "min": 1.73,
+     "max": 1.79,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 2.8971428571428572,
+     "baseline_time": 5.07,
+     "baseline_type": "recorded"
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   },
+   "measured_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 3.15,
+    "runtime_stats": {
+     "mean": 3.15,
+     "std": 0.0144,
+     "min": 3.13,
+     "max": 3.2,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 1.1206349206349207,
+     "baseline_type": "measured",
+     "baseline_time": 3.53
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   }
+  },
+  "8": {
+   "source_run": "experiments/release/MCTS_0120_KB-l3_100",
+   "source_dir": "3_8",
+   "checkpoint_step": 100,
+   "source_kernel": "experiments/release/MCTS_0120_KB-l3_100/3_8/global_best_kernel_100.py",
+   "recorded_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 4.37,
+    "runtime_stats": {
+     "mean": 4.37,
+     "std": 0.0154,
+     "min": 4.34,
+     "max": 4.41,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 1.1281464530892447,
+     "baseline_time": 4.93,
+     "baseline_type": "recorded"
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   },
+   "measured_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 4.42,
+    "runtime_stats": {
+     "mean": 4.42,
+     "std": 0.00619,
+     "min": 4.41,
+     "max": 4.43,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 1.1085972850678734,
+     "baseline_type": "measured",
+     "baseline_time": 4.9
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   }
+  },
+  "9": {
+   "source_run": "experiments/release/MCTS_0120_KB-l3_100",
+   "source_dir": "3_9",
+   "checkpoint_step": 100,
+   "source_kernel": "experiments/release/MCTS_0120_KB-l3_100/3_9/global_best_kernel_100.py",
+   "recorded_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 1.67,
+    "runtime_stats": {
+     "mean": 1.67,
+     "std": 0.0101,
+     "min": 1.66,
+     "max": 1.72,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "1",
+     "fast_p": 1.5209580838323353,
+     "baseline_time": 2.54,
+     "baseline_type": "recorded"
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "1",
+     "correctness_trials": "(5 / 5)"
+    }
+   },
+   "measured_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 2.58,
+    "runtime_stats": {
+     "mean": 2.58,
+     "std": 0.0174,
+     "min": 2.54,
+     "max": 2.61,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 0.9689922480620154,
+     "baseline_type": "measured",
+     "baseline_time": 2.5
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   }
+  },
+  "10": {
+   "source_run": "experiments/release/MCTS_0120_KB-l3_100",
+   "source_dir": "3_10",
+   "checkpoint_step": 100,
+   "source_kernel": "experiments/release/MCTS_0120_KB-l3_100/3_10/global_best_kernel_100.py",
+   "recorded_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 16.3,
+    "runtime_stats": {
+     "mean": 16.3,
+     "std": 0.0317,
+     "min": 16.2,
+     "max": 16.4,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "0",
+     "fast_p": 1.067484662576687,
+     "baseline_time": 17.4,
+     "baseline_type": "recorded"
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "0",
+     "correctness_trials": "(5 / 5)"
+    }
+   },
+   "measured_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 16.3,
+    "runtime_stats": {
+     "mean": 16.3,
+     "std": 0.0487,
+     "min": 16.2,
+     "max": 16.4,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 0.9938650306748466,
+     "baseline_type": "measured",
+     "baseline_time": 16.2
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   }
+  },
+  "11": {
+   "source_run": "experiments/release/MCTS_0120_KB-l3_100",
+   "source_dir": "3_11",
+   "checkpoint_step": 100,
+   "source_kernel": "experiments/release/MCTS_0120_KB-l3_100/3_11/global_best_kernel_100.py",
+   "recorded_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 11.0,
+    "runtime_stats": {
+     "mean": 11.0,
+     "std": 0.041,
+     "min": 11.0,
+     "max": 11.1,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "0",
+     "fast_p": 1.4181818181818182,
+     "baseline_time": 15.6,
+     "baseline_type": "recorded"
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "0",
+     "correctness_trials": "(5 / 5)"
+    }
+   },
+   "measured_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 11.0,
+    "runtime_stats": {
+     "mean": 11.0,
+     "std": 0.0116,
+     "min": 11.0,
+     "max": 11.1,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 1.018181818181818,
+     "baseline_type": "measured",
+     "baseline_time": 11.2
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   }
+  },
+  "12": {
+   "source_run": "experiments/release/MCTS_0120_KB-l3_100",
+   "source_dir": "3_12",
+   "checkpoint_step": 100,
+   "source_kernel": "experiments/release/MCTS_0120_KB-l3_100/3_12/global_best_kernel_100.py",
+   "recorded_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 17.6,
+    "runtime_stats": {
+     "mean": 17.6,
+     "std": 0.0625,
+     "min": 17.5,
+     "max": 17.8,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "2",
+     "fast_p": 1.0624999999999998,
+     "baseline_time": 18.7,
+     "baseline_type": "recorded"
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "2",
+     "correctness_trials": "(5 / 5)"
+    }
+   },
+   "measured_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 17.6,
+    "runtime_stats": {
+     "mean": 17.6,
+     "std": 0.0662,
+     "min": 17.6,
+     "max": 17.8,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 1.0511363636363635,
+     "baseline_type": "measured",
+     "baseline_time": 18.5
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   }
+  },
+  "13": {
+   "source_run": "experiments/release/MCTS_0120_KB-l3_100",
+   "source_dir": "3_13",
+   "checkpoint_step": 100,
+   "source_kernel": "experiments/release/MCTS_0120_KB-l3_100/3_13/global_best_kernel_100.py",
+   "recorded_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 8.72,
+    "runtime_stats": {
+     "mean": 8.72,
+     "std": 0.0796,
+     "min": 8.64,
+     "max": 8.89,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "2",
+     "fast_p": 2.018348623853211,
+     "baseline_time": 17.6,
+     "baseline_type": "recorded"
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "2",
+     "correctness_trials": "(5 / 5)"
+    }
+   },
+   "measured_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 8.64,
+    "runtime_stats": {
+     "mean": 8.64,
+     "std": 0.01,
+     "min": 8.63,
+     "max": 8.66,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 2.025462962962963,
+     "baseline_type": "measured",
+     "baseline_time": 17.5
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   }
+  },
+  "14": {
+   "source_run": "experiments/release/MCTS_0120_KB-l3_100",
+   "source_dir": "3_14",
+   "checkpoint_step": 100,
+   "source_kernel": "experiments/release/MCTS_0120_KB-l3_100/3_14/global_best_kernel_100.py",
+   "recorded_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 23.7,
+    "runtime_stats": {
+     "mean": 23.7,
+     "std": 0.0117,
+     "min": 23.7,
+     "max": 23.7,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "0",
+     "fast_p": 1.0,
+     "baseline_time": 23.7,
+     "baseline_type": "recorded"
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "0",
+     "correctness_trials": "(5 / 5)"
+    }
+   },
+   "measured_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 23.7,
+    "runtime_stats": {
+     "mean": 23.7,
+     "std": 0.0111,
+     "min": 23.7,
+     "max": 23.7,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 1.0,
+     "baseline_type": "measured",
+     "baseline_time": 23.7
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   }
+  },
+  "15": {
+   "source_run": "experiments/release/MCTS_0120_KB-l3_100",
+   "source_dir": "3_15",
+   "checkpoint_step": 100,
+   "source_kernel": "experiments/release/MCTS_0120_KB-l3_100/3_15/global_best_kernel_100.py",
+   "recorded_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 11.1,
+    "runtime_stats": {
+     "mean": 11.1,
+     "std": 0.0201,
+     "min": 11.1,
+     "max": 11.2,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 1.0360360360360361,
+     "baseline_time": 11.5,
+     "baseline_type": "recorded"
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   },
+   "measured_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 11.3,
+    "runtime_stats": {
+     "mean": 11.3,
+     "std": 0.0328,
+     "min": 11.2,
+     "max": 11.4,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 1.0,
+     "baseline_type": "measured",
+     "baseline_time": 11.3
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   }
+  },
+  "16": {
+   "source_run": "experiments/release/MCTS_0120_KB-l3_100",
+   "source_dir": "3_16",
+   "checkpoint_step": 100,
+   "source_kernel": "experiments/release/MCTS_0120_KB-l3_100/3_16/global_best_kernel_100.py",
+   "recorded_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 25.4,
+    "runtime_stats": {
+     "mean": 25.4,
+     "std": 0.0512,
+     "min": 25.3,
+     "max": 25.6,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 1.031496062992126,
+     "baseline_time": 26.2,
+     "baseline_type": "recorded"
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   },
+   "measured_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 25.8,
+    "runtime_stats": {
+     "mean": 25.8,
+     "std": 0.0442,
+     "min": 25.7,
+     "max": 25.9,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 1.003875968992248,
+     "baseline_type": "measured",
+     "baseline_time": 25.9
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   }
+  },
+  "17": {
+   "source_run": "experiments/release/MCTS_0120_KB-l3_100",
+   "source_dir": "3_17",
+   "checkpoint_step": 100,
+   "source_kernel": "experiments/release/MCTS_0120_KB-l3_100/3_17/global_best_kernel_100.py",
+   "recorded_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 35.5,
+    "runtime_stats": {
+     "mean": 35.5,
+     "std": 0.0184,
+     "min": 35.5,
+     "max": 35.6,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "2",
+     "fast_p": 1.36056338028169,
+     "baseline_time": 48.3,
+     "baseline_type": "recorded"
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "2",
+     "correctness_trials": "(5 / 5)"
+    }
+   },
+   "measured_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 35.5,
+    "runtime_stats": {
+     "mean": 35.5,
+     "std": 0.0114,
+     "min": 35.5,
+     "max": 35.5,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 1.36056338028169,
+     "baseline_type": "measured",
+     "baseline_time": 48.3
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   }
+  },
+  "18": {
+   "source_run": "experiments/release/MCTS_0120_KB-l3_100",
+   "source_dir": "3_18",
+   "checkpoint_step": 100,
+   "source_kernel": "experiments/release/MCTS_0120_KB-l3_100/3_18/global_best_kernel_100.py",
+   "recorded_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 48.5,
+    "runtime_stats": {
+     "mean": 48.5,
+     "std": 0.0465,
+     "min": 48.5,
+     "max": 48.6,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "0",
+     "fast_p": 1.847422680412371,
+     "baseline_time": 89.6,
+     "baseline_type": "recorded"
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "0",
+     "correctness_trials": "(5 / 5)"
+    }
+   },
+   "measured_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 48.5,
+    "runtime_stats": {
+     "mean": 48.5,
+     "std": 0.0476,
+     "min": 48.4,
+     "max": 48.6,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 1.6350515463917525,
+     "baseline_type": "measured",
+     "baseline_time": 79.3
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   }
+  },
+  "19": {
+   "source_run": "experiments/release/MCTS_0120_KB-l3_100",
+   "source_dir": "3_19",
+   "checkpoint_step": 100,
+   "source_kernel": "experiments/release/MCTS_0120_KB-l3_100/3_19/global_best_kernel_100.py",
+   "recorded_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 2.83,
+    "runtime_stats": {
+     "mean": 2.83,
+     "std": 0.0124,
+     "min": 2.81,
+     "max": 2.92,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "2",
+     "fast_p": 1.0954063604240283,
+     "baseline_time": 3.1,
+     "baseline_type": "recorded"
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "2",
+     "correctness_trials": "(5 / 5)"
+    }
+   },
+   "measured_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 2.91,
+    "runtime_stats": {
+     "mean": 2.91,
+     "std": 0.00947,
+     "min": 2.89,
+     "max": 2.94,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 1.0240549828178693,
+     "baseline_type": "measured",
+     "baseline_time": 2.98
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   }
+  },
+  "20": {
+   "source_run": "experiments/release/MCTS_0120_KB-l3_100",
+   "source_dir": "3_20",
+   "checkpoint_step": 100,
+   "source_kernel": "experiments/release/MCTS_0120_KB-l3_100/3_20/global_best_kernel_100.py",
+   "recorded_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 4.47,
+    "runtime_stats": {
+     "mean": 4.47,
+     "std": 0.00937,
+     "min": 4.46,
+     "max": 4.5,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 1.4116331096196868,
+     "baseline_time": 6.31,
+     "baseline_type": "recorded"
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   },
+   "measured_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 6.04,
+    "runtime_stats": {
+     "mean": 6.04,
+     "std": 0.0185,
+     "min": 6.01,
+     "max": 6.08,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 1.01158940397351,
+     "baseline_type": "measured",
+     "baseline_time": 6.11
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   }
+  },
+  "21": {
+   "source_run": "experiments/release/MCTS_0120_KB-l3_100",
+   "source_dir": "3_21",
+   "checkpoint_step": 100,
+   "source_kernel": "experiments/release/MCTS_0120_KB-l3_100/3_21/global_best_kernel_100.py",
+   "recorded_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 22.2,
+    "runtime_stats": {
+     "mean": 22.2,
+     "std": 0.0678,
+     "min": 22.1,
+     "max": 22.5,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "2",
+     "fast_p": 1.2297297297297298,
+     "baseline_time": 27.3,
+     "baseline_type": "recorded"
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "2",
+     "correctness_trials": "(5 / 5)"
+    }
+   },
+   "measured_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 22.2,
+    "runtime_stats": {
+     "mean": 22.2,
+     "std": 0.0418,
+     "min": 22.1,
+     "max": 22.3,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 1.220720720720721,
+     "baseline_type": "measured",
+     "baseline_time": 27.1
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   }
+  },
+  "22": {
+   "source_run": "experiments/release/MCTS_0120_KB-l3_100",
+   "source_dir": "3_22",
+   "checkpoint_step": 100,
+   "source_kernel": "experiments/release/MCTS_0120_KB-l3_100/3_22/global_best_kernel_100.py",
+   "recorded_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 4.35,
+    "runtime_stats": {
+     "mean": 4.35,
+     "std": 0.00861,
+     "min": 4.34,
+     "max": 4.39,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 1.1747126436781612,
+     "baseline_time": 5.11,
+     "baseline_type": "recorded"
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   },
+   "measured_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 4.8,
+    "runtime_stats": {
+     "mean": 4.8,
+     "std": 0.0157,
+     "min": 4.77,
+     "max": 4.84,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 1.0041666666666669,
+     "baseline_type": "measured",
+     "baseline_time": 4.82
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   }
+  },
+  "23": {
+   "source_run": "experiments/release/MCTS_0120_KB-l3_100",
+   "source_dir": "3_23",
+   "checkpoint_step": 100,
+   "source_kernel": "experiments/release/MCTS_0120_KB-l3_100/3_23/global_best_kernel_100.py",
+   "recorded_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 3.2,
+    "runtime_stats": {
+     "mean": 3.2,
+     "std": 0.00448,
+     "min": 3.2,
+     "max": 3.22,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 1.028125,
+     "baseline_time": 3.29,
+     "baseline_type": "recorded"
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   },
+   "measured_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 3.26,
+    "runtime_stats": {
+     "mean": 3.26,
+     "std": 0.00618,
+     "min": 3.25,
+     "max": 3.28,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 1.0030674846625767,
+     "baseline_type": "measured",
+     "baseline_time": 3.27
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   }
+  },
+  "24": {
+   "source_run": "experiments/release/MCTS_0120_KB-l3_100",
+   "source_dir": "3_24",
+   "checkpoint_step": 100,
+   "source_kernel": "experiments/release/MCTS_0120_KB-l3_100/3_24/global_best_kernel_100.py",
+   "recorded_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 1.57,
+    "runtime_stats": {
+     "mean": 1.57,
+     "std": 0.00646,
+     "min": 1.55,
+     "max": 1.59,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "0",
+     "fast_p": 1.5987261146496814,
+     "baseline_time": 2.51,
+     "baseline_type": "recorded"
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "0",
+     "correctness_trials": "(5 / 5)"
+    }
+   },
+   "measured_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 2.42,
+    "runtime_stats": {
+     "mean": 2.42,
+     "std": 0.0107,
+     "min": 2.4,
+     "max": 2.45,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 1.0,
+     "baseline_type": "measured",
+     "baseline_time": 2.42
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   }
+  },
+  "25": {
+   "source_run": "experiments/release/MCTS_0120_KB-l3_100",
+   "source_dir": "3_25",
+   "checkpoint_step": 100,
+   "source_kernel": "experiments/release/MCTS_0120_KB-l3_100/3_25/global_best_kernel_100.py",
+   "recorded_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 29.8,
+    "runtime_stats": {
+     "mean": 29.8,
+     "std": 0.113,
+     "min": 29.6,
+     "max": 30.0,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "0",
+     "fast_p": 1.0335570469798658,
+     "baseline_time": 30.8,
+     "baseline_type": "recorded"
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "0",
+     "correctness_trials": "(5 / 5)"
+    }
+   },
+   "measured_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 29.6,
+    "runtime_stats": {
+     "mean": 29.6,
+     "std": 0.0516,
+     "min": 29.5,
+     "max": 29.7,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 1.0337837837837838,
+     "baseline_type": "measured",
+     "baseline_time": 30.6
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   }
+  },
+  "26": {
+   "source_run": "experiments/release/MCTS_0120_KB-l3_100",
+   "source_dir": "3_26",
+   "checkpoint_step": 100,
+   "source_kernel": "experiments/release/MCTS_0120_KB-l3_100/3_26/global_best_kernel_100.py",
+   "recorded_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 23.1,
+    "runtime_stats": {
+     "mean": 23.1,
+     "std": 0.0257,
+     "min": 23.0,
+     "max": 23.1,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 1.1904761904761905,
+     "baseline_time": 27.5,
+     "baseline_type": "recorded"
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   },
+   "measured_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 23.4,
+    "runtime_stats": {
+     "mean": 23.4,
+     "std": 0.0293,
+     "min": 23.4,
+     "max": 23.5,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 1.1581196581196582,
+     "baseline_type": "measured",
+     "baseline_time": 27.1
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   }
+  },
+  "27": {
+   "source_run": "experiments/release/MCTS_0120_KB-l3_100",
+   "source_dir": "3_27",
+   "checkpoint_step": 100,
+   "source_kernel": "experiments/release/MCTS_0120_KB-l3_100/3_27/global_best_kernel_100.py",
+   "recorded_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 8.47,
+    "runtime_stats": {
+     "mean": 8.47,
+     "std": 0.0695,
+     "min": 8.34,
+     "max": 8.57,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "1",
+     "fast_p": 1.0271546635182998,
+     "baseline_time": 8.7,
+     "baseline_type": "recorded"
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "1",
+     "correctness_trials": "(5 / 5)"
+    }
+   },
+   "measured_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 8.57,
+    "runtime_stats": {
+     "mean": 8.57,
+     "std": 0.0134,
+     "min": 8.55,
+     "max": 8.62,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 1.0,
+     "baseline_type": "measured",
+     "baseline_time": 8.57
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   }
+  },
+  "28": {
+   "source_run": "experiments/release/MCTS_0120_KB-l3_100",
+   "source_dir": "3_28",
+   "checkpoint_step": 100,
+   "source_kernel": "experiments/release/MCTS_0120_KB-l3_100/3_28/global_best_kernel_100.py",
+   "recorded_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 2.34,
+    "runtime_stats": {
+     "mean": 2.34,
+     "std": 0.00513,
+     "min": 2.33,
+     "max": 2.35,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 1.2393162393162394,
+     "baseline_time": 2.9,
+     "baseline_type": "recorded"
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   },
+   "measured_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 2.77,
+    "runtime_stats": {
+     "mean": 2.77,
+     "std": 0.00907,
+     "min": 2.75,
+     "max": 2.79,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 0.9891696750902528,
+     "baseline_type": "measured",
+     "baseline_time": 2.74
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   }
+  },
+  "29": {
+   "source_run": "experiments/release/MCTS_0120_KB-l3_100",
+   "source_dir": "3_29",
+   "checkpoint_step": 100,
+   "source_kernel": "experiments/release/MCTS_0120_KB-l3_100/3_29/global_best_kernel_100.py",
+   "recorded_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 8.34,
+    "runtime_stats": {
+     "mean": 8.34,
+     "std": 0.0166,
+     "min": 8.29,
+     "max": 8.36,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "0",
+     "fast_p": 1.0719424460431655,
+     "baseline_time": 8.94,
+     "baseline_type": "recorded"
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "0",
+     "correctness_trials": "(5 / 5)"
+    }
+   },
+   "measured_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 8.36,
+    "runtime_stats": {
+     "mean": 8.36,
+     "std": 0.0147,
+     "min": 8.33,
+     "max": 8.4,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 1.0466507177033493,
+     "baseline_type": "measured",
+     "baseline_time": 8.75
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   }
+  },
+  "30": {
+   "source_run": "experiments/release/MCTS_0120_KB-l3_100",
+   "source_dir": "3_30",
+   "checkpoint_step": 100,
+   "source_kernel": "experiments/release/MCTS_0120_KB-l3_100/3_30/global_best_kernel_100.py",
+   "recorded_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 16.0,
+    "runtime_stats": {
+     "mean": 16.0,
+     "std": 0.0352,
+     "min": 16.0,
+     "max": 16.1,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 1.15,
+     "baseline_time": 18.4,
+     "baseline_type": "recorded"
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   },
+   "measured_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 17.8,
+    "runtime_stats": {
+     "mean": 17.8,
+     "std": 0.0479,
+     "min": 17.7,
+     "max": 17.9,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 1.0,
+     "baseline_type": "measured",
+     "baseline_time": 17.8
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   }
+  },
+  "31": {
+   "source_run": "experiments/release/MCTS_0120_KB-l3_100",
+   "source_dir": "3_31",
+   "checkpoint_step": 100,
+   "source_kernel": "experiments/release/MCTS_0120_KB-l3_100/3_31/global_best_kernel_100.py",
+   "recorded_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 94.3,
+    "runtime_stats": {
+     "mean": 94.3,
+     "std": 0.184,
+     "min": 93.9,
+     "max": 94.6,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 1.0190880169671261,
+     "baseline_time": 96.1,
+     "baseline_type": "recorded"
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   },
+   "measured_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 95.5,
+    "runtime_stats": {
+     "mean": 95.5,
+     "std": 0.175,
+     "min": 95.1,
+     "max": 95.8,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 1.0020942408376963,
+     "baseline_type": "measured",
+     "baseline_time": 95.7
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   }
+  },
+  "32": {
+   "source_run": "experiments/release/MCTS_0120_KB-l3_100",
+   "source_dir": "3_32",
+   "checkpoint_step": 100,
+   "source_kernel": "experiments/release/MCTS_0120_KB-l3_100/3_32/global_best_kernel_100.py",
+   "recorded_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 1.93,
+    "runtime_stats": {
+     "mean": 1.93,
+     "std": 0.00976,
+     "min": 1.91,
+     "max": 1.95,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "1",
+     "fast_p": 1.533678756476684,
+     "baseline_time": 2.96,
+     "baseline_type": "recorded"
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "1",
+     "correctness_trials": "(5 / 5)"
+    }
+   },
+   "measured_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 2.94,
+    "runtime_stats": {
+     "mean": 2.94,
+     "std": 0.0077,
+     "min": 2.93,
+     "max": 2.96,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 0.989795918367347,
+     "baseline_type": "measured",
+     "baseline_time": 2.91
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   }
+  },
+  "33": {
+   "source_run": "experiments/release/MCTS_0120_KB-l3_100",
+   "source_dir": "3_33",
+   "checkpoint_step": 100,
+   "source_kernel": "experiments/release/MCTS_0120_KB-l3_100/3_33/global_best_kernel_100.py",
+   "recorded_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 3.8,
+    "runtime_stats": {
+     "mean": 3.8,
+     "std": 0.143,
+     "min": 3.55,
+     "max": 3.93,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "1",
+     "fast_p": 5.421052631578948,
+     "baseline_time": 20.6,
+     "baseline_type": "recorded"
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "1",
+     "correctness_trials": "(5 / 5)"
+    }
+   },
+   "measured_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 3.91,
+    "runtime_stats": {
+     "mean": 3.91,
+     "std": 0.0268,
+     "min": 3.86,
+     "max": 3.95,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 5.1918158567774935,
+     "baseline_type": "measured",
+     "baseline_time": 20.3
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   }
+  },
+  "34": {
+   "source_run": "experiments/release/MCTS_0120_KB-l3_100",
+   "source_dir": "3_34",
+   "checkpoint_step": 100,
+   "source_kernel": "experiments/release/MCTS_0120_KB-l3_100/3_34/global_best_kernel_100.py",
+   "recorded_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 4.12,
+    "runtime_stats": {
+     "mean": 4.12,
+     "std": 0.0967,
+     "min": 4.07,
+     "max": 4.36,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "2",
+     "fast_p": 5.87378640776699,
+     "baseline_time": 24.2,
+     "baseline_type": "recorded"
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "2",
+     "correctness_trials": "(5 / 5)"
+    }
+   },
+   "measured_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 4.17,
+    "runtime_stats": {
+     "mean": 4.17,
+     "std": 0.0373,
+     "min": 4.16,
+     "max": 4.35,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 5.203836930455635,
+     "baseline_type": "measured",
+     "baseline_time": 21.7
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   }
+  },
+  "35": {
+   "source_run": "experiments/release/MCTS_0120_KB-l3_100",
+   "source_dir": "3_35",
+   "checkpoint_step": 100,
+   "source_kernel": "experiments/release/MCTS_0120_KB-l3_100/3_35/global_best_kernel_100.py",
+   "recorded_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 16.8,
+    "runtime_stats": {
+     "mean": 16.8,
+     "std": 0.0817,
+     "min": 16.4,
+     "max": 16.9,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "2",
+     "fast_p": 1.2202380952380951,
+     "baseline_time": 20.5,
+     "baseline_type": "recorded"
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "2",
+     "correctness_trials": "(5 / 5)"
+    }
+   },
+   "measured_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 18.0,
+    "runtime_stats": {
+     "mean": 18.0,
+     "std": 0.219,
+     "min": 17.7,
+     "max": 18.7,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 0.9888888888888889,
+     "baseline_type": "measured",
+     "baseline_time": 17.8
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   }
+  },
+  "36": {
+   "source_run": "experiments/release/MCTS_0120_KB-l3_100",
+   "source_dir": "3_36",
+   "checkpoint_step": 100,
+   "source_kernel": "experiments/release/MCTS_0120_KB-l3_100/3_36/global_best_kernel_100.py",
+   "recorded_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 16.7,
+    "runtime_stats": {
+     "mean": 16.7,
+     "std": 0.0904,
+     "min": 16.3,
+     "max": 16.8,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "2",
+     "fast_p": 1.2335329341317367,
+     "baseline_time": 20.6,
+     "baseline_type": "recorded"
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "2",
+     "correctness_trials": "(5 / 5)"
+    }
+   },
+   "measured_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 18.6,
+    "runtime_stats": {
+     "mean": 18.6,
+     "std": 0.161,
+     "min": 18.0,
+     "max": 18.8,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 0.9623655913978493,
+     "baseline_type": "measured",
+     "baseline_time": 17.9
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   }
+  },
+  "37": {
+   "source_run": "experiments/release/MCTS_0120_KB-l3_100",
+   "source_dir": "3_37",
+   "checkpoint_step": 100,
+   "source_kernel": "experiments/release/MCTS_0120_KB-l3_100/3_37/global_best_kernel_100.py",
+   "recorded_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 16.8,
+    "runtime_stats": {
+     "mean": 16.8,
+     "std": 0.0339,
+     "min": 16.7,
+     "max": 16.9,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "1",
+     "fast_p": 1.2202380952380951,
+     "baseline_time": 20.5,
+     "baseline_type": "recorded"
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "1",
+     "correctness_trials": "(5 / 5)"
+    }
+   },
+   "measured_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 18.0,
+    "runtime_stats": {
+     "mean": 18.0,
+     "std": 0.0497,
+     "min": 17.9,
+     "max": 18.2,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 1.0,
+     "baseline_type": "measured",
+     "baseline_time": 18.0
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   }
+  },
+  "38": {
+   "source_run": "experiments/release/MCTS_0120_KB-l3_100",
+   "source_dir": "3_38",
+   "checkpoint_step": 100,
+   "source_kernel": "experiments/release/MCTS_0120_KB-l3_100/3_38/global_best_kernel_100.py",
+   "recorded_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 32.8,
+    "runtime_stats": {
+     "mean": 32.8,
+     "std": 0.136,
+     "min": 32.5,
+     "max": 33.2,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 1.301829268292683,
+     "baseline_time": 42.7,
+     "baseline_type": "recorded"
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   },
+   "measured_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 34.5,
+    "runtime_stats": {
+     "mean": 34.5,
+     "std": 0.0491,
+     "min": 34.5,
+     "max": 34.7,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 1.0,
+     "baseline_type": "measured",
+     "baseline_time": 34.5
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   }
+  },
+  "39": {
+   "source_run": "experiments/release/MCTS_0120_KB-l3_100",
+   "source_dir": "3_39",
+   "checkpoint_step": 100,
+   "source_kernel": "experiments/release/MCTS_0120_KB-l3_100/3_39/global_best_kernel_100.py",
+   "recorded_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 16.6,
+    "runtime_stats": {
+     "mean": 16.6,
+     "std": 0.0202,
+     "min": 16.6,
+     "max": 16.7,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "0",
+     "fast_p": 1.2530120481927711,
+     "baseline_time": 20.8,
+     "baseline_type": "recorded"
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "0",
+     "correctness_trials": "(5 / 5)"
+    }
+   },
+   "measured_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 19.0,
+    "runtime_stats": {
+     "mean": 19.0,
+     "std": 1.44,
+     "min": 18.1,
+     "max": 22.3,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 0.9578947368421052,
+     "baseline_type": "measured",
+     "baseline_time": 18.2
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   }
+  },
+  "40": {
+   "source_run": "experiments/release/MCTS_0120_KB-l3_100",
+   "source_dir": "3_40",
+   "checkpoint_step": 100,
+   "source_kernel": "experiments/release/MCTS_0120_KB-l3_100/3_40/global_best_kernel_100.py",
+   "recorded_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 16.7,
+    "runtime_stats": {
+     "mean": 16.7,
+     "std": 0.0439,
+     "min": 16.6,
+     "max": 16.8,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "2",
+     "fast_p": 1.44311377245509,
+     "baseline_time": 24.1,
+     "baseline_type": "recorded"
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "2",
+     "correctness_trials": "(5 / 5)"
+    }
+   },
+   "measured_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 17.8,
+    "runtime_stats": {
+     "mean": 17.8,
+     "std": 0.337,
+     "min": 17.6,
+     "max": 18.5,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 1.0168539325842696,
+     "baseline_type": "measured",
+     "baseline_time": 18.1
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   }
+  },
+  "41": {
+   "source_run": "experiments/release/MCTS_0120_KB-l3_100",
+   "source_dir": "3_41",
+   "checkpoint_step": 100,
+   "source_kernel": "experiments/release/MCTS_0120_KB-l3_100/3_41/global_best_kernel_100.py",
+   "recorded_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 31.8,
+    "runtime_stats": {
+     "mean": 31.8,
+     "std": 0.047,
+     "min": 31.7,
+     "max": 31.9,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "0",
+     "fast_p": 1.2987421383647797,
+     "baseline_time": 41.3,
+     "baseline_type": "recorded"
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "0",
+     "correctness_trials": "(5 / 5)"
+    }
+   },
+   "measured_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 34.0,
+    "runtime_stats": {
+     "mean": 34.0,
+     "std": 0.0893,
+     "min": 33.8,
+     "max": 34.2,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 0.9970588235294118,
+     "baseline_type": "measured",
+     "baseline_time": 33.9
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   }
+  },
+  "42": {
+   "source_run": "experiments/release/MCTS_0120_KB-l3_100",
+   "source_dir": "3_42",
+   "checkpoint_step": 100,
+   "source_kernel": "experiments/release/MCTS_0120_KB-l3_100/3_42/global_best_kernel_100.py",
+   "recorded_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 32.1,
+    "runtime_stats": {
+     "mean": 32.1,
+     "std": 0.0819,
+     "min": 31.9,
+     "max": 32.3,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 1.2866043613707163,
+     "baseline_time": 41.3,
+     "baseline_type": "recorded"
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   },
+   "measured_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 34.7,
+    "runtime_stats": {
+     "mean": 34.7,
+     "std": 0.149,
+     "min": 34.4,
+     "max": 35.0,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 1.0,
+     "baseline_type": "measured",
+     "baseline_time": 34.7
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   }
+  },
+  "43": {
+   "source_run": "experiments/release/MCTS_0120_KB-l3_100",
+   "source_dir": "3_43",
+   "checkpoint_step": 100,
+   "source_kernel": "experiments/release/MCTS_0120_KB-l3_100/3_43/global_best_kernel_100.py",
+   "recorded_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 4.99,
+    "runtime_stats": {
+     "mean": 4.99,
+     "std": 0.0446,
+     "min": 4.95,
+     "max": 5.15,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 7.454909819639279,
+     "baseline_time": 37.2,
+     "baseline_type": "recorded"
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   },
+   "measured_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 5.21,
+    "runtime_stats": {
+     "mean": 5.21,
+     "std": 0.0187,
+     "min": 5.18,
+     "max": 5.26,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 7.1017274472168905,
+     "baseline_type": "measured",
+     "baseline_time": 37.0
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   }
+  },
+  "44": {
+   "source_run": "experiments/release/MCTS_0120_KB-l3_100",
+   "source_dir": "3_44",
+   "checkpoint_step": 100,
+   "source_kernel": "experiments/release/MCTS_0120_KB-l3_100/3_44/global_best_kernel_100.py",
+   "recorded_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 14.5,
+    "runtime_stats": {
+     "mean": 14.5,
+     "std": 0.278,
+     "min": 14.0,
+     "max": 16.1,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "2",
+     "fast_p": 6.372413793103449,
+     "baseline_time": 92.4,
+     "baseline_type": "recorded"
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "2",
+     "correctness_trials": "(5 / 5)"
+    }
+   },
+   "measured_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 14.7,
+    "runtime_stats": {
+     "mean": 14.7,
+     "std": 0.0487,
+     "min": 14.6,
+     "max": 14.8,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 4.034013605442177,
+     "baseline_type": "measured",
+     "baseline_time": 59.3
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   }
+  },
+  "45": {
+   "source_run": "experiments/release/MCTS_0120_KB-l3_100",
+   "source_dir": "3_45",
+   "checkpoint_step": 100,
+   "source_kernel": "experiments/release/MCTS_0120_KB-l3_100/3_45/global_best_kernel_100.py",
+   "recorded_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 25.0,
+    "runtime_stats": {
+     "mean": 25.0,
+     "std": 0.0797,
+     "min": 24.9,
+     "max": 25.2,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 1.028,
+     "baseline_time": 25.7,
+     "baseline_type": "recorded"
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   },
+   "measured_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 25.4,
+    "runtime_stats": {
+     "mean": 25.4,
+     "std": 0.0811,
+     "min": 25.3,
+     "max": 25.6,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 1.0,
+     "baseline_type": "measured",
+     "baseline_time": 25.4
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   }
+  },
+  "46": {
+   "source_run": "experiments/release/MCTS_0120_KB-l3_100",
+   "source_dir": "3_46",
+   "checkpoint_step": 100,
+   "source_kernel": "experiments/release/MCTS_0120_KB-l3_100/3_46/global_best_kernel_100.py",
+   "recorded_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 3.31,
+    "runtime_stats": {
+     "mean": 3.31,
+     "std": 0.0126,
+     "min": 3.29,
+     "max": 3.33,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 1.6012084592145015,
+     "baseline_time": 5.3,
+     "baseline_type": "recorded"
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   },
+   "measured_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 3.3,
+    "runtime_stats": {
+     "mean": 3.3,
+     "std": 0.0033,
+     "min": 3.3,
+     "max": 3.31,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 1.296969696969697,
+     "baseline_type": "measured",
+     "baseline_time": 4.28
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   }
+  },
+  "47": {
+   "source_run": "experiments/release/MCTS_0120_KB-l3_100",
+   "source_dir": "3_47",
+   "checkpoint_step": 100,
+   "source_kernel": "experiments/release/MCTS_0120_KB-l3_100/3_47/global_best_kernel_100.py",
+   "recorded_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 3.57,
+    "runtime_stats": {
+     "mean": 3.57,
+     "std": 0.00612,
+     "min": 3.56,
+     "max": 3.58,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "0",
+     "fast_p": 1.3025210084033616,
+     "baseline_time": 4.65,
+     "baseline_type": "recorded"
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "0",
+     "correctness_trials": "(5 / 5)"
+    }
+   },
+   "measured_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 3.59,
+    "runtime_stats": {
+     "mean": 3.59,
+     "std": 0.00256,
+     "min": 3.58,
+     "max": 3.59,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 1.286908077994429,
+     "baseline_type": "measured",
+     "baseline_time": 4.62
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   }
+  },
+  "48": {
+   "source_run": "experiments/release/MCTS_0120_KB-l3_100",
+   "source_dir": "3_48",
+   "checkpoint_step": 100,
+   "source_kernel": "experiments/release/MCTS_0120_KB-l3_100/3_48/global_best_kernel_100.py",
+   "recorded_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 27.9,
+    "runtime_stats": {
+     "mean": 27.9,
+     "std": 0.077,
+     "min": 27.8,
+     "max": 28.1,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "0",
+     "fast_p": 1.053763440860215,
+     "baseline_time": 29.4,
+     "baseline_type": "recorded"
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "0",
+     "correctness_trials": "(5 / 5)"
+    }
+   },
+   "measured_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 27.9,
+    "runtime_stats": {
+     "mean": 27.9,
+     "std": 0.0345,
+     "min": 27.8,
+     "max": 28.0,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 1.050179211469534,
+     "baseline_type": "measured",
+     "baseline_time": 29.3
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   }
+  },
+  "49": {
+   "source_run": "experiments/release/MCTS_0120_KB-l3_100",
+   "source_dir": "3_49",
+   "checkpoint_step": 100,
+   "source_kernel": "experiments/release/MCTS_0120_KB-l3_100/3_49/global_best_kernel_100.py",
+   "recorded_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 6.17,
+    "runtime_stats": {
+     "mean": 6.17,
+     "std": 0.00343,
+     "min": 6.16,
+     "max": 6.18,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "0",
+     "fast_p": 3.4846029173419772,
+     "baseline_time": 21.5,
+     "baseline_type": "recorded"
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "0",
+     "correctness_trials": "(5 / 5)"
+    }
+   },
+   "measured_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 6.19,
+    "runtime_stats": {
+     "mean": 6.19,
+     "std": 0.00256,
+     "min": 6.18,
+     "max": 6.19,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 3.4571890145395794,
+     "baseline_type": "measured",
+     "baseline_time": 21.4
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   }
+  },
+  "50": {
+   "source_run": "experiments/release/MCTS_0120_KB-l3_100",
+   "source_dir": "3_50",
+   "checkpoint_step": 100,
+   "source_kernel": "experiments/release/MCTS_0120_KB-l3_100/3_50/global_best_kernel_100.py",
+   "recorded_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 6.03,
+    "runtime_stats": {
+     "mean": 6.03,
+     "std": 0.0428,
+     "min": 5.97,
+     "max": 6.14,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "1",
+     "fast_p": 2.8026533996683245,
+     "baseline_time": 16.9,
+     "baseline_type": "recorded"
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "1",
+     "correctness_trials": "(5 / 5)"
+    }
+   },
+   "measured_baseline": {
+    "correctness": true,
+    "compiled": true,
+    "runtime": 6.06,
+    "runtime_stats": {
+     "mean": 6.06,
+     "std": 0.0229,
+     "min": 6.03,
+     "max": 6.1,
+     "num_trials": 90,
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "fast_p": 2.788778877887789,
+     "baseline_type": "measured",
+     "baseline_time": 16.9
+    },
+    "metadata": {
+     "hardware": "NVIDIA RTX A6000",
+     "device": "3",
+     "correctness_trials": "(5 / 5)"
+    }
+   }
+  }
+ }
+}

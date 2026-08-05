@@ -3,224 +3,397 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
-# Triton kernel to compute per-block partial sums and sum-of-squares for each column tile.
-# Input is expected in FP16; accumulations are done in FP32 for numeric stability.
+# Autotune configurations tuned for A6000 / Ampere-like
+GEMM_CONFIGS = [
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 32}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 64}, num_warps=8, num_stages=3),
+]
+
+REDUCE_CONFIGS = [
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_M": 256, "BLOCK_N": 128}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_M": 512, "BLOCK_N": 128}, num_warps=8, num_stages=3),
+]
+
+
+@triton.autotune(
+    configs=GEMM_CONFIGS,
+    key=['M', 'N', 'K'],
+)
 @triton.jit
-def _col_reduce_kernel(
-    inp_ptr,              # pointer to input tensor (N, C) in FP16
-    partial_sum_ptr,      # pointer to partial sums buffer (grid_m * C) in FP32
-    partial_sumsq_ptr,    # pointer to partial sumsq buffer (grid_m * C) in FP32
-    N,                    # rows
-    C,                    # cols
-    stride_row,           # stride between rows (in elements)
-    stride_col,           # stride between cols (in elements)
-    BLOCK_M: tl.constexpr,  # rows per block (constexpr)
-    BLOCK_N: tl.constexpr,  # cols per block (constexpr)
+def _fused_gemm_scale_kernel(
+    A_ptr,        # pointer to A (M x K)
+    W_ptr,        # pointer to Wt (K x N)  <-- weight transposed before kernel
+    bias_ptr,     # pointer to bias (N,) or 0
+    scale_ptr,    # pointer to scale (N,)
+    C_ptr,        # pointer to output C (M x N)
+    M, N, K,
+    stride_am, stride_ak,   # A strides: stride along M (rows), stride along K (cols)
+    stride_wk, stride_wn,   # Wt strides: stride along K (rows), stride along N (cols)
+    stride_cm, stride_cn,   # C strides
+    has_bias: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
-    # block indices
-    row_block = tl.program_id(0)
-    col_block = tl.program_id(1)
+    # program ids for tiling
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
 
-    row_start = row_block * BLOCK_M
-    col_start = col_block * BLOCK_N
+    row_start = pid_m * BLOCK_M
+    col_start = pid_n * BLOCK_N
 
-    rows = row_start + tl.arange(0, BLOCK_M)
-    cols = col_start + tl.arange(0, BLOCK_N)
+    # ranges
+    row_offsets = row_start + tl.arange(0, BLOCK_M)
+    col_offsets = col_start + tl.arange(0, BLOCK_N)
+    k_offsets = tl.arange(0, BLOCK_K)
 
-    row_mask = rows < N
-    col_mask = cols < C
-    mask = row_mask[:, None] & col_mask[None, :]
+    # compute address bases
+    # shapes:
+    # A: (M, K) with strides stride_am, stride_ak
+    # Wt: (K, N) with strides stride_wk, stride_wn
+    # C: (M, N) with strides stride_cm, stride_cn
 
-    offs = rows[:, None] * stride_row + cols[None, :] * stride_col
-    ptrs = inp_ptr + offs
+    # initialize accumulator
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    # Load FP16 tile, cast to FP32 for accumulation
-    x = tl.load(ptrs, mask=mask, other=0.0)
-    x_fp32 = x.to(tl.float32)
+    # iterate over K dimension tiles
+    for k_start in range(0, K, BLOCK_K):
+        k = k_start + k_offsets  # shape [BLOCK_K]
+        # masks for bounds
+        mask_a = (row_offsets[:, None] < M) & (k[None, :] < K)
+        mask_w = (k[:, None] < K) & (col_offsets[None, :] < N)
 
-    # Reduce across rows -> vector of length BLOCK_N (FP32)
-    sum_cols = tl.sum(x_fp32, 0)
-    sumsq_cols = tl.sum(x_fp32 * x_fp32, 0)
+        # compute addresses
+        a_addr = A_ptr + (row_offsets[:, None] * stride_am) + (k[None, :] * stride_ak)
+        w_addr = W_ptr + (k[:, None] * stride_wk) + (col_offsets[None, :] * stride_wn)
 
-    # Store partials into flattened buffers at base index: base = row_block * C + cols
-    base = row_block * C + cols
-    tl.store(partial_sum_ptr + base, sum_cols, mask=col_mask)
-    tl.store(partial_sumsq_ptr + base, sumsq_cols, mask=col_mask)
+        a = tl.load(a_addr, mask=mask_a, other=0.0)
+        w = tl.load(w_addr, mask=mask_w, other=0.0)  # shape (BLOCK_K, BLOCK_N)
+
+        # a: (BLOCK_M, BLOCK_K), w: (BLOCK_K, BLOCK_N) -> dot -> (BLOCK_M, BLOCK_N)
+        acc += tl.dot(a, w)
+
+    # after accumulation, add bias and scale
+    col_mask = col_offsets < N
+    row_mask = row_offsets < M
+    store_mask = row_mask[:, None] & col_mask[None, :]
+
+    if has_bias:
+        bias_addr = bias_ptr + col_offsets
+        bias_vals = tl.load(bias_addr, mask=col_mask, other=0.0)  # (BLOCK_N,)
+        acc = acc + bias_vals[None, :]
+
+    # apply scale per output channel
+    scale_addr = scale_ptr + col_offsets
+    scale_vals = tl.load(scale_addr, mask=col_mask, other=1.0)
+    acc = acc * scale_vals[None, :]
+
+    # store
+    c_addr = C_ptr + (row_offsets[:, None] * stride_cm) + (col_offsets[None, :] * stride_cn)
+    tl.store(c_addr, acc, mask=store_mask)
 
 
-# Triton kernel to apply per-channel fused affine transform (y = x * eff_w + eff_b)
-# Works in FP16 for the large activation matrix for bandwidth efficiency.
+@triton.autotune(
+    configs=REDUCE_CONFIGS,
+    key=['M', 'N'],
+)
 @triton.jit
-def _apply_affine_kernel(
-    inp_ptr,      # pointer to input (N, C) FP16
-    out_ptr,      # pointer to output (N, C) FP16
-    eff_w_ptr,    # pointer to effective weight (C,) FP16
-    eff_b_ptr,    # pointer to effective bias (C,) FP16
-    N,            # rows
-    C,            # cols
-    stride_row,   # stride between rows (elements)
-    stride_col,   # stride between cols (elements)
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
+def _reduce_mean_var_kernel(
+    X_ptr,      # pointer to X (M x N)
+    mean_ptr,   # pointer to mean (N,)
+    sq_ptr,     # pointer to sum_of_squares (N,)
+    M, N,
+    stride_xm, stride_xn,
+    stride_mean, stride_sq,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
 ):
-    row_block = tl.program_id(0)
-    col_block = tl.program_id(1)
+    # reduce over rows (M) for each column block (N)
+    pid_n = tl.program_id(0)
+    col_start = pid_n * BLOCK_N
+    col_offsets = col_start + tl.arange(0, BLOCK_N)
 
-    row_start = row_block * BLOCK_M
-    col_start = col_block * BLOCK_N
+    m_start = tl.program_id(1) * BLOCK_M
+    m_offsets = m_start + tl.arange(0, BLOCK_M)
 
-    rows = row_start + tl.arange(0, BLOCK_M)
-    cols = col_start + tl.arange(0, BLOCK_N)
+    # initialize accumulators
+    sum_acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    sumsq_acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
 
-    row_mask = rows < N
-    col_mask = cols < C
-    mask2 = row_mask[:, None] & col_mask[None, :]
+    # iterate over row tiles
+    # each program handles a tile of rows (BLOCK_M) at given m_start
+    # but we launch over multiple m tiles; we'll perform reduction across all m tiles in the grid
+    # To do a full reduction, we will require grid to cover all m tiles; we will use atomic adds by launching
+    # a reduction in two phases: 1) this kernel sums across its local rows and writes to temporary buffers
+    # But Triton doesn't have native atomics for float reliably across SMs in all configs; instead,
+    # we'll structure the kernel so that program_id(1) sweeps across M in steps of BLOCK_M and accumulates
+    # the full column sums in this single program. For simplicity, we assume grid is (ceil(N/BLOCK_N),)
+    # and loop over rows here.
+    # However, to be robust, we will sum across all rows inside this kernel by looping over m in python style.
 
-    # Load per-channel fused params (1D)
-    ew = tl.load(eff_w_ptr + cols, mask=col_mask, other=0.0)  # (BLOCK_N,)
-    eb = tl.load(eff_b_ptr + cols, mask=col_mask, other=0.0)  # (BLOCK_N,)
+    # Instead of relying on multiple program_ids over m, we just loop across all m ranges here:
+    # NOTE: This is potentially less parallel but simplifies correctness.
+    for m in range(0, M, BLOCK_M):
+        m_range = m + tl.arange(0, BLOCK_M)
+        mask_m = m_range < M
+        # compute addresses: X[m_range, col_offsets] -> shape (BLOCK_M, BLOCK_N)
+        x_addr = X_ptr + (m_range[:, None] * stride_xm) + (col_offsets[None, :] * stride_xn)
+        mask = mask_m[:, None] & (col_offsets[None, :] < N)
+        x = tl.load(x_addr, mask=mask, other=0.0)  # shape (BLOCK_M, BLOCK_N)
+        # sum across rows
+        sum_acc += tl.sum(x, axis=0)
+        sumsq_acc += tl.sum(x * x, axis=0)
 
-    # Fast path when columns are contiguous (common row-major case)
-    if stride_col == 1:
-        offs = rows[:, None] * stride_row + cols[None, :]
-        inp_ptrs = inp_ptr + offs
-        out_ptrs = out_ptr + offs
+    col_mask = col_offsets < N
+    # write results to mean_ptr and sq_ptr (these store sum and sumsq, will be normalized outside)
+    write_mean_addr = mean_ptr + col_offsets
+    write_sq_addr = sq_ptr + col_offsets
+    tl.store(write_mean_addr, sum_acc, mask=col_mask)
+    tl.store(write_sq_addr, sumsq_acc, mask=col_mask)
 
-        x = tl.load(inp_ptrs, mask=mask2, other=0.0)
-        y = x * ew[None, :] + eb[None, :]
-        tl.store(out_ptrs, y, mask=mask2)
-        return
 
-    # General case: arbitrary strides
-    offs = rows[:, None] * stride_row + cols[None, :] * stride_col
-    ptrs = inp_ptr + offs
+@triton.jit
+def _apply_batchnorm_kernel(
+    X_ptr,
+    mean_ptr,
+    invstd_ptr,
+    gamma_ptr,
+    beta_ptr,
+    M, N,
+    stride_xm, stride_xn,
+    stride_mean, stride_invstd,
+    stride_gamma, stride_beta,
+    stride_outm, stride_outn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    row_start = pid_m * BLOCK_M
+    col_start = pid_n * BLOCK_N
 
-    x = tl.load(ptrs, mask=mask2, other=0.0)
-    y = x * ew[None, :] + eb[None, :]
+    row_offsets = row_start + tl.arange(0, BLOCK_M)
+    col_offsets = col_start + tl.arange(0, BLOCK_N)
 
-    tl.store(out_ptr + offs, y, mask=mask2)
+    m_mask = row_offsets < M
+    n_mask = col_offsets < N
+    store_mask = m_mask[:, None] & n_mask[None, :]
+
+    x_addr = X_ptr + (row_offsets[:, None] * stride_xm) + (col_offsets[None, :] * stride_xn)
+    x = tl.load(x_addr, mask=store_mask, other=0.0)
+
+    mean = tl.load(mean_ptr + col_offsets, mask=n_mask, other=0.0)  # (BLOCK_N,)
+    invstd = tl.load(invstd_ptr + col_offsets, mask=n_mask, other=1.0)
+    gamma = tl.load(gamma_ptr + col_offsets, mask=n_mask, other=1.0)
+    beta = tl.load(beta_ptr + col_offsets, mask=n_mask, other=0.0)
+
+    # broadcast and apply: (x - mean) * invstd * gamma + beta
+    out = (x - mean[None, :]) * invstd[None, :] * gamma[None, :] + beta[None, :]
+
+    out_addr = X_ptr + (row_offsets[:, None] * stride_outm) + (col_offsets[None, :] * stride_outn)
+    tl.store(out_addr, out, mask=store_mask)
+
+
+def triton_fused_gemm_scale(x: torch.Tensor, weight_t: torch.Tensor, bias: torch.Tensor, scale: torch.Tensor):
+    """
+    Performs C = (x @ weight_t) + bias  (weight_t is KxN), then C *= scale (per-column).
+    x: (M, K)
+    weight_t: (K, N)
+    bias: (N,) or None
+    scale: (N,)
+    """
+    assert x.is_cuda and weight_t.is_cuda and scale.is_cuda
+    M, K = x.shape
+    K_w, N = weight_t.shape
+    assert K == K_w
+    out = torch.empty((M, N), device=x.device, dtype=x.dtype)
+
+    # ensure contiguous
+    x_ = x.contiguous()
+    w_ = weight_t.contiguous()
+    scale_ = scale.contiguous()
+    if bias is None:
+        bias_ptr = torch.empty((0,), device=x.device, dtype=x.dtype)
+        has_bias = 0
+    else:
+        bias_ = bias.contiguous()
+        bias_ptr = bias_
+        has_bias = 1
+
+    # strides (elements)
+    stride_am = x_.stride(0)  # step to next row in elements
+    stride_ak = x_.stride(1)
+    stride_wk = w_.stride(0)
+    stride_wn = w_.stride(1)
+    stride_cm = out.stride(0)
+    stride_cn = out.stride(1)
+
+    # Convert strides from bytes to elements
+    # In PyTorch strides are in elements already.
+    # Launch kernel
+    grid = lambda meta: (
+        (M + meta['BLOCK_M'] - 1) // meta['BLOCK_M'],
+        (N + meta['BLOCK_N'] - 1) // meta['BLOCK_N'],
+    )
+
+    _fused_gemm_scale_kernel[grid](
+        x_, w_, bias_ptr if has_bias else x_.new_empty(0), scale_, out,
+        M, N, K,
+        stride_am, stride_ak,
+        stride_wk, stride_wn,
+        stride_cm, stride_cn,
+        has_bias,
+    )
+    return out
+
+
+def triton_mean_var(x: torch.Tensor):
+    """
+    Compute per-column sum and sum of squares across rows using Triton kernel,
+    then return mean and var (unbiased population var E[x^2] - mean^2).
+    x: (M, N)
+    returns mean (N,), var (N,)
+    """
+    M, N = x.shape
+    # temporary tensors to store sums
+    sum_tensor = torch.empty((N,), device=x.device, dtype=torch.float32)
+    sumsq_tensor = torch.empty((N,), device=x.device, dtype=torch.float32)
+
+    # strides
+    stride_xm = x.stride(0)
+    stride_xn = x.stride(1)
+    stride_mean = sum_tensor.stride(0)
+    stride_sq = sumsq_tensor.stride(0)
+
+    # grid choose over columns only (kernel loops over rows)
+    # grid for _reduce_mean_var_kernel: (ceil(N/BLOCK_N),)
+    grid = lambda meta: ((N + meta['BLOCK_N'] - 1) // meta['BLOCK_N'], 1)
+
+    _reduce_mean_var_kernel[grid](
+        x, sum_tensor, sumsq_tensor,
+        M, N,
+        stride_xm, stride_xn,
+        stride_mean, stride_sq,
+    )
+
+    # Convert sums to mean and variance (population)
+    mean = sum_tensor / float(M)
+    ex2 = sumsq_tensor / float(M)
+    var = ex2 - mean * mean
+    # clamp small negative numerical values to zero
+    var = torch.clamp(var, min=0.0)
+    return mean, var
+
+
+def triton_apply_batchnorm(x: torch.Tensor, mean: torch.Tensor, invstd: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor):
+    """
+    In-place application of batchnorm on x:
+    x = (x - mean) * invstd * gamma + beta
+    """
+    M, N = x.shape
+    # ensure contiguity
+    x_ = x.contiguous()
+    mean_ = mean.contiguous()
+    invstd_ = invstd.contiguous()
+    gamma_ = gamma.contiguous()
+    beta_ = beta.contiguous()
+
+    stride_xm = x_.stride(0)
+    stride_xn = x_.stride(1)
+    stride_mean = mean_.stride(0)
+    stride_invstd = invstd_.stride(0)
+    stride_gamma = gamma_.stride(0)
+    stride_beta = beta_.stride(0)
+    stride_outm = stride_xm
+    stride_outn = stride_xn
+
+    # Choose blocks
+    BLOCK_M = 128
+    BLOCK_N = 128
+    grid = ((M + BLOCK_M - 1) // BLOCK_M, (N + BLOCK_N - 1) // BLOCK_N)
+    _apply_batchnorm_kernel[grid](
+        x_, mean_, invstd_, gamma_, beta_,
+        M, N,
+        stride_xm, stride_xn,
+        stride_mean, stride_invstd,
+        stride_gamma, stride_beta,
+        stride_outm, stride_outn,
+        BLOCK_M, BLOCK_N
+    )
+    return x_
 
 
 class ModelNew(nn.Module):
     """
-    Optimized model that:
-      - Uses PyTorch/cuBLAS for the GEMM under autocast to FP16.
-      - Computes per-column mean/var using a Triton reduction kernel (FP16->FP32 accumulations).
-      - Fuses scaling and BatchNorm affine application in a bandwidth-efficient Triton FP16 kernel.
+    Optimized model that fuses GEMM + scale + batchnorm using Triton kernels.
+    NOTE: This ModelNew performs the forward-pass using custom Triton kernels.
+    It uses the stored BatchNorm running_mean and running_var for inference.
+    If bn.training == True, it will compute batch statistics and update running stats
+    in the standard PyTorch way (on the CPU/GPU tensors).
     """
     def __init__(self, in_features, out_features, scale_shape, eps=1e-5, momentum=0.1):
         super(ModelNew, self).__init__()
-        # Keep original modules so parameter names and shapes remain compatible
+        # keep the same modules/parameters so state_dict is compatible
         self.gemm = nn.Linear(in_features, out_features)
         self.scale = nn.Parameter(torch.randn(scale_shape))
         self.bn = nn.BatchNorm1d(out_features, eps=eps, momentum=momentum)
-
-        # Tunable Triton block sizes (constexpr). Balanced for Ampere A6000.
-        # BLOCK_M controls number of rows reduced per block; larger BLOCK_M reduces number of partials.
-        # BLOCK_N controls vector width for better memory throughput; keep it multiple of 32.
-        self._BLOCK_M = 128
-        self._BLOCK_N = 256
+        # ensure parameters are float32
+        self.eps = eps
+        self.momentum = momentum
 
     def forward(self, x):
-        # CPU fallback: keep original behavior
-        if not x.is_cuda:
-            x = self.gemm(x)
-            x = x * self.scale
-            return self.bn(x)
+        # x: (B, in_features)
+        assert x.is_cuda, "Inputs must be on CUDA."
+        # Prepare weight transposed for our kernel: weight_t shape (K, N) where K=in_features, N=out_features
+        weight = self.gemm.weight  # shape (out_features, in_features)
+        # transpose to (in_features, out_features)
+        weight_t = weight.t().contiguous()
 
-        device = x.device
+        bias = self.gemm.bias if self.gemm.bias is not None else None
+        scale = self.scale
 
-        # GEMM under autocast to FP16 to reduce memory traffic
-        with torch.cuda.amp.autocast(enabled=True, dtype=torch.float16):
-            x_fp16 = self.gemm(x)  # (N, C) in FP16 due to autocast
+        x = x.contiguous().to(torch.float32)
 
-        # Ensure contiguous layout for efficient Triton loads
-        x_fp16 = x_fp16.contiguous()
-        N, C = x_fp16.shape
+        # Stage 1: fused GEMM + scale
+        out = triton_fused_gemm_scale(x, weight_t, bias, scale)
 
-        # Triton reduction parameters
-        BLOCK_M = self._BLOCK_M
-        BLOCK_N = self._BLOCK_N
-
-        grid_m = (N + BLOCK_M - 1) // BLOCK_M
-        grid_n = (C + BLOCK_N - 1) // BLOCK_N
-
-        # Allocate partial buffers (grid_m x C) on device (FP32)
-        # Flattened layout: partial_sum[block_row, col] stored at index block_row*C + col
-        partial_sum = torch.zeros((grid_m, C), dtype=torch.float32, device=device)
-        partial_sumsq = torch.zeros_like(partial_sum)
-
-        # Launch Triton reduction kernel to compute per-block partial sums and sumsq
-        _col_reduce_kernel[(grid_m, grid_n)](
-            x_fp16, partial_sum, partial_sumsq,
-            N, C, x_fp16.stride(0), x_fp16.stride(1),
-            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N
-        )
-
-        # Final reduction across block rows to get per-column sums and sumsq (FP32)
-        sum_per_col = partial_sum.sum(dim=0)      # (C,)
-        sumsq_per_col = partial_sumsq.sum(dim=0)  # (C,)
-
-        mean_x = sum_per_col / N
-        var_x = sumsq_per_col / N - mean_x * mean_x
-        var_x = var_x.clamp(min=0.0)
-
-        # Account for the scale parameter: BatchNorm sees x * scale
-        scale_fp32 = self.scale.to(torch.float32)
-
+        # Stage 2: compute mean and variance across batch (per-channel)
         if self.bn.training:
-            mean_scaled = scale_fp32 * mean_x
-            var_scaled = (scale_fp32 * scale_fp32) * var_x
-
-            # Update running stats in FP32
+            # compute batch stats
+            mean, var = triton_mean_var(out)
+            # update running stats in-place (same behavior as PyTorch)
             with torch.no_grad():
-                m = self.bn.momentum if self.bn.momentum is not None else 0.1
-                self.bn.running_mean.mul_(1 - m).add_(m * mean_scaled)
-                self.bn.running_var.mul_(1 - m).add_(m * var_scaled)
-
-            mean = mean_scaled
-            var = var_scaled
+                self.bn.running_mean = (1 - self.momentum) * self.bn.running_mean + self.momentum * mean
+                self.bn.running_var = (1 - self.momentum) * self.bn.running_var + self.momentum * var
+            used_mean = mean
+            used_var = var
         else:
-            mean = self.bn.running_mean.to(torch.float32)
-            var = self.bn.running_var.to(torch.float32)
+            # use stored running stats (inference)
+            used_mean = self.bn.running_mean.to(out.device).to(out.dtype)
+            used_var = self.bn.running_var.to(out.device).to(out.dtype)
 
-        invstd = 1.0 / torch.sqrt(var + self.bn.eps)
+        # compute invstd
+        invstd = 1.0 / torch.sqrt(used_var + self.eps)
 
-        # BN affine params (gamma, beta) in FP32
-        if self.bn.affine:
-            gamma = self.bn.weight.to(torch.float32)
-            beta = self.bn.bias.to(torch.float32)
-        else:
-            gamma = torch.ones(C, device=device, dtype=torch.float32)
-            beta = torch.zeros(C, device=device, dtype=torch.float32)
+        # Stage 3: apply batchnorm affine
+        gamma = self.bn.weight if self.bn.weight is not None else torch.ones_like(used_mean)
+        beta = self.bn.bias if self.bn.bias is not None else torch.zeros_like(used_mean)
+        # ensure on correct device/dtype
+        gamma = gamma.to(out.device).to(out.dtype)
+        beta = beta.to(out.device).to(out.dtype)
+        used_mean = used_mean.to(out.device).to(out.dtype)
+        invstd = invstd.to(out.device).to(out.dtype)
 
-        # Effective per-channel coefficients (FP32)
-        # eff_w = scale * invstd * gamma
-        # eff_b = -mean * invstd * gamma + beta
-        eff_w_fp32 = (scale_fp32 * invstd) * gamma
-        eff_b_fp32 = (-mean * invstd) * gamma + beta
-
-        # Prepare FP16 inputs for the bandwidth-bound apply kernel
-        inp_half = x_fp16.half()
-        out_half = torch.empty_like(inp_half)
-
-        # Convert coefficients to FP16 for the apply kernel (bandwidth heavy)
-        eff_w = eff_w_fp32.contiguous().half()
-        eff_b = eff_b_fp32.contiguous().half()
-
-        # Grid and strides
-        grid = (grid_m, grid_n)
-        stride_row = inp_half.stride(0)
-        stride_col = inp_half.stride(1)
-
-        # Launch Triton kernel to apply fused affine in FP16
-        _apply_affine_kernel[grid](
-            inp_half, out_half,
-            eff_w, eff_b,
-            N, C, stride_row, stride_col,
-            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N
-        )
-
-        # Cast back to FP32 to match original model semantics
-        out = out_half.to(torch.float32)
+        out = triton_apply_batchnorm(out, used_mean, invstd, gamma, beta)
         return out
+
+# Provide the same helper functions to generate inputs as original module expects
+batch_size = 1024
+in_features = 8192
+out_features = 8192
+scale_shape = (out_features,)
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features).cuda()]
+
+def get_init_inputs():
+    return [in_features, out_features, scale_shape]
