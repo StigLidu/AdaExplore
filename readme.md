@@ -160,7 +160,7 @@ To summarize a completed run, use `tool_scripts/stats.py`, e.g. `python tool_scr
 The main takeaway is that AdaExplore benefits from both stages of the pipeline: adaptation improves proposal quality by turning repeated failures into reusable guidance, and exploration converts that guidance into stronger search decisions at test time.
 Across the reported benchmarks, this combination improves robustness and leads to better final kernels than using direct generation or search alone.
 
-We also release the AdaExplore-generated kernels in `results/saved_kernels`; each kernel is the final output of a 50-step exploration run.
+We also release the AdaExplore-generated kernels in `results/saved_kernels`.
 
 ## Citation
 
